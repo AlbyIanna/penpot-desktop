@@ -372,6 +372,25 @@ WRAPEOF
   fi
   [[ -x "$STAGING/postgres/$POSTGRES_VERSION/bin/initdb" ]] || die "postgres payload has no initdb"
 
+  # The theseus archive's lib/uuid-ossp.so NEEDs libossp-uuid.so.16 but does
+  # NOT ship it, and carries a dead build-time RUNPATH (/opt/postgresql/lib).
+  # Penpot's very first migration (0001-add-extensions) CREATEs the
+  # uuid-ossp extension, so first boot hard-fails without the lib (proven:
+  # CI run 29271265611). Bundle it from the build host and normalize every
+  # shared object's rpath to \$ORIGIN. Other host libs the binaries use
+  # (libgssapi_krb5, libxml2, libreadline) follow the AppImage excludelist
+  # convention: system-provided, present on the runner and desktop distros.
+  OSSP_SRC=""
+  for c in /usr/lib/x86_64-linux-gnu/libossp-uuid.so.16 /usr/lib/libossp-uuid.so.16; do
+    [[ -e "$c" ]] && { OSSP_SRC="$c"; break; }
+  done
+  [[ -n "$OSSP_SRC" ]] || die "libossp-uuid.so.16 not found on the build host (apt-get install libossp-uuid16)"
+  cp "$(readlink -f "$OSSP_SRC")" "$STAGING/postgres/$POSTGRES_VERSION/lib/libossp-uuid.so.16"
+  chmod 755 "$STAGING/postgres/$POSTGRES_VERSION/lib/libossp-uuid.so.16"
+  while IFS= read -r -d '' so; do
+    patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
+  done < <(find "$STAGING/postgres/$POSTGRES_VERSION/lib" -name '*.so*' -type f -print0)
+
   # ----- 5. licenses/ + MANIFEST.json + VERSION -------------------------------
   log "licenses/ ..."
   if [[ ! -f "$CACHE_DIR/penpot-LICENSE-${PENPOT_VERSION}" ]]; then
@@ -582,12 +601,18 @@ if [[ "$P5_OK" -eq 1 ]]; then
       -o "-p $TEST_PG_PORT -h 127.0.0.1 -k ''" -w -l "$PROOF_TMP/pg.log" start \
       > /dev/null 2>&1 || { P5_OK=0; tail -5 "$PROOF_TMP/pg.log" >&2; }
 fi
+P5_UUID=""
 if [[ "$P5_OK" -eq 1 ]]; then
   env -i PATH=/usr/bin:/bin "$PGB/pg_isready" -h 127.0.0.1 -p "$TEST_PG_PORT" >/dev/null 2>&1 || P5_OK=0
+  # penpot's first migration loads the uuid-ossp extension — prove it live
+  # (this is what caught the missing libossp-uuid.so.16).
+  P5_UUID="$(env -i PATH=/usr/bin:/bin "$PGB/psql" -h 127.0.0.1 -p "$TEST_PG_PORT" -U postgres -d postgres \
+      -tAc 'CREATE EXTENSION "uuid-ossp"; SELECT uuid_generate_v4();' 2>&1 || true)"
+  grep -qE '^[0-9a-f-]{36}$' <<< "$P5_UUID" || { echo "uuid-ossp probe: $P5_UUID" >&2; P5_OK=0; }
   env -i PATH=/usr/bin:/bin "$PGB/pg_ctl" -D "$PROOF_TMP/pgdata" -w stop >/dev/null 2>&1 || P5_OK=0
 fi
 if [[ "$P5_OK" -eq 1 ]]; then
-  ok P5 "postgres $POSTGRES_VERSION initdb/pg_ctl/pg_isready from bundle location (env -i)"
+  ok P5 "postgres $POSTGRES_VERSION initdb/pg_ctl/pg_isready + uuid-ossp extension (env -i)"
 else
   bad P5 "postgres pre-seed is not functional"
 fi
