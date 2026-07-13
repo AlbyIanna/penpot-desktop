@@ -18,6 +18,8 @@ async fn embedded_postgres_start_provision_stop() {
 
     let config = PostgresConfig {
         install_dir,
+        trust_installation_dir: false,
+        releases_url: None,
         data_dir: scratch.path().join("data"),
         password_file: scratch.path().join(".pgpass"),
         port: 0, // random free port; avoids clashing with a dev instance on 5433
@@ -58,6 +60,8 @@ async fn embedded_postgres_data_dir_survives_restart() {
 
     let make_config = || PostgresConfig {
         install_dir: install_dir.clone(),
+        trust_installation_dir: false,
+        releases_url: None,
         data_dir: scratch.path().join("data"),
         password_file: scratch.path().join(".pgpass"),
         port: 0,

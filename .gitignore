@@ -7,6 +7,9 @@ m0/roundtrip-work/
 # Extracted Penpot artifacts (backend JAR, frontend build, JRE, binaries) — never commit
 /runtime/
 
+# Packaging output (scripts/build-runtime-bundle.sh: penpot-runtime/ bundle + download cache)
+/dist/
+
 # Tauri build-time generated schemas
 apps/desktop/gen/
 

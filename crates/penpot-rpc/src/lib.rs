@@ -71,7 +71,16 @@ impl PenpotClient {
             base_url.pop();
         }
         Self {
-            http: reqwest::Client::new(),
+            // This client only ever talks to the local backend on loopback.
+            // .no_proxy() keeps system/env proxy settings (http_proxy & co.)
+            // from hijacking loopback RPC: reqwest honors them by default,
+            // and on a machine with a corporate proxy configured the app
+            // would otherwise fail single-user provisioning at first boot
+            // (found by the M4 artifact test's poisoned-proxy run).
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("building a loopback-only reqwest client cannot fail"),
             base_url,
             auth: Auth::None,
         }

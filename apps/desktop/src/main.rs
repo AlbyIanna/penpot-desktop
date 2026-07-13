@@ -59,10 +59,14 @@ fn main() {
             if let Err(e) = tray_result {
                 tracing::error!("failed to create the sync-status tray: {e}");
             }
+            // The bundled `penpot-runtime/` (M4) lives in the Tauri
+            // resources dir; in dev there is no bundle there and the
+            // resolver falls back to env overrides + repo runtime/.
+            let resource_dir = app.path().resource_dir().ok();
             // The window already shows placeholder-dist ("booting…"); bring
             // the stack up asynchronously and swap the URL when ready.
             tauri::async_runtime::spawn(async move {
-                let booted = match AppConfig::resolve() {
+                let booted = match AppConfig::resolve_with_resources(resource_dir) {
                     Ok(config) => boot(config).await,
                     Err(e) => Err(e),
                 };
