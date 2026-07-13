@@ -1,0 +1,231 @@
+# M4 packaging CI — proves the two targets the macOS dev machine cannot:
+# the Linux AppImage and the Nix flake, plus a macOS dmg leg (crane path,
+# no docker daemon on macOS runners).
+#
+# Runs on pushes to ci/m4 (the M4 CI iteration branch) and manual dispatch.
+
+name: package
+
+on:
+  push:
+    branches: [ci/m4]
+  workflow_dispatch:
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux AppImage: runtime bundle (linux builder) + tauri appimage + headless
+  # smoke against the artifact's own extracted resources.
+  # ---------------------------------------------------------------------------
+  linux-appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri v2 + bundle-builder system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev librsvg2-common libxdo-dev libssl-dev build-essential \
+            curl wget file gettext desktop-file-utils libglib2.0-bin \
+            patchelf squashfs-tools xvfb libfuse2t64 libossp-uuid16
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: linux-appimage
+
+      - name: Cache runtime-bundle components (dist/)
+        uses: actions/cache@v4
+        with:
+          path: dist
+          key: linux-runtime-bundle-${{ hashFiles('scripts/build-runtime-bundle-linux.sh') }}
+
+      - name: Install tauri-cli
+        uses: cargo-bins/cargo-binstall@802977a265b5f8825ebef2176db5f5f3edc82280 # main 2026-07
+      - run: cargo binstall -y --force tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked --force
+
+      - name: Build the Linux penpot-runtime bundle (docker path + proofs)
+        run: bash scripts/build-runtime-bundle-linux.sh
+
+      - name: Build the AppImage (slim — WITHOUT the runtime resources)
+        run: |
+          # Deliberately no tauri.bundle.conf.json overlay here: linuxdeploy
+          # dependency-scans every ELF inside the AppDir and (a) hard-fails
+          # on the jlink'd JRE ("Could not find dependency: libjvm.so", run
+          # 29266059720) and (b) would rewrite the rpaths of the carefully
+          # relocated valkey/postgres payloads. The runtime bundle is
+          # injected AFTER linuxdeploy, below.
+          rm -rf target/release/penpot-runtime
+          cd apps/desktop
+          CI=true NO_STRIP=true cargo tauri build --verbose --bundles appimage
+          ls -la ../../target/release/bundle/appimage/
+
+      - name: Inject penpot-runtime into the AppImage and repack
+        run: |
+          set -euxo pipefail
+          cd target/release/bundle/appimage
+          APPIMAGE="$(ls *.AppImage | head -1)"
+          ./"$APPIMAGE" --appimage-extract >/dev/null
+          # layout.rs discovery path: <exe_dir>/../lib/penpot-desktop/penpot-runtime
+          mkdir -p squashfs-root/usr/lib/penpot-desktop
+          cp -a "$GITHUB_WORKSPACE/dist/penpot-runtime" squashfs-root/usr/lib/penpot-desktop/penpot-runtime
+          rm -rf squashfs-root/usr/lib/penpot-desktop/penpot-runtime/.cache
+          # appimagetool = mksquashfs + embedded runtime, NO dependency
+          # analysis — the injected bundle stays byte-exact. Pinned 1.9.1.
+          curl -fsSL --retry 3 -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+          rm -f "$APPIMAGE"
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
+          rm -rf squashfs-root appimagetool
+          ls -la
+
+      - name: Build headless + watchdog (release, incremental after tauri build)
+        run: cargo build --release -p penpot-desktop --bin headless -p supervisor --bin penpot-watchdog
+
+      - name: Headless smoke against the AppImage's own extracted resources
+        run: |
+          set -euxo pipefail
+          cd target/release/bundle/appimage
+          APPIMAGE="$(ls *.AppImage | head -1)"
+          ./"$APPIMAGE" --appimage-extract >/dev/null
+          BUNDLE="$(find "$PWD/squashfs-root" -type d -name penpot-runtime | head -1)"
+          test -n "$BUNDLE"
+          cd "$GITHUB_WORKSPACE"
+          bash scripts/ci-bundle-smoke.sh "$BUNDLE" target/release/headless
+
+      # Best-effort: a short tray-less GUI boot under xvfb. Informational
+      # only — tray/webkit behavior on a bare X server is not an M4 exit
+      # criterion; the headless smoke above is the gating check.
+      - name: GUI boot check under xvfb (best-effort)
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set -x
+          APPDIR="$(pwd)/target/release/bundle/appimage/squashfs-root"
+          DATA="$(mktemp -d)"
+          PENPOT_LOCAL_DATA_DIR="$DATA" xvfb-run -a "$APPDIR/AppRun" > gui.log 2>&1 &
+          GUI_PID=$!
+          OK=0
+          for _ in $(seq 1 60); do
+            if curl -sSf http://localhost:8686/ 2>/dev/null | grep -qi penpot; then OK=1; break; fi
+            kill -0 "$GUI_PID" 2>/dev/null || break
+            sleep 3
+          done
+          kill -TERM "$GUI_PID" 2>/dev/null || true
+          sleep 5; kill -9 "$GUI_PID" 2>/dev/null || true
+          tail -40 gui.log || true
+          [ "$OK" -eq 1 ] && echo "GUI boot: SPA served through the proxy under xvfb" || { echo "GUI boot under xvfb did not serve the SPA (informational)"; exit 1; }
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: penpot-local-appimage
+          path: target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Nix flake: exactly the flake author's validation sequence (see nix/README.md).
+  # flake.lock is committed — do NOT re-lock here.
+  # ---------------------------------------------------------------------------
+  nix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free runner disk space (nix store + webkitgtk closure need room)
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/dotnet
+          df -h /
+
+      - uses: DeterminateSystems/nix-installer-action@a7ad9c4f0c65208097f4d34f3cfa1913b80cce5c # main 2026-07
+
+      - name: (1) Pure evaluation on all systems
+        run: nix flake check --no-build --all-systems
+
+      - name: (2) Build packages.headless (first actual compilation)
+        run: |
+          nix build .#headless -L
+          test -x result/bin/headless
+          test -x result/bin/penpot-watchdog
+
+      - name: (3) Dev shell usability (cargo check inside nix develop)
+        run: nix develop -c cargo check --workspace
+
+      - name: (4) Full flake check (builds checks.headless, mostly cached)
+        run: nix flake check -L
+      # Step (5) `nix develop -c cargo test --workspace` is the flake author's
+      # optional extra (needs network for the embedded-postgres download and
+      # free localhost ports). The same suite already runs green in dev mode
+      # on the macOS machine; skipped here to keep CI iterations fast.
+
+  # ---------------------------------------------------------------------------
+  # macOS dmg: crane path (no docker on macOS runners) + build-dmg.sh + the
+  # headless subset of the artifact test against the dmg's own .app resources.
+  # ---------------------------------------------------------------------------
+  # macos-15 (not -14): the theseus postgres 15.18.0 darwin binaries link
+  # _strchrnul (libSystem >= macOS 15.4) — initdb aborts on Sonoma runners.
+  macos-dmg:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install homebrew deps (JDK 26, valkey, ImageMagick)
+        run: |
+          brew install --quiet openjdk valkey imagemagick
+          /opt/homebrew/opt/openjdk/bin/java --version
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: macos-dmg
+
+      - name: Cache runtime-bundle components (dist/)
+        uses: actions/cache@v4
+        with:
+          path: dist
+          key: macos-runtime-bundle-${{ hashFiles('scripts/build-runtime-bundle.sh') }}
+
+      - name: Install tauri-cli
+        uses: cargo-bins/cargo-binstall@802977a265b5f8825ebef2176db5f5f3edc82280 # main 2026-07
+      - run: cargo binstall -y --force tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked --force
+
+      - name: Build the macOS penpot-runtime bundle (crane path + proofs)
+        run: bash scripts/build-runtime-bundle.sh --no-docker
+
+      - name: Build the dmg
+        run: bash scripts/build-dmg.sh --skip-bundle
+
+      - name: Build headless + watchdog (release, incremental)
+        run: cargo build --release -p penpot-desktop --bin headless -p supervisor --bin penpot-watchdog
+
+      - name: Headless smoke against the dmg's own .app resources
+        run: |
+          set -euxo pipefail
+          DMG="$(ls target/release/bundle/dmg/*.dmg | head -1)"
+          MOUNT="$(mktemp -d)/mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT" "$DMG" >/dev/null
+          INSTALL="$(mktemp -d)"
+          ditto "$MOUNT"/*.app "$INSTALL/Penpot Local.app"
+          hdiutil detach "$MOUNT" -quiet || true
+          bash scripts/ci-bundle-smoke.sh \
+            "$INSTALL/Penpot Local.app/Contents/Resources/penpot-runtime" \
+            target/release/headless
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: penpot-local-dmg
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

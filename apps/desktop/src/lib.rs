@@ -6,6 +6,7 @@
 //! backend JVM) → first-boot single-user provisioning over RPC → start the
 //! local proxy with the `/__bootstrap` auto-login route → expose readiness.
 
+pub mod layout;
 pub mod status;
 pub mod tray;
 
@@ -43,13 +44,16 @@ const PROVISION_FULLNAME: &str = "Penpot Local";
 const ACCESS_TOKEN_NAME: &str = "penpot-local-desktop";
 
 /// Resolved application configuration. Everything has env overrides so the
-/// smoke test can run against a scratch data dir / alternate ports.
+/// smoke test can run against a scratch data dir / alternate ports. External
+/// components (runtime artifacts, java, valkey, postgres, watchdog, backend
+/// PATH) come from the [`layout`] resolver: env > bundle > dev.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     /// App-internal state root (`PENPOT_LOCAL_DATA_DIR` or the platform
     /// app-data dir, e.g. `~/Library/Application Support/penpot-local`).
     pub data_dir: PathBuf,
-    /// Extracted Penpot artifacts (`PENPOT_LOCAL_RUNTIME_DIR` or `<repo>/runtime`).
+    /// Extracted Penpot artifacts (`PENPOT_LOCAL_RUNTIME_DIR`, the bundle,
+    /// or `<repo>/runtime`).
     pub runtime_dir: PathBuf,
     /// Proxy listen port (`PENPOT_LOCAL_PROXY_PORT`, default 8686).
     pub proxy_port: u16,
@@ -62,6 +66,17 @@ pub struct AppConfig {
     /// The user's designs folder the sync daemon mirrors the DB into
     /// (`PENPOT_LOCAL_DESIGNS_DIR`, default `<data_dir>/designs`).
     pub designs_dir: PathBuf,
+    /// Pre-seeded postgres installation (`PENPOT_LOCAL_POSTGRES_INSTALL_DIR`
+    /// or the bundle's `postgres/`); `None` = download once into the data dir.
+    pub postgres_install_dir: Option<PathBuf>,
+    /// Explicit `penpot-watchdog` binary (bundle `bin/`); the
+    /// `PENPOT_WATCHDOG_BIN` env var still wins inside the supervisor.
+    pub watchdog_bin: Option<PathBuf>,
+    /// Dirs prepended to the backend JVM child's PATH (bundle `bin/` with
+    /// `identify`/`node`, or `PENPOT_LOCAL_IDENTIFY`/`PENPOT_LOCAL_NODE` dirs).
+    pub child_path_prepend: Vec<PathBuf>,
+    /// The full layout with per-component provenance (logged at boot).
+    pub layout: layout::RuntimeLayout,
 }
 
 fn env_port(name: &str, default: u16) -> anyhow::Result<u16> {
@@ -74,8 +89,16 @@ fn env_port(name: &str, default: u16) -> anyhow::Result<u16> {
 }
 
 impl AppConfig {
-    /// Resolve config from environment + platform defaults.
+    /// Resolve config from environment + platform defaults (headless entry:
+    /// no Tauri resources dir; the bundle can still be found via
+    /// `PENPOT_LOCAL_RUNTIME_BUNDLE` or executable-adjacent discovery).
     pub fn resolve() -> anyhow::Result<Self> {
+        Self::resolve_with_resources(None)
+    }
+
+    /// Resolve config, additionally considering `<resource_dir>/penpot-runtime`
+    /// as a bundle location (the Tauri v2 GUI passes its resources dir here).
+    pub fn resolve_with_resources(resource_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         let data_dir = match std::env::var_os("PENPOT_LOCAL_DATA_DIR") {
             Some(dir) => PathBuf::from(dir),
             None => directories::ProjectDirs::from("", "", "penpot-local")
@@ -83,25 +106,20 @@ impl AppConfig {
                 .data_dir()
                 .to_path_buf(),
         };
-        let runtime_dir = match std::env::var_os("PENPOT_LOCAL_RUNTIME_DIR") {
-            Some(dir) => PathBuf::from(dir),
-            // Dev default: <repo>/runtime, resolved relative to this crate.
-            None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime"),
-        };
+
+        // --- runtime layout: env > bundle > dev --------------------------
+        let env_overrides = layout::EnvOverrides::from_env();
+        let env_bundle = std::env::var_os(layout::ENV_RUNTIME_BUNDLE).map(PathBuf::from);
+        let bundle = layout::discover_bundle(env_bundle.as_deref(), resource_dir.as_deref())?;
+        let resolved = layout::resolve_layout(&env_overrides, bundle.as_deref());
+
+        let runtime_dir = resolved.runtime_dir.path.clone();
         if !runtime_dir.join("backend/penpot.jar").is_file() {
             bail!(
                 "Penpot runtime artifacts not found under {} — run scripts/fetch-penpot.sh first",
                 runtime_dir.display()
             );
         }
-        let java_path = PathBuf::from(
-            std::env::var("PENPOT_LOCAL_JAVA")
-                .unwrap_or_else(|_| "/opt/homebrew/opt/openjdk/bin/java".to_string()),
-        );
-        let valkey_path = PathBuf::from(
-            std::env::var("PENPOT_LOCAL_VALKEY")
-                .unwrap_or_else(|_| "/opt/homebrew/bin/valkey-server".to_string()),
-        );
         let designs_dir = match std::env::var_os("PENPOT_LOCAL_DESIGNS_DIR") {
             Some(dir) => PathBuf::from(dir),
             None => data_dir.join("designs"),
@@ -115,9 +133,13 @@ impl AppConfig {
                 valkey: env_port("PENPOT_LOCAL_VALKEY_PORT", 6380)?,
                 backend: env_port("PENPOT_LOCAL_BACKEND_PORT", proxy::DEFAULT_BACKEND_PORT)?,
             },
-            java_path,
-            valkey_path,
+            java_path: resolved.java.path.clone(),
+            valkey_path: resolved.valkey.path.clone(),
             designs_dir,
+            postgres_install_dir: resolved.postgres_install.as_ref().map(|r| r.path.clone()),
+            watchdog_bin: resolved.watchdog_bin.as_ref().map(|r| r.path.clone()),
+            child_path_prepend: resolved.child_path_prepend.clone(),
+            layout: resolved,
         })
     }
 
@@ -381,17 +403,14 @@ impl RunningApp {
     }
 }
 
-/// Run the full boot sequence. On first run this downloads the embedded
-/// Postgres binaries (network needed once) and registers the single user;
-/// afterwards everything is offline and idempotent.
-pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
-    std::fs::create_dir_all(&config.data_dir)
-        .with_context(|| format!("cannot create data dir {}", config.data_dir.display()))?;
-
-    let secret_key = load_or_generate_secret(&config.data_dir)?;
-    let public_uri = config.public_uri();
-
-    // --- supervised children -------------------------------------------
+/// Build the [`supervisor::SupervisorConfig`] for a resolved [`AppConfig`].
+/// Pure (no spawning, no fs writes) so packaged-mode resolution can be
+/// asserted in tests down to the exact command lines.
+pub fn supervisor_config(
+    config: &AppConfig,
+    secret_key: &str,
+    public_uri: &str,
+) -> supervisor::SupervisorConfig {
     let mut jvm = supervisor::JvmSpec::penpot_2_16(&config.java_path);
     // Replace `-m app.main` with the nrepl-free entry (see BACKEND_ENTRY_EXPR).
     jvm.extra_args = vec!["-e".into(), BACKEND_ENTRY_EXPR.into()];
@@ -402,10 +421,37 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         &config.valkey_path,
         config.runtime_dir.join("backend"),
         jvm,
-        &secret_key,
-        &public_uri,
+        secret_key,
+        public_uri,
     );
     sup_config.ports = config.ports;
+    // M4 packaged mode: pre-seeded postgres (offline), bundled watchdog, and
+    // the bundle bin/ (identify/node) on the backend child's PATH. All None/
+    // empty in dev mode — behavior byte-identical to pre-M4.
+    sup_config.postgres_install_dir = config.postgres_install_dir.clone();
+    sup_config.orphan_watchdog_bin = config.watchdog_bin.clone();
+    sup_config.child_path_prepend = config.child_path_prepend.clone();
+    sup_config
+}
+
+/// Run the full boot sequence. On first run in dev mode this downloads the
+/// embedded Postgres binaries (network needed once); a packaged install with
+/// a bundled `postgres/` is fully offline from the very first boot. Also
+/// registers the single user; afterwards everything is offline and idempotent.
+pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("cannot create data dir {}", config.data_dir.display()))?;
+
+    // One clear line per component: where it came from (env|bundle|dev).
+    for line in config.layout.describe() {
+        tracing::info!("runtime layout: {line}");
+    }
+
+    let secret_key = load_or_generate_secret(&config.data_dir)?;
+    let public_uri = config.public_uri();
+
+    // --- supervised children -------------------------------------------
+    let sup_config = supervisor_config(&config, &secret_key, &public_uri);
 
     let mut sup = supervisor::Supervisor::new(sup_config);
     let readiness = sup.start().await.context("supervisor failed to start")?;

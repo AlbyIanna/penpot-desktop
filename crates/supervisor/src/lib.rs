@@ -45,7 +45,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-pub use postgres::{EmbeddedPostgres, PostgresConfig};
+pub use postgres::{
+    detect_postgres_install, EmbeddedPostgres, PostgresConfig, PostgresInstall,
+    OFFLINE_RELEASES_URL,
+};
 pub use postgresql_embedded::VersionReq;
 
 use child::{ChildSpec, Probe, ReadyState, ServiceHandle};
@@ -251,6 +254,18 @@ pub struct SupervisorConfig {
     pub penpot_flags: String,
     /// Extra backend env vars appended last (they override the generated ones).
     pub extra_backend_env: Vec<(String, String)>,
+    /// Pre-seeded PostgreSQL installation (M4 bundle `postgres/` dir or an
+    /// existing binaries cache). When set, the embedded postgres uses these
+    /// binaries as-is and **never downloads anything** (`releases_url` is
+    /// poisoned with [`OFFLINE_RELEASES_URL`]); a directory that does not
+    /// contain a usable installation fails the boot loudly instead of
+    /// falling back to a download. `None` keeps the dev behavior: download
+    /// once into `<data_dir>/postgres/install`, offline afterwards.
+    pub postgres_install_dir: Option<PathBuf>,
+    /// Directories prepended to the backend JVM child's `PATH` (bundle
+    /// `bin/` with `identify`/`node`, or dirs derived from env overrides).
+    /// Empty = inherit the parent PATH untouched (dev behavior).
+    pub child_path_prepend: Vec<PathBuf>,
     /// Postgres database name provisioned on first start.
     pub db_name: String,
     /// Password for the embedded Postgres `postgres` superuser.
@@ -300,6 +315,8 @@ impl SupervisorConfig {
             public_uri: public_uri.into(),
             penpot_flags: DEFAULT_PENPOT_FLAGS.to_string(),
             extra_backend_env: Vec::new(),
+            postgres_install_dir: None,
+            child_path_prepend: Vec::new(),
             db_name: "penpot".to_string(),
             db_password: "penpot".to_string(),
             postgres_version: VersionReq::parse(DEFAULT_POSTGRES_VERSION)
@@ -316,10 +333,38 @@ impl SupervisorConfig {
         }
     }
 
-    fn postgres_config(&self) -> PostgresConfig {
+    /// Build the [`PostgresConfig`], honoring a pre-seeded installation.
+    ///
+    /// Errors only when `postgres_install_dir` is set but does not contain a
+    /// usable installation — the pre-seeded path is offline-only, it never
+    /// silently falls back to downloading.
+    pub fn postgres_config(&self) -> Result<PostgresConfig, SupervisorError> {
         let root = self.data_dir.join("postgres");
-        PostgresConfig {
-            install_dir: root.join("install"),
+        let (install_dir, trust, releases_url) = match &self.postgres_install_dir {
+            Some(dir) => match detect_postgres_install(dir) {
+                Some(PostgresInstall::Trusted(dir)) => {
+                    (dir, true, Some(OFFLINE_RELEASES_URL.to_string()))
+                }
+                Some(PostgresInstall::VersionedRoot(dir)) => {
+                    (dir, false, Some(OFFLINE_RELEASES_URL.to_string()))
+                }
+                None => {
+                    return Err(SupervisorError::ServiceFailed {
+                        service: Service::Postgres,
+                        reason: format!(
+                            "pre-seeded postgres install dir {} contains neither bin/initdb \
+                             nor a <version>/bin/initdb subdirectory",
+                            dir.display()
+                        ),
+                    })
+                }
+            },
+            None => (root.join("install"), false, None),
+        };
+        Ok(PostgresConfig {
+            install_dir,
+            trust_installation_dir: trust,
+            releases_url,
             data_dir: root.join("data"),
             password_file: root.join(".pgpass"),
             port: self.ports.postgres,
@@ -327,7 +372,12 @@ impl SupervisorConfig {
             db_name: self.db_name.clone(),
             version: self.postgres_version.clone(),
             timeout: Duration::from_secs(300),
-        }
+        })
+    }
+    /// PGDATA location (needed by the orphan watchdog independently of
+    /// whether the postgres config resolves).
+    fn postgres_data_dir(&self) -> PathBuf {
+        self.data_dir.join("postgres").join("data")
     }
 
     fn valkey_dir(&self) -> PathBuf {
@@ -387,6 +437,18 @@ pub fn backend_command(config: &SupervisorConfig) -> (PathBuf, Vec<String>, Vec<
         ("PENPOT_TELEMETRY_ENABLED".into(), "false".into()),
         ("PENPOT_FLAGS".into(), config.penpot_flags.clone()),
     ];
+    // Bundle-provided tools (`identify`, optionally `node`) must be findable
+    // by the JVM child: prepend the configured dirs to the inherited PATH.
+    // Empty prepend list = leave PATH alone (dev behavior, child inherits).
+    if !config.child_path_prepend.is_empty() {
+        let mut paths: Vec<PathBuf> = config.child_path_prepend.clone();
+        if let Some(inherited) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&inherited));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            env.push(("PATH".into(), joined.to_string_lossy().into_owned()));
+        }
+    }
     // Later entries override earlier ones when applied to the Command.
     env.extend(config.extra_backend_env.iter().cloned());
 
@@ -466,7 +528,7 @@ impl Supervisor {
 
         // --- 1. Postgres (embedded) -------------------------------------
         self.notifier.emit(SupervisorEvent::Starting { service: Service::Postgres });
-        let mut pg = EmbeddedPostgres::new(self.config.postgres_config());
+        let mut pg = EmbeddedPostgres::new(self.config.postgres_config()?);
         let postgres_uri = pg.start().await?;
         self.notifier.emit(SupervisorEvent::Ready { service: Service::Postgres });
         let pg_settings = pg.settings_clone();
@@ -604,7 +666,7 @@ impl Supervisor {
         if !self.config.orphan_watchdog {
             return;
         }
-        let pgdata = self.config.postgres_config().data_dir;
+        let pgdata = self.config.postgres_data_dir();
         let Some(bin) =
             watchdog::WatchdogHandle::locate_bin(self.config.orphan_watchdog_bin.as_deref())
         else {
@@ -637,9 +699,7 @@ impl Supervisor {
     #[cfg(unix)]
     fn collect_child_pids(&self) -> Vec<u32> {
         let mut pids = Vec::new();
-        if let Some(pid) =
-            watchdog::read_postmaster_pid(&self.config.postgres_config().data_dir)
-        {
+        if let Some(pid) = watchdog::read_postmaster_pid(&self.config.postgres_data_dir()) {
             pids.push(pid);
         }
         if let Some(handle) = &self.valkey {
@@ -678,7 +738,7 @@ impl Supervisor {
     fn spawn_watchdog_feeder(&mut self) {
         let Some(watchdog) = &self.orphan_watchdog else { return };
         let watchdog = Arc::clone(watchdog);
-        let pgdata = self.config.postgres_config().data_dir;
+        let pgdata = self.config.postgres_data_dir();
         let mut slots = Vec::new();
         if let Some(handle) = &self.valkey {
             slots.push(handle.pid_slot());
@@ -858,6 +918,114 @@ mod tests {
             vec![("PENPOT_FLAGS".into(), "enable-prepl-server".into())];
         let (_, _, env) = backend_command(&config);
         assert_eq!(env_get(&env, "PENPOT_FLAGS"), Some("enable-prepl-server"));
+    }
+
+    /// Write an executable-ish marker file, creating parent dirs.
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+    }
+
+    #[test]
+    fn postgres_config_dev_default_downloads_into_data_dir() {
+        let config = test_config();
+        let pg = config.postgres_config().expect("dev config resolves");
+        assert_eq!(pg.install_dir, PathBuf::from("/data/penpot-local/postgres/install"));
+        assert!(!pg.trust_installation_dir);
+        assert_eq!(pg.releases_url, None, "dev mode keeps the crate default releases url");
+    }
+
+    #[test]
+    fn postgres_config_preseeded_flat_install_is_trusted_and_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("bin/initdb"));
+        let mut config = test_config();
+        config.postgres_install_dir = Some(dir.path().to_path_buf());
+        let pg = config.postgres_config().expect("flat install resolves");
+        assert_eq!(pg.install_dir, dir.path());
+        assert!(pg.trust_installation_dir);
+        assert_eq!(pg.releases_url.as_deref(), Some(OFFLINE_RELEASES_URL));
+        // PGDATA stays in the app data dir, never inside the (read-only) bundle.
+        assert_eq!(pg.data_dir, PathBuf::from("/data/penpot-local/postgres/data"));
+    }
+
+    #[test]
+    fn postgres_config_preseeded_versioned_root_is_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("15.18.0/bin/initdb"));
+        let mut config = test_config();
+        config.postgres_install_dir = Some(dir.path().to_path_buf());
+        let pg = config.postgres_config().expect("versioned root resolves");
+        assert_eq!(pg.install_dir, dir.path());
+        assert!(!pg.trust_installation_dir, "the crate resolves the version subdir itself");
+        assert_eq!(pg.releases_url.as_deref(), Some(OFFLINE_RELEASES_URL));
+    }
+
+    #[test]
+    fn postgres_config_preseeded_garbage_fails_loudly_instead_of_downloading() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README"), b"nothing here").unwrap();
+        let mut config = test_config();
+        config.postgres_install_dir = Some(dir.path().to_path_buf());
+        let err = config.postgres_config().expect_err("must not fall back to download");
+        assert!(err.to_string().contains("initdb"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn detect_postgres_install_classifies_both_shapes() {
+        let flat = tempfile::tempdir().unwrap();
+        touch(&flat.path().join("bin/initdb"));
+        assert_eq!(
+            detect_postgres_install(flat.path()),
+            Some(PostgresInstall::Trusted(flat.path().to_path_buf()))
+        );
+
+        let versioned = tempfile::tempdir().unwrap();
+        touch(&versioned.path().join("15.18.0/bin/initdb"));
+        assert_eq!(
+            detect_postgres_install(versioned.path()),
+            Some(PostgresInstall::VersionedRoot(versioned.path().to_path_buf()))
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(detect_postgres_install(empty.path()), None);
+        assert_eq!(detect_postgres_install(&empty.path().join("missing")), None);
+
+        // A non-version subdir with binaries is NOT a versioned root.
+        let odd = tempfile::tempdir().unwrap();
+        touch(&odd.path().join("latest/bin/initdb"));
+        assert_eq!(detect_postgres_install(odd.path()), None);
+    }
+
+    #[test]
+    fn backend_path_untouched_without_prepend() {
+        let config = test_config();
+        let (_, _, env) = backend_command(&config);
+        assert!(
+            env_get(&env, "PATH").is_none(),
+            "dev mode must inherit the parent PATH untouched"
+        );
+    }
+
+    #[test]
+    fn backend_path_prepends_bundle_bin_dirs() {
+        let mut config = test_config();
+        config.child_path_prepend =
+            vec![PathBuf::from("/bundle/bin"), PathBuf::from("/override/dir")];
+        let (_, _, env) = backend_command(&config);
+        let path = env_get(&env, "PATH").expect("PATH must be set for the JVM child");
+        assert!(
+            path.starts_with("/bundle/bin:/override/dir"),
+            "prepend dirs must come first: {path}"
+        );
+        // The inherited PATH survives after the prepends.
+        if let Ok(parent_path) = std::env::var("PATH") {
+            if let Some(first) = parent_path.split(':').next() {
+                if !first.is_empty() {
+                    assert!(path.contains(first), "inherited PATH must be preserved: {path}");
+                }
+            }
+        }
     }
 
     #[test]

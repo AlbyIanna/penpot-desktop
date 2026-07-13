@@ -34,8 +34,8 @@ See [PLAN.md](PLAN.md) for the architecture, milestones, and risk register;
 | M1 — process supervisor: `cargo tauri dev` = working offline Penpot | ✅ done (`docs/milestones/m1.md`) |
 | M2 — one-way sync (DB → FS) + startup reconciliation | ✅ done (`docs/milestones/m2.md`) |
 | M3 — two-way sync + conflicts | ✅ done (`docs/milestones/m3.md`) |
-| M4 — packaging (AppImage/dmg/Nix) | next |
-| M5 — per-board exports, git helpers | — |
+| M4 — packaging (AppImage/dmg/Nix) | ✅ done — macOS dmg verified; AppImage CI-only; NixOS VM deferred (`docs/milestones/m4.md`) |
+| M5 — per-board exports, git helpers | next |
 
 ## Running it (macOS, dev)
 
