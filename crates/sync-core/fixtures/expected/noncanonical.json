@@ -1,0 +1,44 @@
+{
+  "a_first": true,
+  "dup": 2,
+  "escaped_key_sorts_after_z": {
+    "z": "before-e-acute",
+    "é": "after-z"
+  },
+  "escaped_solidus": "a/b",
+  "escaped_unicode": "héllo",
+  "exp_forms": [
+    100000.0,
+    100000.0,
+    100000.0,
+    1e-05,
+    100000.0,
+    100000.0,
+    150.0,
+    150.0
+  ],
+  "float_without_canonical_form": [
+    0.1,
+    3e+17
+  ],
+  "int_forms": [
+    -0.0,
+    5,
+    -5
+  ],
+  "nested": {
+    "ws": [
+      1,
+      2,
+      3
+    ]
+  },
+  "surrogate_pair_escape": "🎨",
+  "trailing_zero_floats": [
+    1.5,
+    2.5,
+    0.1,
+    100.0
+  ],
+  "z_last": "value"
+}

@@ -536,3 +536,203 @@ async fn non_json_error_body_is_preserved_as_string() {
         other => panic!("expected Error::Rpc, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Projects & files surface (shapes verified live against 2.16.2 on
+// 2026-07-13; see also tests/live.rs)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_projects_sends_team_id_and_parses_summaries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/get-projects"))
+        .and(body_json(json!({"teamId": TEAM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id": PROJECT_ID,
+            "teamId": TEAM_ID,
+            "name": "Drafts",
+            "isDefault": true,
+            "isPinned": false,
+            "count": 0,
+            "totalCount": 0,
+            "createdAt": "2026-07-13T11:09:59.658839Z",
+            "modifiedAt": "2026-07-13T11:09:59.658839Z"
+        }, {
+            // delete-project is a soft delete: deleted projects keep showing
+            // up in get-projects with `deletedAt` set (verified live, 2.16.2).
+            "id": "99999999-0000-0000-0000-000000000000",
+            "teamId": TEAM_ID,
+            "name": "soft-deleted",
+            "isDefault": false,
+            "createdAt": "2026-07-13T11:00:00.000000Z",
+            "modifiedAt": "2026-07-13T11:00:00.000000Z",
+            "deletedAt": "2026-07-20T11:00:00.000000Z"
+        }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    let projects = client.get_projects(TEAM_ID).await.unwrap();
+    assert_eq!(projects.len(), 2);
+    assert_eq!(projects[0].id, PROJECT_ID);
+    assert_eq!(projects[0].team_id, TEAM_ID);
+    assert_eq!(projects[0].name, "Drafts");
+    assert!(projects[0].is_default);
+    assert!(projects[0].deleted_at.is_none());
+    assert_eq!(
+        projects[1].deleted_at.as_deref(),
+        Some("2026-07-20T11:00:00.000000Z")
+    );
+}
+
+#[tokio::test]
+async fn get_project_files_parses_the_poll_surface_revn_and_modified_at() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/get-project-files"))
+        .and(body_json(json!({"projectId": PROJECT_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id": FILE_ID,
+            "name": "m0-rpc-spike",
+            "projectId": PROJECT_ID,
+            "teamId": TEAM_ID,
+            "revn": 3,
+            "vern": 0,
+            "isShared": false,
+            "modifiedAt": "2026-07-13T12:00:00.000000Z",
+            "createdAt": "2026-07-13T11:00:00.000000Z"
+        }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    let files = client.get_project_files(PROJECT_ID).await.unwrap();
+    assert_eq!(files.len(), 1);
+    let f = &files[0];
+    assert_eq!(f.id, FILE_ID);
+    assert_eq!(f.project_id, PROJECT_ID);
+    assert_eq!(f.revn, 3);
+    assert_eq!(f.vern, 0);
+    assert_eq!(f.modified_at, "2026-07-13T12:00:00.000000Z");
+    assert!(!f.is_shared);
+}
+
+#[tokio::test]
+async fn create_file_parses_metadata_and_first_page_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/create-file"))
+        .and(body_json(json!({"name": "new-file", "projectId": PROJECT_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": FILE_ID,
+            "name": "new-file",
+            "projectId": PROJECT_ID,
+            "revn": 0,
+            "vern": 0,
+            "version": 67,
+            "data": {
+                "pages": ["page-uuid-1"],
+                "pagesIndex": {"page-uuid-1": {"objects": {}}}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    let file = client.create_file(PROJECT_ID, "new-file").await.unwrap();
+    assert_eq!(file.id, FILE_ID);
+    assert_eq!(file.revn, 0);
+    assert_eq!(file.first_page_id(), Some("page-uuid-1"));
+}
+
+#[tokio::test]
+async fn create_file_with_id_sends_the_client_chosen_uuid() {
+    // First half of the resurrect recipe (verified live on 2.16.2):
+    // create-file accepts an optional client-chosen `id` and creates the
+    // file under exactly that id.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/create-file"))
+        .and(body_json(
+            json!({"name": "resurrected", "projectId": PROJECT_ID, "id": FILE_ID}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": FILE_ID,
+            "name": "resurrected",
+            "projectId": PROJECT_ID,
+            "revn": 0,
+            "vern": 0,
+            "data": {"pages": ["page-uuid-1"], "pagesIndex": {}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    let file = client
+        .create_file_with_id(PROJECT_ID, "resurrected", FILE_ID)
+        .await
+        .unwrap();
+    assert_eq!(file.id, FILE_ID);
+}
+
+#[tokio::test]
+async fn update_file_sends_required_top_level_params_and_parses_outcome() {
+    let server = MockServer::start().await;
+    let change = json!({"type": "add-obj", "id": "shape-1", "obj": {}});
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/update-file"))
+        // Required top-level params per rpc-endpoints.md §update-file:
+        // id, sessionId, revn, vern, changes — camelCase.
+        .and(body_json(json!({
+            "id": FILE_ID,
+            "sessionId": "session-uuid",
+            "revn": 2,
+            "vern": 0,
+            "changes": [change]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            // revn BEFORE the update; lagged includes our own change entry.
+            "revn": 2,
+            "lagged": [{"id": "entry-1", "revn": 3, "fileId": FILE_ID}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    let change = json!({"type": "add-obj", "id": "shape-1", "obj": {}});
+    let outcome = client
+        .update_file(FILE_ID, "session-uuid", 2, 0, &[change])
+        .await
+        .unwrap();
+    assert_eq!(outcome.revn, 2);
+    assert_eq!(outcome.lagged.len(), 1);
+}
+
+#[tokio::test]
+async fn delete_file_and_delete_project_tolerate_204_no_content() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/delete-file"))
+        .and(body_json(json!({"id": FILE_ID})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/delete-project"))
+        .and(body_json(json!({"id": PROJECT_ID})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    client.delete_file(FILE_ID).await.unwrap();
+    client.delete_project(PROJECT_ID).await.unwrap();
+}

@@ -76,7 +76,11 @@ produces identical bytes (modulo regenerated IDs — see Known risks).
 
 ### Startup reconciliation
 On boot, walk the folder tree vs the manifest vs the DB:
-- On disk but not in DB → import (this is how the invariant is satisfied).
+- On disk but not in DB → import (this is how the invariant is satisfied). If the manifest
+  knows the file's old id, resurrect it under that id: `create-file` with the client-chosen
+  uuid, then in-place import onto it (in-place import alone fails on nonexistent ids —
+  verified on 2.16.2). Soft-deleted ids are unavailable for ~7 days (500) → import-as-new
+  and re-key the manifest, loudly.
 - In DB but not on disk → export (first run / file created before daemon started).
 - Hash mismatch on both sides → conflict rule above.
 
@@ -112,7 +116,15 @@ provisions the single user, serves the frontend, opens one window auto-logged-in
 Clean shutdown kills children; crash of a child restarts it.
 **Exit criteria:** `cargo tauri dev` gives a working offline Penpot with zero manual steps.
 
-### M2 — One-way sync (DB → FS) + reconciliation
+### M2 — One-way sync (DB → FS) + reconciliation — ✅ DONE 2026-07-13
+
+Core invariant passed: `rm -rf` the postgres data dir → restart → all projects/files rebuilt
+from disk **under their original file ids**, disk byte-untouched, third boot a pure no-op.
+`scripts/m2-invariant.sh` 17/17 (run twice + unicode-names probe); 129 workspace tests; M1
+smoke not regressed. Evidence + M3 implications in `docs/milestones/m2.md`. Key discovery:
+on 2.16.2, in-place import onto a *nonexistent* file-id fails (`object-not-found`) — the
+resurrect recipe is `create-file` with the manifest's old id (client-chosen uuid), then
+in-place import onto it; a soft-deleted id 500s (~7-day GC) → fallback import-as-new.
 Direction A above, plus startup import of anything on disk. Ship the manifest + hash ledger.
 **Exit criteria:** the core-invariant test passes: `rm -rf` the Postgres data dir, restart, all files restored from disk.
 

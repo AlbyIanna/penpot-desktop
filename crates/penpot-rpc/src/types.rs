@@ -71,6 +71,96 @@ pub struct AccessToken {
     pub updated_at: Option<String>,
 }
 
+/// Project summary as returned by `get-projects` and `create-project`
+/// (rpc-endpoints.md §get-projects).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectInfo {
+    pub id: String,
+    pub team_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub modified_at: Option<String>,
+    /// Soft-deletion marker. **`delete-project` answers 204 but is a soft
+    /// delete** (verified live on 2.16.2): the project keeps appearing in
+    /// `get-projects` with `deletedAt` set to the scheduled GC time (~7 days
+    /// out). Poll consumers must treat `deleted_at.is_some()` as "gone".
+    /// (Deleted *files*, by contrast, disappear from `get-project-files`
+    /// immediately.)
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+}
+
+/// File summary as returned by `get-project-files` (no `data`).
+///
+/// This is the sync daemon's **poll surface**: `revn` + `modified_at` are the
+/// change-detection fields (rpc-endpoints.md §get-project-files). Beware that
+/// `revn` is not monotonic across in-place imports — it is set to whatever the
+/// imported binfile carries.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSummary {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub revn: i64,
+    #[serde(default)]
+    pub vern: i64,
+    pub modified_at: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub is_shared: bool,
+    /// Soft-deletion marker, exposed for symmetry with [`ProjectInfo`].
+    /// Deleted files were observed to vanish from `get-project-files`
+    /// immediately, so this is expected to stay `None` in practice.
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+}
+
+/// File object as returned by `create-file`: metadata plus the full `data`
+/// map (pages, pagesIndex, ...). Verified live: `revn` starts at 0 and `data`
+/// already contains one page.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedFile {
+    pub id: String,
+    pub name: String,
+    pub project_id: String,
+    pub revn: i64,
+    #[serde(default)]
+    pub vern: i64,
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+impl CreatedFile {
+    /// Id of the first page (`data.pages[0]`) — `update-file` changes that
+    /// touch page content need it as `pageId`.
+    pub fn first_page_id(&self) -> Option<&str> {
+        self.data.get("pages")?.as_array()?.first()?.as_str()
+    }
+}
+
+/// Response of `update-file` (rpc-endpoints.md §update-file).
+///
+/// `revn` is the file revision **before** this update; `lagged` contains all
+/// stored change entries with revn greater than the one you sent — including
+/// your own (which lands at `revn + 1`). An up-to-date client sees exactly one
+/// lagged entry. The server never conflict-errors on a stale revn; inspecting
+/// `lagged` is the client's job.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateFileOutcome {
+    pub revn: i64,
+    #[serde(default)]
+    pub lagged: Vec<serde_json::Value>,
+}
+
 /// Result of `export-binfile`: the artifact URI carried by the final SSE
 /// `end` event. The URI host is `PENPOT_PUBLIC_URI` and must be fetched
 /// **with auth** (cookie or token both work — M0 verified); the backend

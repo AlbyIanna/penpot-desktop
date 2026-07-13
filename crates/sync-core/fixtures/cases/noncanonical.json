@@ -1,0 +1,12 @@
+{"z_last"  :  "value",
+ "a_first":true,
+ "exp_forms": [1e5, 1E5, 1e+5, 1E-5, 10e4, 100E3, 1.5e2, 0.15e3],
+ "trailing_zero_floats": [1.50, 2.500, 0.10, 100.00],
+ "float_without_canonical_form": [0.1000000000000000055511151231257827, 299999999999999988.0],
+ "escaped_unicode": "h\u00e9llo",
+ "escaped_solidus": "a\/b",
+ "surrogate_pair_escape": "\ud83c\udfa8",
+ "escaped_key_sorts_after_z": {"\u00e9": "after-z", "z": "before-e-acute"},
+ "dup": 1, "dup": 2,
+ "nested"    :{    "ws":   [ 1 ,   2,3 ]   },
+ "int_forms": [-0.0, 5, -5]}

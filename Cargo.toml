@@ -5,6 +5,8 @@ members = [
     "crates/supervisor",
     "crates/proxy",
     "crates/penpot-rpc",
+    "crates/sync-core",
+    "crates/sync-daemon",
 ]
 
 [workspace.package]

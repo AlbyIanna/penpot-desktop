@@ -1,0 +1,15 @@
+{
+  "accents": "héllo wörld caffè perché Ångström ñoño",
+  "emoji": "🎨🖌️ design 👩‍🎨 family: 👨‍👩‍👧‍👦 flags: 🇮🇹🇺🇳",
+  "cjk": "日本語 中文 한국어",
+  "rtl": "مرحبا שלום",
+  "combining": "é vs é and ñ vs ñ",
+  "controls_escaped": "\u0000\u0001\u0002\u0007\u000b\u000e\u001f",
+  "shorthands": "quote:\" backslash:\\ bs:\b ff:\f nl:\n cr:\r tab:\t slash:\/",
+  "line_separators": "before between after",
+  "escaped_non_ascii_in_source": "caf\u00e9 \ud83c\udfa8 \u65e5\u672c",
+  "del_and_nbsp": "del: nbsp: ",
+  "keys with unicode": {"é": 1, "e": 2, "z": 3, "Z": 4, "ß": 5, "日": 6, "🎨": 7, "a b": 8, "": 9},
+  "math": "±×÷≠≤≥∞∑∏√∂∆π",
+  "specials": "­​‍﻿�"
+}
