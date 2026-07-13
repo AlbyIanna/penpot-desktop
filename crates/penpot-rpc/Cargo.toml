@@ -1,0 +1,17 @@
+[package]
+name = "penpot-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
+thiserror = "2"
+
+[dev-dependencies]
+wiremock = "0.6"

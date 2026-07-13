@@ -1,0 +1,683 @@
+//! Process supervisor for the embedded Penpot stack (Milestone M1).
+//!
+//! Responsibility (from PLAN.md): launch embedded Postgres, Valkey, and the
+//! Penpot backend JVM as supervised child processes. Clean shutdown kills all
+//! children in reverse order (backend → valkey → postgres); a crashed child is
+//! restarted with exponential backoff up to a retry limit. All services bind
+//! localhost-only on configurable ports (defaults: postgres 5433, valkey 6380,
+//! backend 6161). App-internal state (Postgres data dir, valkey dir, logs)
+//! lives under the configured `data_dir` (XDG path chosen by the caller),
+//! never inside the user's Designs folder.
+//!
+//! # Public API sketch
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), supervisor::SupervisorError> {
+//! use supervisor::{Supervisor, SupervisorConfig, JvmSpec};
+//!
+//! let config = SupervisorConfig::new(
+//!     "/home/user/.local/share/penpot-local",          // data dir (XDG)
+//!     "/home/user/.local/share/penpot-local/assets",   // objects storage (fs backend)
+//!     "/opt/homebrew/bin/valkey-server",
+//!     "/home/user/.local/share/penpot-local/runtime/backend", // dir containing penpot.jar
+//!     JvmSpec::penpot_2_16("/opt/homebrew/opt/openjdk/bin/java"),
+//!     "some-pinned-secret-key",
+//!     "http://localhost:8686",
+//! );
+//! let mut supervisor = Supervisor::new(config);
+//! let readiness = supervisor.start().await?;
+//! println!("postgres at {}", readiness.postgres_uri);
+//! // ... run the app ...
+//! supervisor.shutdown().await;
+//! # Ok(()) }
+//! ```
+
+mod child;
+mod postgres;
+mod probe;
+
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::watch;
+use tracing::{info, warn};
+
+pub use postgres::{EmbeddedPostgres, PostgresConfig};
+pub use postgresql_embedded::VersionReq;
+
+use child::{ChildSpec, Probe, ReadyState, ServiceHandle};
+
+/// Pinned PostgreSQL version line (a concrete 15.x release available from
+/// theseus-rs/postgresql-binaries; downloaded and cached on first run).
+pub const DEFAULT_POSTGRES_VERSION: &str = "=15.18.0";
+
+/// `PENPOT_FLAGS` for single-user local mode (PLAN.md "Single-user mode").
+pub const DEFAULT_PENPOT_FLAGS: &str =
+    "enable-access-tokens disable-email-verification disable-secure-session-cookies disable-onboarding";
+
+/// The three supervised services, in start order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Service {
+    Postgres,
+    Valkey,
+    Backend,
+}
+
+impl fmt::Display for Service {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Service::Postgres => write!(f, "postgres"),
+            Service::Valkey => write!(f, "valkey"),
+            Service::Backend => write!(f, "backend"),
+        }
+    }
+}
+
+/// Events emitted through the notify hook (and mirrored to `tracing`).
+#[derive(Debug, Clone)]
+pub enum SupervisorEvent {
+    /// A child process has been spawned (not yet ready).
+    Starting { service: Service },
+    /// The service passed its readiness probe for the first time.
+    Ready { service: Service },
+    /// The service exited (or failed its probe) unexpectedly.
+    Crashed {
+        service: Service,
+        /// 1-based consecutive failure count.
+        attempt: u32,
+        /// Whether a restart will be attempted.
+        restarting: bool,
+    },
+    /// The service passed its readiness probe again after a crash restart.
+    Restarted { service: Service },
+    /// Retries exhausted; the service will stay down.
+    GaveUp { service: Service },
+    /// The service was stopped as part of an orderly shutdown.
+    Stopped { service: Service },
+}
+
+/// Callback invoked (synchronously, from supervision tasks) on every event.
+/// Keep it cheap; offload heavy work to a channel.
+pub type NotifyHook = Arc<dyn Fn(SupervisorEvent) + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct Notifier(Option<NotifyHook>);
+
+impl Notifier {
+    pub(crate) fn emit(&self, event: SupervisorEvent) {
+        match &event {
+            SupervisorEvent::Starting { service } => info!(%service, "starting"),
+            SupervisorEvent::Ready { service } => info!(%service, "ready"),
+            SupervisorEvent::Crashed { service, attempt, restarting } => {
+                warn!(%service, attempt, restarting, "crashed");
+            }
+            SupervisorEvent::Restarted { service } => info!(%service, "restarted"),
+            SupervisorEvent::GaveUp { service } => warn!(%service, "gave up restarting"),
+            SupervisorEvent::Stopped { service } => info!(%service, "stopped"),
+        }
+        if let Some(hook) = &self.0 {
+            hook(event);
+        }
+    }
+}
+
+/// Localhost ports for the three services.
+#[derive(Debug, Clone, Copy)]
+pub struct Ports {
+    pub postgres: u16,
+    pub valkey: u16,
+    pub backend: u16,
+}
+
+impl Default for Ports {
+    fn default() -> Self {
+        // Conventions from docs/milestones/m1.md (9001/6060 are the m0 spike).
+        Ports { postgres: 5433, valkey: 6380, backend: 6161 }
+    }
+}
+
+/// How to invoke the backend JVM. Kept fully configurable so the integration
+/// layer can inject the exact contract extracted from the
+/// `penpotapp/backend:2.16.2` image.
+#[derive(Debug, Clone)]
+pub struct JvmSpec {
+    /// Path to the `java` binary (must be the exact JDK major the pinned
+    /// Penpot release builds with — `--enable-preview` hard-fails otherwise).
+    pub java_path: PathBuf,
+    /// JVM flags placed before `-jar`.
+    pub flags: Vec<String>,
+    /// Path to `penpot.jar`. Relative paths resolve against the backend dir
+    /// (the JVM's working directory).
+    pub jar: PathBuf,
+    /// Arguments after the jar (the image's entrypoint flag: `-m app.main`).
+    pub extra_args: Vec<String>,
+}
+
+impl JvmSpec {
+    /// The invocation replicated from `penpotapp/backend:2.16.2`'s `run.sh`:
+    ///
+    /// ```text
+    /// java -Dim4java.useV7=true \
+    ///      -Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager \
+    ///      -Dlog4j2.configurationFile=log4j2.xml \
+    ///      -XX:-OmitStackTraceInFastThrow \
+    ///      --sun-misc-unsafe-memory-access=allow \
+    ///      --enable-native-access=ALL-UNNAMED \
+    ///      --enable-preview \
+    ///      -jar penpot.jar -m app.main
+    /// ```
+    ///
+    /// `log4j2.xml` and `penpot.jar` are relative to the backend dir (cwd).
+    pub fn penpot_2_16(java_path: impl Into<PathBuf>) -> Self {
+        JvmSpec {
+            java_path: java_path.into(),
+            flags: [
+                "-Dim4java.useV7=true",
+                "-Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager",
+                "-Dlog4j2.configurationFile=log4j2.xml",
+                "-XX:-OmitStackTraceInFastThrow",
+                "--sun-misc-unsafe-memory-access=allow",
+                "--enable-native-access=ALL-UNNAMED",
+                "--enable-preview",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            jar: PathBuf::from("penpot.jar"),
+            extra_args: vec!["-m".into(), "app.main".into()],
+        }
+    }
+}
+
+/// Crash-restart policy (per service).
+#[derive(Debug, Clone, Copy)]
+pub struct RestartPolicy {
+    /// Consecutive failed starts/crashes tolerated before giving up.
+    pub max_retries: u32,
+    /// Delay before the first restart; doubles each consecutive failure.
+    pub initial_backoff: Duration,
+    /// Backoff ceiling.
+    pub max_backoff: Duration,
+    /// If a service stays ready this long, the failure counter resets.
+    pub stable_after: Duration,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        RestartPolicy {
+            max_retries: 5,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+            stable_after: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RestartPolicy {
+    /// Exponential backoff for the given 1-based attempt, capped at `max_backoff`.
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
+        self.initial_backoff
+            .saturating_mul(factor)
+            .min(self.max_backoff)
+    }
+}
+
+/// Full supervisor configuration. Construct via [`SupervisorConfig::new`] and
+/// override fields as needed.
+#[derive(Clone)]
+pub struct SupervisorConfig {
+    /// App-internal state root (XDG data dir). Postgres/valkey subdirs are
+    /// created under it. Never inside the user's Designs folder.
+    pub data_dir: PathBuf,
+    /// `PENPOT_OBJECTS_STORAGE_FS_DIRECTORY` (fs storage backend).
+    pub storage_dir: PathBuf,
+    pub ports: Ports,
+    /// Path to the `valkey-server` binary.
+    pub valkey_path: PathBuf,
+    /// Directory containing the extracted backend artifacts (`penpot.jar`,
+    /// `log4j2.xml`, …); used as the JVM's working directory.
+    pub backend_dir: PathBuf,
+    pub jvm: JvmSpec,
+    /// Pinned `PENPOT_SECRET_KEY` (must be persisted by the caller or every
+    /// restart invalidates all sessions/access tokens — M0 gotcha #7).
+    pub secret_key: String,
+    /// `PENPOT_PUBLIC_URI` — the proxy origin, e.g. `http://localhost:8686`.
+    pub public_uri: String,
+    /// `PENPOT_FLAGS` value.
+    pub penpot_flags: String,
+    /// Extra backend env vars appended last (they override the generated ones).
+    pub extra_backend_env: Vec<(String, String)>,
+    /// Postgres database name provisioned on first start.
+    pub db_name: String,
+    /// Password for the embedded Postgres `postgres` superuser.
+    pub db_password: String,
+    /// Version requirement for the embedded Postgres binaries.
+    pub postgres_version: VersionReq,
+    pub restart: RestartPolicy,
+    /// Grace period between SIGTERM and SIGKILL on shutdown.
+    pub shutdown_grace: Duration,
+    /// Readiness timeout for valkey (PING).
+    pub valkey_ready_timeout: Duration,
+    /// Readiness timeout for the backend (`GET /readyz`); the JVM + migrations
+    /// can take a while on first boot.
+    pub backend_ready_timeout: Duration,
+    /// How often the postgres watchdog probes the port (0 disables it).
+    pub postgres_check_interval: Duration,
+    pub notify: Option<NotifyHook>,
+}
+
+impl SupervisorConfig {
+    pub fn new(
+        data_dir: impl Into<PathBuf>,
+        storage_dir: impl Into<PathBuf>,
+        valkey_path: impl Into<PathBuf>,
+        backend_dir: impl Into<PathBuf>,
+        jvm: JvmSpec,
+        secret_key: impl Into<String>,
+        public_uri: impl Into<String>,
+    ) -> Self {
+        SupervisorConfig {
+            data_dir: data_dir.into(),
+            storage_dir: storage_dir.into(),
+            ports: Ports::default(),
+            valkey_path: valkey_path.into(),
+            backend_dir: backend_dir.into(),
+            jvm,
+            secret_key: secret_key.into(),
+            public_uri: public_uri.into(),
+            penpot_flags: DEFAULT_PENPOT_FLAGS.to_string(),
+            extra_backend_env: Vec::new(),
+            db_name: "penpot".to_string(),
+            db_password: "penpot".to_string(),
+            postgres_version: VersionReq::parse(DEFAULT_POSTGRES_VERSION)
+                .expect("default postgres version is valid"),
+            restart: RestartPolicy::default(),
+            shutdown_grace: Duration::from_secs(10),
+            valkey_ready_timeout: Duration::from_secs(15),
+            backend_ready_timeout: Duration::from_secs(180),
+            postgres_check_interval: Duration::from_secs(5),
+            notify: None,
+        }
+    }
+
+    fn postgres_config(&self) -> PostgresConfig {
+        let root = self.data_dir.join("postgres");
+        PostgresConfig {
+            install_dir: root.join("install"),
+            data_dir: root.join("data"),
+            password_file: root.join(".pgpass"),
+            port: self.ports.postgres,
+            password: self.db_password.clone(),
+            db_name: self.db_name.clone(),
+            version: self.postgres_version.clone(),
+            timeout: Duration::from_secs(300),
+        }
+    }
+
+    fn valkey_dir(&self) -> PathBuf {
+        self.data_dir.join("valkey")
+    }
+}
+
+/// Connection endpoints, available once [`Supervisor::start`] returns.
+#[derive(Debug, Clone)]
+pub struct Readiness {
+    /// Full Postgres URI (with credentials) for direct DB access.
+    pub postgres_uri: String,
+    /// `redis://…` URI the backend was pointed at.
+    pub valkey_uri: String,
+    /// Backend HTTP base, e.g. `http://127.0.0.1:6161`.
+    pub backend_base_url: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SupervisorError {
+    #[error("postgres: {0}")]
+    Postgres(#[from] postgresql_embedded::Error),
+    #[error("{service} failed to become ready: {reason}")]
+    ServiceFailed { service: Service, reason: String },
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Command line + environment for the backend JVM, replicating the
+/// `penpotapp/backend:2.16.2` container contract. Pure function → unit-tested
+/// without spawning anything.
+pub fn backend_command(config: &SupervisorConfig) -> (PathBuf, Vec<String>, Vec<(String, String)>) {
+    let mut args: Vec<String> = config.jvm.flags.clone();
+    args.push("-jar".into());
+    args.push(config.jvm.jar.to_string_lossy().into_owned());
+    args.extend(config.jvm.extra_args.iter().cloned());
+
+    let mut env: Vec<(String, String)> = vec![
+        // Bind localhost only; port per config.
+        ("PENPOT_HTTP_SERVER_HOST".into(), "127.0.0.1".into()),
+        ("PENPOT_HTTP_SERVER_PORT".into(), config.ports.backend.to_string()),
+        (
+            "PENPOT_DATABASE_URI".into(),
+            format!("postgresql://127.0.0.1:{}/{}", config.ports.postgres, config.db_name),
+        ),
+        // The embedded-postgres bootstrap superuser is always `postgres`.
+        ("PENPOT_DATABASE_USERNAME".into(), "postgres".into()),
+        ("PENPOT_DATABASE_PASSWORD".into(), config.db_password.clone()),
+        ("PENPOT_REDIS_URI".into(), format!("redis://127.0.0.1:{}/0", config.ports.valkey)),
+        ("PENPOT_OBJECTS_STORAGE_BACKEND".into(), "fs".into()),
+        (
+            "PENPOT_OBJECTS_STORAGE_FS_DIRECTORY".into(),
+            config.storage_dir.to_string_lossy().into_owned(),
+        ),
+        ("PENPOT_SECRET_KEY".into(), config.secret_key.clone()),
+        ("PENPOT_PUBLIC_URI".into(), config.public_uri.clone()),
+        ("PENPOT_TELEMETRY_ENABLED".into(), "false".into()),
+        ("PENPOT_FLAGS".into(), config.penpot_flags.clone()),
+    ];
+    // Later entries override earlier ones when applied to the Command.
+    env.extend(config.extra_backend_env.iter().cloned());
+
+    (config.jvm.java_path.clone(), args, env)
+}
+
+/// Command line for `valkey-server`: localhost-only bind, configured port, no
+/// persistence (msgbus only).
+pub fn valkey_command(config: &SupervisorConfig) -> (PathBuf, Vec<String>) {
+    let args = vec![
+        "--port".into(),
+        config.ports.valkey.to_string(),
+        "--bind".into(),
+        "127.0.0.1".into(),
+        "--save".into(),
+        String::new(), // disable RDB snapshots
+        "--appendonly".into(),
+        "no".into(),
+        "--daemonize".into(),
+        "no".into(),
+        "--dir".into(),
+        config.valkey_dir().to_string_lossy().into_owned(),
+    ];
+    (config.valkey_path.clone(), args)
+}
+
+/// The supervisor. Owns the three services; kills them on [`shutdown`] and
+/// (best-effort) on drop — no orphans.
+///
+/// [`shutdown`]: Supervisor::shutdown
+pub struct Supervisor {
+    config: SupervisorConfig,
+    notifier: Notifier,
+    postgres: Option<EmbeddedPostgres>,
+    postgres_watchdog: Option<tokio::task::JoinHandle<()>>,
+    valkey: Option<ServiceHandle>,
+    backend: Option<ServiceHandle>,
+    shutdown_done: bool,
+}
+
+impl Supervisor {
+    pub fn new(config: SupervisorConfig) -> Self {
+        let notifier = Notifier(config.notify.clone());
+        Supervisor {
+            config,
+            notifier,
+            postgres: None,
+            postgres_watchdog: None,
+            valkey: None,
+            backend: None,
+            shutdown_done: false,
+        }
+    }
+
+    /// Start postgres → valkey → backend, returning once all three are ready.
+    ///
+    /// On the very first run the embedded Postgres binaries are downloaded
+    /// (network required once); afterwards everything is offline.
+    pub async fn start(&mut self) -> Result<Readiness, SupervisorError> {
+        std::fs::create_dir_all(&self.config.data_dir)?;
+        std::fs::create_dir_all(&self.config.storage_dir)?;
+        std::fs::create_dir_all(self.config.valkey_dir())?;
+
+        // --- 1. Postgres (embedded) -------------------------------------
+        self.notifier.emit(SupervisorEvent::Starting { service: Service::Postgres });
+        let mut pg = EmbeddedPostgres::new(self.config.postgres_config());
+        let postgres_uri = pg.start().await?;
+        self.notifier.emit(SupervisorEvent::Ready { service: Service::Postgres });
+        let pg_settings = pg.settings_clone();
+        self.postgres = Some(pg);
+        if !self.config.postgres_check_interval.is_zero() {
+            self.postgres_watchdog = Some(tokio::spawn(postgres::watchdog(
+                pg_settings,
+                self.config.ports.postgres,
+                self.config.postgres_check_interval,
+                self.config.restart,
+                self.notifier.clone(),
+            )));
+        }
+
+        // --- 2. Valkey ----------------------------------------------------
+        let (valkey_program, valkey_args) = valkey_command(&self.config);
+        let valkey_spec = ChildSpec {
+            service: Service::Valkey,
+            program: valkey_program,
+            args: valkey_args,
+            envs: Vec::new(),
+            cwd: Some(self.config.valkey_dir()),
+            probe: Probe::ValkeyPing { port: self.config.ports.valkey },
+            ready_timeout: self.config.valkey_ready_timeout,
+        };
+        let valkey = ServiceHandle::spawn(
+            valkey_spec,
+            self.config.restart,
+            self.config.shutdown_grace,
+            self.notifier.clone(),
+        );
+        valkey.wait_ready().await.map_err(|reason| SupervisorError::ServiceFailed {
+            service: Service::Valkey,
+            reason,
+        })?;
+        self.valkey = Some(valkey);
+
+        // --- 3. Backend JVM ------------------------------------------------
+        let (program, args, envs) = backend_command(&self.config);
+        let backend_spec = ChildSpec {
+            service: Service::Backend,
+            program,
+            args,
+            envs,
+            cwd: Some(self.config.backend_dir.clone()),
+            probe: Probe::HttpOk { port: self.config.ports.backend, path: "/readyz".into() },
+            ready_timeout: self.config.backend_ready_timeout,
+        };
+        let backend = ServiceHandle::spawn(
+            backend_spec,
+            self.config.restart,
+            self.config.shutdown_grace,
+            self.notifier.clone(),
+        );
+        backend.wait_ready().await.map_err(|reason| SupervisorError::ServiceFailed {
+            service: Service::Backend,
+            reason,
+        })?;
+        self.backend = Some(backend);
+
+        Ok(Readiness {
+            postgres_uri,
+            valkey_uri: format!("redis://127.0.0.1:{}/0", self.config.ports.valkey),
+            backend_base_url: format!("http://127.0.0.1:{}", self.config.ports.backend),
+        })
+    }
+
+    /// Orderly shutdown, reverse start order: backend → valkey → postgres.
+    /// SIGTERM first, SIGKILL after the grace period. Idempotent.
+    pub async fn shutdown(&mut self) {
+        if self.shutdown_done {
+            return;
+        }
+        self.shutdown_done = true;
+
+        // Stop the watchdog first so it doesn't resurrect postgres below.
+        if let Some(watchdog) = self.postgres_watchdog.take() {
+            watchdog.abort();
+        }
+        if let Some(backend) = self.backend.take() {
+            backend.shutdown().await;
+        }
+        if let Some(valkey) = self.valkey.take() {
+            valkey.shutdown().await;
+        }
+        if let Some(mut pg) = self.postgres.take() {
+            if let Err(error) = pg.stop().await {
+                warn!(%error, "postgres did not stop cleanly");
+            }
+            self.notifier.emit(SupervisorEvent::Stopped { service: Service::Postgres });
+        }
+    }
+}
+
+impl Drop for Supervisor {
+    /// Best-effort no-orphan guarantee if the supervisor is dropped without
+    /// `shutdown()`: abort supervision tasks and SIGKILL any live children.
+    /// The embedded Postgres handle stops its server in its own `Drop`.
+    fn drop(&mut self) {
+        if self.shutdown_done {
+            return;
+        }
+        if let Some(watchdog) = self.postgres_watchdog.take() {
+            watchdog.abort();
+        }
+        if let Some(backend) = self.backend.take() {
+            backend.kill_now();
+        }
+        if let Some(valkey) = self.valkey.take() {
+            valkey.kill_now();
+        }
+        // `self.postgres` drops after this body: postgresql_embedded's Drop
+        // runs `pg_ctl stop` synchronously if the server is still up.
+    }
+}
+
+/// Await a `watch::Receiver<ReadyState>` until Ready (Ok) or Failed (Err).
+pub(crate) async fn await_ready(rx: &mut watch::Receiver<ReadyState>) -> Result<(), String> {
+    loop {
+        match &*rx.borrow() {
+            ReadyState::Ready => return Ok(()),
+            ReadyState::Failed(reason) => return Err(reason.clone()),
+            ReadyState::Pending => {}
+        }
+        if rx.changed().await.is_err() {
+            return Err("supervision task exited before readiness".to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> SupervisorConfig {
+        let mut config = SupervisorConfig::new(
+            "/data/penpot-local",
+            "/data/penpot-local/assets",
+            "/usr/bin/valkey-server",
+            "/data/penpot-local/runtime/backend",
+            JvmSpec::penpot_2_16("/usr/bin/java"),
+            "sekrit",
+            "http://localhost:8686",
+        );
+        config.ports = Ports { postgres: 5433, valkey: 6380, backend: 6161 };
+        config
+    }
+
+    fn env_get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        // Last occurrence wins, mirroring Command::env application order.
+        env.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn backoff_is_exponential_and_capped() {
+        let policy = RestartPolicy {
+            max_retries: 10,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+            stable_after: Duration::from_secs(30),
+        };
+        assert_eq!(policy.backoff(1), Duration::from_millis(500));
+        assert_eq!(policy.backoff(2), Duration::from_secs(1));
+        assert_eq!(policy.backoff(3), Duration::from_secs(2));
+        assert_eq!(policy.backoff(7), Duration::from_secs(30)); // 32s capped
+        assert_eq!(policy.backoff(100), Duration::from_secs(30)); // no overflow
+    }
+
+    #[test]
+    fn backend_command_replicates_image_contract() {
+        let config = test_config();
+        let (program, args, _env) = backend_command(&config);
+        assert_eq!(program, PathBuf::from("/usr/bin/java"));
+        // Flags exactly as in penpotapp/backend:2.16.2 run.sh, then -jar, then
+        // the entrypoint flag.
+        assert_eq!(
+            args,
+            vec![
+                "-Dim4java.useV7=true",
+                "-Djava.util.logging.manager=org.apache.logging.log4j.jul.LogManager",
+                "-Dlog4j2.configurationFile=log4j2.xml",
+                "-XX:-OmitStackTraceInFastThrow",
+                "--sun-misc-unsafe-memory-access=allow",
+                "--enable-native-access=ALL-UNNAMED",
+                "--enable-preview",
+                "-jar",
+                "penpot.jar",
+                "-m",
+                "app.main",
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_env_is_complete() {
+        let config = test_config();
+        let (_, _, env) = backend_command(&config);
+        assert_eq!(env_get(&env, "PENPOT_HTTP_SERVER_HOST"), Some("127.0.0.1"));
+        assert_eq!(env_get(&env, "PENPOT_HTTP_SERVER_PORT"), Some("6161"));
+        assert_eq!(
+            env_get(&env, "PENPOT_DATABASE_URI"),
+            Some("postgresql://127.0.0.1:5433/penpot")
+        );
+        assert_eq!(env_get(&env, "PENPOT_DATABASE_USERNAME"), Some("postgres"));
+        assert_eq!(env_get(&env, "PENPOT_DATABASE_PASSWORD"), Some("penpot"));
+        assert_eq!(env_get(&env, "PENPOT_REDIS_URI"), Some("redis://127.0.0.1:6380/0"));
+        assert_eq!(env_get(&env, "PENPOT_OBJECTS_STORAGE_BACKEND"), Some("fs"));
+        assert_eq!(
+            env_get(&env, "PENPOT_OBJECTS_STORAGE_FS_DIRECTORY"),
+            Some("/data/penpot-local/assets")
+        );
+        assert_eq!(env_get(&env, "PENPOT_SECRET_KEY"), Some("sekrit"));
+        assert_eq!(env_get(&env, "PENPOT_PUBLIC_URI"), Some("http://localhost:8686"));
+        assert_eq!(env_get(&env, "PENPOT_TELEMETRY_ENABLED"), Some("false"));
+        assert_eq!(env_get(&env, "PENPOT_FLAGS"), Some(DEFAULT_PENPOT_FLAGS));
+    }
+
+    #[test]
+    fn extra_backend_env_overrides_generated_values() {
+        let mut config = test_config();
+        config.extra_backend_env =
+            vec![("PENPOT_FLAGS".into(), "enable-prepl-server".into())];
+        let (_, _, env) = backend_command(&config);
+        assert_eq!(env_get(&env, "PENPOT_FLAGS"), Some("enable-prepl-server"));
+    }
+
+    #[test]
+    fn valkey_command_is_localhost_only_without_persistence() {
+        let config = test_config();
+        let (program, args) = valkey_command(&config);
+        assert_eq!(program, PathBuf::from("/usr/bin/valkey-server"));
+        let joined = args.join(" ");
+        assert!(joined.contains("--port 6380"));
+        assert!(joined.contains("--bind 127.0.0.1"));
+        assert!(joined.contains("--appendonly no"));
+        assert!(joined.contains("--daemonize no"));
+        // `--save` followed by an empty argument disables RDB snapshots.
+        let save_idx = args.iter().position(|a| a == "--save").unwrap();
+        assert_eq!(args[save_idx + 1], "");
+    }
+}

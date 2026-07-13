@@ -1,6 +1,18 @@
 # Spike/scratch artifacts (zips, extracted trees from roundtrip runs)
 m0/roundtrip-work/
 
+# Rust build output
+/target/
+
+# Extracted Penpot artifacts (backend JAR, frontend build, JRE, binaries) — never commit
+/runtime/
+
+# Tauri build-time generated schemas
+apps/desktop/gen/
+
+# NOTE: apps/desktop/placeholder-dist/ is intentionally tracked (static "booting"
+# page needed by tauri.conf.json frontendDist); do not ignore it.
+
 # Local assistant session history
 .remember/
 

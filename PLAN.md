@@ -97,7 +97,16 @@ RPC: login, create file, `export-binfile`, unzip, normalize, re-zip, `import-bin
 round-trip (IDs, timestamps) + **in-place import** (`import-binfile` with `file-id`) verified to
 round-trip with the same file ID + asset serving without nginx characterized (X-Accel behavior, risk 6).
 
-### M1 — Process supervisor
+### M1 — Process supervisor — ✅ DONE 2026-07-13
+
+All exit criteria met (independently verified + follow-up shutdown fix); evidence and M2
+implications in `docs/milestones/m1.md`. Headline: 56 workspace tests green; 9/9 smoke steps
+(incl. X-Accel round-trip, crash-restart of valkey/backend, token persistence across boots);
+signal-clean shutdown on both headless and GUI paths. Notable: upstream `app.main` opens an
+unauthenticated nrepl on 0.0.0.0:6064 with no off switch — the app boots the backend via a
+`clojure.main -e` entry instead (guarded by a unit test). Runtime deps discovered for M4
+packaging: ImageMagick `identify`, node, JDK 26, valkey.
+
 Tauri app that launches embedded Postgres + Valkey + Penpot backend as supervised children,
 provisions the single user, serves the frontend, opens one window auto-logged-in.
 Clean shutdown kills children; crash of a child restarts it.
