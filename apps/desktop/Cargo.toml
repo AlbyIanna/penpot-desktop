@@ -21,7 +21,7 @@ path = "src/bin/headless.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -32,7 +32,11 @@ proxy = { path = "../../crates/proxy" }
 penpot-rpc = { path = "../../crates/penpot-rpc" }
 sync-daemon = { path = "../../crates/sync-daemon" }
 axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 http = "1"
 directories = "5"
 rand = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

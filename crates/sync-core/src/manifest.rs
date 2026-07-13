@@ -35,6 +35,13 @@ pub struct ManifestEntry {
     /// Last `revn` observed in the DB when this entry was synced. Advisory
     /// only — never a conflict signal (see module docs).
     pub revn: i64,
+    /// DB `modifiedAt` observed at last sync. Advisory like `revn` — the
+    /// pair `(revn, dbModifiedAt)` is the cheap "did the DB move since we
+    /// last synced" hint Direction B checks before an in-place import; the
+    /// conflict *decision* still keys off `lastSyncedHash`. Empty string =
+    /// unknown (entry written by an M2 daemon) → fall back to revn alone.
+    #[serde(default)]
+    pub db_modified_at: String,
     /// Semantic tree hash (see [`crate::hash::semantic_tree_hash`]) of the
     /// on-disk directory at last successful sync. The no-op detector and the
     /// conflict rule both key off this.

@@ -30,6 +30,35 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
             let running = running_setup.clone();
+
+            // --- M3 sync-status tray -----------------------------------
+            // The tray must be created here (main thread, before the async
+            // boot completes), but the real sync daemon only exists at the
+            // end of boot() — so the tray subscribes to a DaemonStatusBridge
+            // now and the boot task attaches the daemon to it below.
+            // PENPOT_LOCAL_TRAY_DEMO=1 keeps the scripted mock instead (menu
+            // QA without a running stack).
+            let demo = std::env::var_os("PENPOT_LOCAL_TRAY_DEMO").is_some();
+            let bridge = penpot_desktop::status::DaemonStatusBridge::new();
+            let tray_result = if demo {
+                let mock = Arc::new(penpot_desktop::status::MockStatusSource::new(
+                    Default::default(),
+                ));
+                let result = penpot_desktop::tray::spawn_tray(
+                    app.handle(),
+                    mock.subscribe(),
+                    mock.control(),
+                );
+                tauri::async_runtime::spawn(async move {
+                    mock.play_demo(std::time::Duration::from_secs(4)).await;
+                });
+                result
+            } else {
+                penpot_desktop::tray::spawn_tray(app.handle(), bridge.subscribe(), bridge.control())
+            };
+            if let Err(e) = tray_result {
+                tracing::error!("failed to create the sync-status tray: {e}");
+            }
             // The window already shows placeholder-dist ("booting…"); bring
             // the stack up asynchronously and swap the URL when ready.
             tauri::async_runtime::spawn(async move {
@@ -43,6 +72,19 @@ fn main() {
                             .bootstrap_url()
                             .parse()
                             .expect("bootstrap url is valid");
+                        // Bind the tray to the real sync daemon (no-op in
+                        // demo mode, where the tray watches the mock).
+                        if !demo {
+                            match (running_app.sync_status(), running_app.sync_control()) {
+                                (Some(status), Some(control)) => {
+                                    bridge.attach(status, control);
+                                    tracing::info!("tray bound to the sync daemon");
+                                }
+                                _ => tracing::warn!(
+                                    "sync daemon not running; tray stays in its idle state"
+                                ),
+                            }
+                        }
                         *running.lock().await = Some(running_app);
                         if let Some(window) = handle.get_webview_window("main") {
                             if let Err(e) = window.navigate(url) {

@@ -120,11 +120,14 @@ rpc() { # rpc <command> <json-body> [auth-header]
 echo "== M1 smoke: data dir $DATA_DIR, proxy $BASE"
 
 # --- build -----------------------------------------------------------------
-if ! (cd "$ROOT" && cargo build -q -p penpot-desktop --bin headless); then
-    fail "build (cargo build -p penpot-desktop --bin headless)"
+# Also build the SIGKILL orphan watchdog sibling (crates/supervisor bin):
+# `cargo build -p penpot-desktop` does NOT build dependency-crate bins, and
+# without target/debug/penpot-watchdog the boot proceeds watchdog-less (M3).
+if ! (cd "$ROOT" && cargo build -q -p penpot-desktop --bin headless -p supervisor --bin penpot-watchdog); then
+    fail "build (headless + penpot-watchdog)"
     exit 1
 fi
-pass "build (cargo build -p penpot-desktop --bin headless)"
+pass "build (headless + penpot-watchdog)"
 
 # --- first boot --------------------------------------------------------------
 start_headless

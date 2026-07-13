@@ -96,6 +96,13 @@ impl ServiceHandle {
         *self.pid.lock().expect("pid mutex")
     }
 
+    /// Shared live view of the current pid (updates across crash respawns);
+    /// used by the orphan-watchdog pid feeder.
+    #[cfg(unix)]
+    pub(crate) fn pid_slot(&self) -> Arc<Mutex<Option<u32>>> {
+        Arc::clone(&self.pid)
+    }
+
     /// Orderly stop: signal the supervision task, which SIGTERMs the child and
     /// SIGKILLs it after the grace period. Falls back to a hard kill if the
     /// task itself does not wind down.
