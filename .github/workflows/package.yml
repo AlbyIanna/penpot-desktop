@@ -78,9 +78,10 @@ jobs:
           cp -a "$GITHUB_WORKSPACE/dist/penpot-runtime" squashfs-root/usr/lib/penpot-desktop/penpot-runtime
           rm -rf squashfs-root/usr/lib/penpot-desktop/penpot-runtime/.cache
           # appimagetool = mksquashfs + embedded runtime, NO dependency
-          # analysis — the injected bundle stays byte-exact.
+          # analysis — the injected bundle stays byte-exact. Pinned 1.9.1.
           curl -fsSL --retry 3 -o appimagetool \
-            "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage"
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
           chmod +x appimagetool
           rm -f "$APPIMAGE"
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
