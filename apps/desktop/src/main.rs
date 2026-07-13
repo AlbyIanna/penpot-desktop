@@ -27,6 +27,19 @@ fn main() {
     let running_setup = running.clone();
 
     let app = tauri::Builder::default()
+        // M5: single-instance guard — MUST be the first plugin registered so
+        // it runs before anything else. A second launch never boots its own
+        // supervisor stack (M4 finding: postgres would refuse the shared data
+        // dir); instead the running instance gets this callback and refocuses
+        // its window while the second process exits immediately.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tracing::info!("second launch detected: focusing the existing window");
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(move |app| {
             let handle = app.handle().clone();
             let running = running_setup.clone();
@@ -40,6 +53,25 @@ fn main() {
             // QA without a running stack).
             let demo = std::env::var_os("PENPOT_LOCAL_TRAY_DEMO").is_some();
             let bridge = penpot_desktop::status::DaemonStatusBridge::new();
+            // The bundled `penpot-runtime/` (M4) lives in the Tauri
+            // resources dir; in dev there is no bundle there and the
+            // resolver falls back to env overrides + repo runtime/.
+            // Resolved HERE (cheap, sync) so the tray knows the designs dir
+            // for its file-manager actions (M5); the boot task consumes the
+            // same resolution below — a resolve error is reported there,
+            // exactly like pre-M5.
+            let resource_dir = app.path().resource_dir().ok();
+            let config = AppConfig::resolve_with_resources(resource_dir);
+            let designs_dir = config.as_ref().ok().map(|c| c.designs_dir.clone());
+            // M5: the "Exports:" tray row exists only when the board-export
+            // service will run (PENPOT_LOCAL_EXPORTS=1 resolved a layout);
+            // the bridge late-binds it exactly like the sync-status one.
+            let exports_enabled = config
+                .as_ref()
+                .map(|c| c.exporter.is_some())
+                .unwrap_or(false);
+            let export_bridge = penpot_desktop::status::ExportStatusBridge::new();
+            let exports_rx = exports_enabled.then(|| export_bridge.subscribe());
             let tray_result = if demo {
                 let mock = Arc::new(penpot_desktop::status::MockStatusSource::new(
                     Default::default(),
@@ -48,25 +80,29 @@ fn main() {
                     app.handle(),
                     mock.subscribe(),
                     mock.control(),
+                    designs_dir,
+                    None,
                 );
                 tauri::async_runtime::spawn(async move {
                     mock.play_demo(std::time::Duration::from_secs(4)).await;
                 });
                 result
             } else {
-                penpot_desktop::tray::spawn_tray(app.handle(), bridge.subscribe(), bridge.control())
+                penpot_desktop::tray::spawn_tray(
+                    app.handle(),
+                    bridge.subscribe(),
+                    bridge.control(),
+                    designs_dir,
+                    exports_rx,
+                )
             };
             if let Err(e) = tray_result {
                 tracing::error!("failed to create the sync-status tray: {e}");
             }
-            // The bundled `penpot-runtime/` (M4) lives in the Tauri
-            // resources dir; in dev there is no bundle there and the
-            // resolver falls back to env overrides + repo runtime/.
-            let resource_dir = app.path().resource_dir().ok();
             // The window already shows placeholder-dist ("booting…"); bring
             // the stack up asynchronously and swap the URL when ready.
             tauri::async_runtime::spawn(async move {
-                let booted = match AppConfig::resolve_with_resources(resource_dir) {
+                let booted = match config {
                     Ok(config) => boot(config).await,
                     Err(e) => Err(e),
                 };
@@ -88,6 +124,11 @@ fn main() {
                                     "sync daemon not running; tray stays in its idle state"
                                 ),
                             }
+                            // M5: bind the "Exports:" row to board-export.
+                            if let Some(status) = running_app.export_status() {
+                                export_bridge.attach(status);
+                                tracing::info!("tray bound to the board-export service");
+                            }
                         }
                         *running.lock().await = Some(running_app);
                         if let Some(window) = handle.get_webview_window("main") {
@@ -98,8 +139,28 @@ fn main() {
                     }
                     Err(e) => {
                         tracing::error!("boot failed: {e:#}");
+                        // M5 pre-flight failures get a friendlier surface:
+                        // name the offending path in the title + a native
+                        // dialog. The process stays alive showing the error
+                        // (nothing was spawned; there is nothing to crash-
+                        // loop) and exits cleanly when the user quits.
+                        let title = match e.downcast_ref::<penpot_desktop::preflight::NonBmpPath>()
+                        {
+                            Some(v) => {
+                                penpot_desktop::dialog::native_error_dialog(
+                                    "Penpot Local cannot start",
+                                    &v.to_string(),
+                                );
+                                format!(
+                                    "Penpot Local — cannot start: emoji in the {} path: {}",
+                                    v.label,
+                                    v.path.display()
+                                )
+                            }
+                            None => "Penpot Local — boot failed (see logs)".to_string(),
+                        };
                         if let Some(window) = handle.get_webview_window("main") {
-                            let _ = window.set_title("Penpot Local — boot failed (see logs)");
+                            let _ = window.set_title(&title);
                         }
                     }
                 }

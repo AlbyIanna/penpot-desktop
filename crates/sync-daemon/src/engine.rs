@@ -20,7 +20,7 @@
 //! tracker before the next poll cycle can run, so its own import never looks
 //! like a DB change.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -34,7 +34,10 @@ use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::paths;
-use crate::plan::{db_moved, decide, DbFacts, Decision, DiskFacts, ManifestFacts};
+use crate::plan::{
+    db_moved, decide, folder_of, plan_rekeys, DbFacts, Decision, DiskFacts, ManifestFacts,
+    MissingEntry, RekeyOp, SurvivingEntry, UnclaimedDir,
+};
 use crate::retry::with_retry;
 use crate::status::{FileState, StatusHub};
 use crate::tracker::ChangeTracker;
@@ -199,6 +202,12 @@ pub(crate) struct Engine {
     tracker: ChangeTracker,
     fs_debounce: FsDebounce,
     status: StatusHub,
+    /// Debounced deadline for a *structural sweep* (M5): project-folder
+    /// renames/moves fire watcher events only for the folder itself (FSEvents
+    /// never notifies for children), so those events arm this instead of a
+    /// per-file-dir timer. On fire: re-key pass + route leftovers through the
+    /// normal per-dir handling.
+    sweep_deadline: Option<Instant>,
 }
 
 /// Daemon entry point (spawned by [`crate::spawn`]).
@@ -286,6 +295,7 @@ pub(crate) async fn run(
                     // Pending work is dropped, never half-applied; resume
                     // recovers it with a full rescan.
                     engine.fs_debounce.clear();
+                    engine.sweep_deadline = None;
                     tracing::info!("sync paused");
                 } else {
                     tracing::info!("sync resumed; rescanning the sync root");
@@ -333,6 +343,7 @@ impl Engine {
             tracker: ChangeTracker::new(),
             fs_debounce: FsDebounce::new(),
             status,
+            sweep_deadline: None,
         })
     }
 
@@ -341,12 +352,16 @@ impl Engine {
     // ------------------------------------------------------------------
 
     /// Ingest one raw watcher event path: map it to its owning `.penpot` dir
-    /// and (re)arm that dir's debounce timer.
+    /// and (re)arm that dir's debounce timer. Paths outside any `.penpot` dir
+    /// (project folders — the only watcher trace of a folder rename/move on
+    /// macOS) arm the structural-sweep timer instead.
     fn note_fs_event(&mut self, path: &Path) {
         if let Some(rel) = watcher::map_event_path(&self.cfg.sync_root, path) {
             self.fs_debounce
                 .arm(rel.clone(), Instant::now(), self.cfg.fs_debounce);
             self.status.set_file(&rel, FileState::Pending);
+        } else if watcher::is_structural_event(&self.cfg.sync_root, path) {
+            self.sweep_deadline = Some(Instant::now() + self.cfg.fs_debounce);
         }
     }
 
@@ -370,8 +385,364 @@ impl Engine {
     }
 
     async fn process_due_fs_changes(&mut self) {
+        if self.sweep_deadline.is_some_and(|dl| dl <= Instant::now()) {
+            self.sweep_deadline = None;
+            self.structural_sweep().await;
+        }
         for rel in self.fs_debounce.take_due(Instant::now()) {
             self.handle_fs_change(&rel).await;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M5: OS-side rename/move — re-key instead of delete + reimport
+    // ------------------------------------------------------------------
+
+    /// Pair manifest entries whose dir vanished with unclaimed on-disk dirs
+    /// of identical semantic hash ([`plan_rekeys`]) and execute the ops:
+    /// re-key the manifest path (SAME fileId, NO reimport) and mirror the
+    /// change into the DB (`move-files` / `rename-file` / `rename-project`).
+    ///
+    /// DB mirroring is best-effort: a failure is surfaced loudly but never
+    /// blocks the re-key — preserving the file's identity is the invariant
+    /// (the DB is a disposable cache; an unmirrored rename is cosmetic drift
+    /// that later imports/reconciliations resolve under the same id).
+    /// Ambiguous or unpaired changes are left for the M3-era handling
+    /// (vanish = loud log + DB kept; appear = import-as-new).
+    ///
+    /// Returns the number of re-keyed files.
+    async fn rekey_pass(&mut self) -> anyhow::Result<usize> {
+        let disk_dirs = walk_penpot_dirs(&self.cfg.sync_root)?;
+        let disk_set: BTreeSet<&str> = disk_dirs.iter().map(String::as_str).collect();
+        let missing: Vec<(String, ManifestEntry)> = self
+            .manifest
+            .files
+            .iter()
+            .filter(|(_, e)| !disk_set.contains(e.path.as_str()))
+            .map(|(id, e)| (id.clone(), e.clone()))
+            .collect();
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let claimed: BTreeSet<&str> = self
+            .manifest
+            .files
+            .values()
+            .map(|e| e.path.as_str())
+            .collect();
+        let mut unclaimed: Vec<(String, String)> = Vec::new(); // (rel, hash)
+        for rel in &disk_dirs {
+            if claimed.contains(rel.as_str()) {
+                continue;
+            }
+            match semantic_tree_hash(&self.cfg.sync_root.join(rel)) {
+                Ok(h) => unclaimed.push((rel.clone(), h)),
+                Err(e) => tracing::debug!(
+                    path = %rel,
+                    error = %e,
+                    "unhashable unclaimed dir; not a re-key candidate"
+                ),
+            }
+        }
+        if unclaimed.is_empty() {
+            return Ok(0);
+        }
+        let surviving: Vec<(&str, &str)> = self
+            .manifest
+            .files
+            .values()
+            .filter(|e| disk_set.contains(e.path.as_str()))
+            .map(|e| (e.path.as_str(), e.project_id.as_str()))
+            .collect();
+        let mut existing_folders: BTreeSet<String> = BTreeSet::new();
+        for (_, entry) in &missing {
+            let folder = folder_of(&entry.path);
+            if !folder.is_empty() && self.cfg.sync_root.join(folder).is_dir() {
+                existing_folders.insert(folder.to_string());
+            }
+        }
+        let ops = plan_rekeys(
+            &missing
+                .iter()
+                .map(|(id, e)| MissingEntry {
+                    file_id: id,
+                    old_rel: &e.path,
+                    last_synced_hash: &e.last_synced_hash,
+                    project_id: &e.project_id,
+                })
+                .collect::<Vec<_>>(),
+            &unclaimed
+                .iter()
+                .map(|(rel, h)| UnclaimedDir {
+                    rel,
+                    semantic_hash: h,
+                })
+                .collect::<Vec<_>>(),
+            &surviving
+                .iter()
+                .map(|(rel, pid)| SurvivingEntry {
+                    rel,
+                    project_id: pid,
+                })
+                .collect::<Vec<_>>(),
+            &existing_folders,
+        );
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        let mut rekeyed = 0usize;
+        for op in ops {
+            rekeyed += self.apply_rekey_op(op).await;
+        }
+        self.manifest.save(&self.cfg.sync_root)?;
+        Ok(rekeyed)
+    }
+
+    /// Execute one [`RekeyOp`] (see [`Self::rekey_pass`] for the policy).
+    /// Returns the number of files re-keyed.
+    async fn apply_rekey_op(&mut self, op: RekeyOp) -> usize {
+        match op {
+            RekeyOp::Relocate {
+                file_id,
+                old_rel,
+                new_rel,
+            } => {
+                let Some(entry) = self.manifest.files.get(&file_id).cloned() else {
+                    return 0;
+                };
+                let old_folder = folder_of(&old_rel).to_string();
+                let new_folder = folder_of(&new_rel).to_string();
+                let (mut project_id, mut project_name) =
+                    (entry.project_id.clone(), entry.project_name.clone());
+                if old_folder != new_folder {
+                    match self.resolve_project_for_folder(&new_folder).await {
+                        Ok((pid, pname)) => {
+                            project_id = pid;
+                            project_name = pname;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                file = %file_id,
+                                folder = %new_folder,
+                                error = format!("{e:#}"),
+                                "cannot resolve the target project for a moved dir; re-keying the path but keeping the old project (drift resolves at the next import/reconciliation, same file id)"
+                            );
+                            self.status.set_last_error(format!(
+                                "move {old_rel} → {new_rel}: target project unresolved: {e:#}"
+                            ));
+                        }
+                    }
+                    if project_id != entry.project_id {
+                        let client = self.client.clone();
+                        let (fid, pid) = (file_id.clone(), project_id.clone());
+                        let moved = with_retry("move-files", || {
+                            let c = client.clone();
+                            let (f, p) = (fid.clone(), pid.clone());
+                            async move { c.move_files(&[f.as_str()], &p).await }
+                        })
+                        .await;
+                        match moved {
+                            Ok(()) => tracing::info!(
+                                file = %file_id,
+                                from = %old_rel,
+                                to = %new_rel,
+                                "OS-side move mirrored to the DB (move-files, same file id)"
+                            ),
+                            Err(e) => {
+                                tracing::error!(
+                                    file = %file_id,
+                                    error = %e,
+                                    "move-files failed; manifest re-keyed anyway (identity preserved; the DB project membership will drift until the next import/reconciliation)"
+                                );
+                                self.status.set_last_error(format!(
+                                    "move-files for {new_rel} failed: {e}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                let old_stem = paths::file_stem_of(&old_rel);
+                let new_stem = paths::file_stem_of(&new_rel);
+                if old_stem != new_stem {
+                    let client = self.client.clone();
+                    let (fid, name) = (file_id.clone(), new_stem.clone());
+                    let renamed = with_retry("rename-file", || {
+                        let c = client.clone();
+                        let (f, n) = (fid.clone(), name.clone());
+                        async move { c.rename_file(&f, &n).await }
+                    })
+                    .await;
+                    match renamed {
+                        // Deliberately NOT recording the bumped modifiedAt in
+                        // the manifest/tracker: the next poll must see the
+                        // rename as a DB change so the export pipeline
+                        // refreshes the name embedded in the on-disk JSON
+                        // (otherwise a later disk-side import would revert
+                        // the rename).
+                        Ok(r) => tracing::info!(
+                            file = %file_id,
+                            name = %r.name,
+                            "OS-side rename mirrored to the DB (rename-file, same file id)"
+                        ),
+                        Err(e) => {
+                            tracing::error!(
+                                file = %file_id,
+                                error = %e,
+                                "rename-file failed; manifest re-keyed anyway (identity preserved; the DB name will drift until the next import/reconciliation)"
+                            );
+                            self.status
+                                .set_last_error(format!("rename-file for {new_rel} failed: {e}"));
+                        }
+                    }
+                }
+                self.rekey_manifest_entry(&file_id, &old_rel, &new_rel, &project_id, &project_name);
+                1
+            }
+            RekeyOp::RenameProject {
+                project_id,
+                old_folder,
+                new_folder,
+                pairs,
+            } => {
+                let client = self.client.clone();
+                let (pid, name) = (project_id.clone(), new_folder.clone());
+                let renamed = with_retry("rename-project", || {
+                    let c = client.clone();
+                    let (p, n) = (pid.clone(), name.clone());
+                    async move { c.rename_project(&p, &n).await }
+                })
+                .await;
+                match renamed {
+                    Ok(()) => tracing::info!(
+                        project = %project_id,
+                        from = %old_folder,
+                        to = %new_folder,
+                        files = pairs.len(),
+                        "OS-side project folder rename mirrored to the DB (rename-project)"
+                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            project = %project_id,
+                            error = %e,
+                            "rename-project failed; manifest re-keyed anyway (identity preserved; the DB project name will drift)"
+                        );
+                        self.status
+                            .set_last_error(format!("rename-project → {new_folder:?} failed: {e}"));
+                    }
+                }
+                let mut n = 0usize;
+                for pair in pairs {
+                    if self.manifest.files.contains_key(&pair.file_id) {
+                        self.rekey_manifest_entry(
+                            &pair.file_id,
+                            &pair.old_rel,
+                            &pair.new_rel,
+                            &project_id,
+                            &new_folder,
+                        );
+                        n += 1;
+                    }
+                }
+                n
+            }
+        }
+    }
+
+    /// Re-key one manifest entry to its new path (same fileId — the whole
+    /// point). `lastSyncedHash`, `revn` and `dbModifiedAt` are deliberately
+    /// untouched: the content did not change, and a rename-file's bumped
+    /// modifiedAt must keep looking like a DB change to the poll loop.
+    fn rekey_manifest_entry(
+        &mut self,
+        file_id: &str,
+        old_rel: &str,
+        new_rel: &str,
+        project_id: &str,
+        project_name: &str,
+    ) {
+        if let Some(e) = self.manifest.files.get_mut(file_id) {
+            e.path = new_rel.to_string();
+            e.project_id = project_id.to_string();
+            e.project_name = project_name.to_string();
+            e.last_synced_at = now_rfc3339();
+        }
+        self.status.remove_file(old_rel);
+        self.status.set_file(new_rel, FileState::Synced);
+        self.status.record_success();
+        tracing::info!(
+            file = %file_id,
+            from = %old_rel,
+            to = %new_rel,
+            "manifest re-keyed (same file id, no reimport)"
+        );
+    }
+
+    /// Project for a folder name: an existing manifest entry under that
+    /// folder wins (the folder ↔ project mapping is manifest-authoritative);
+    /// otherwise find-or-create by name. Root-level dirs use the "imported"
+    /// catch-all, mirroring [`Self::import_as_new`].
+    async fn resolve_project_for_folder(&self, folder: &str) -> anyhow::Result<(String, String)> {
+        if !folder.is_empty() {
+            if let Some(e) = self
+                .manifest
+                .files
+                .values()
+                .find(|e| folder_of(&e.path) == folder)
+            {
+                return Ok((e.project_id.clone(), e.project_name.clone()));
+            }
+        }
+        let name = if folder.is_empty() { "imported" } else { folder };
+        let projects = self.fetch_projects().await?;
+        let mut resolver = ProjectResolver::new(projects);
+        resolver
+            .ensure(&self.client, &self.cfg.team_id, None, name)
+            .await
+    }
+
+    /// Fired by the debounced structural timer: a project folder was
+    /// renamed/moved/created/deleted (macOS FSEvents fires only for the
+    /// folder itself — its children never get events). Run the re-key pass,
+    /// then route leftovers through the normal per-dir handling: unclaimed
+    /// dirs are armed for import-as-new; still-missing entries are logged
+    /// loudly (the DB copy is kept — M3 policy — and re-exported at the next
+    /// startup reconciliation).
+    async fn structural_sweep(&mut self) {
+        match self.rekey_pass().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "structural sweep re-keyed moved/renamed dirs"),
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "structural sweep re-key pass failed");
+                self.status
+                    .set_last_error(format!("structural sweep failed: {e:#}"));
+                return;
+            }
+        }
+        match walk_penpot_dirs(&self.cfg.sync_root) {
+            Ok(dirs) => {
+                let now = Instant::now();
+                let disk: BTreeSet<&str> = dirs.iter().map(String::as_str).collect();
+                for rel in &dirs {
+                    if self.manifest.entry_by_path(rel).is_none() {
+                        // e.g. a whole project folder moved INTO the root:
+                        // its file dirs never produced their own events.
+                        self.fs_debounce.arm(rel.clone(), now, Duration::ZERO);
+                    }
+                }
+                for entry in self.manifest.files.values() {
+                    if !disk.contains(entry.path.as_str()) {
+                        tracing::warn!(
+                            path = %entry.path,
+                            "dir missing after a structural change (folder moved out or deleted?); the DB copy is deliberately kept and will be re-exported at the next startup reconciliation"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "structural sweep walk failed");
+                self.status
+                    .set_last_error(format!("structural sweep walk failed: {e:#}"));
+            }
         }
     }
 
@@ -389,13 +760,21 @@ impl Engine {
     async fn handle_fs_change(&mut self, rel: &str) {
         let target = self.cfg.sync_root.join(rel);
         if !target.is_dir() {
+            if self.manifest.entry_by_path(rel).is_some() {
+                // M5: a vanished dir may be the OLD path of a rename/move —
+                // try to pair it with an unclaimed dir of identical content
+                // before declaring it deleted.
+                if let Err(e) = self.rekey_pass().await {
+                    tracing::warn!(error = format!("{e:#}"), "re-key pass failed for a vanished dir; falling back to the deletion policy");
+                }
+            }
             if let Some((file_id, _)) = self.manifest.entry_by_path(rel) {
                 // M3 policy: a deletion on disk NEVER deletes DB-side. The
                 // next startup reconciliation re-exports the DB version.
                 tracing::error!(
                     file = %file_id,
                     path = %rel,
-                    "file dir deleted (or renamed) on disk; the DB copy is deliberately NOT deleted — restart the app to re-export it, or recreate the directory"
+                    "file dir deleted on disk (no rename/move pair found); the DB copy is deliberately NOT deleted — restart the app to re-export it, or recreate the directory"
                 );
                 self.status.set_file(
                     rel,
@@ -416,10 +795,22 @@ impl Engine {
                 return;
             }
         };
-        let known = self
+        let mut known = self
             .manifest
             .entry_by_path(rel)
             .map(|(id, e)| (id.to_string(), e.clone()));
+        if known.is_none() {
+            // M5: an unknown dir may be the NEW path of a rename/move — try
+            // to pair it before treating it as a brand-new file. A re-keyed
+            // dir then hits the hash-skip arm below (same content).
+            if let Err(e) = self.rekey_pass().await {
+                tracing::warn!(error = format!("{e:#}"), "re-key pass failed for an unknown dir; falling back to import-as-new");
+            }
+            known = self
+                .manifest
+                .entry_by_path(rel)
+                .map(|(id, e)| (id.to_string(), e.clone()));
+        }
         let result: anyhow::Result<Option<String>> = match known {
             Some((file_id, entry)) => {
                 if entry.last_synced_hash == disk_hash {
@@ -1177,7 +1568,21 @@ impl Engine {
             );
         }
 
-        // 2. DB snapshot (retried; the backend may still be settling).
+        // 2. M5: re-key dirs that were moved/renamed across the shutdown
+        //    (same lastSyncedHash under a different path than the manifest
+        //    records) BEFORE the join — otherwise the old path would be
+        //    re-exported as an orphan and the new path imported as a NEW
+        //    file. Runs before the snapshot so any project it creates or
+        //    renames is visible to the decisions below.
+        let rekeyed = self
+            .rekey_pass()
+            .await
+            .context("re-key pass (dirs moved/renamed across the shutdown)")?;
+        if rekeyed > 0 {
+            tracing::info!(count = rekeyed, "startup reconciliation re-keyed moved/renamed dirs (same file ids, no reimport)");
+        }
+
+        // 3. DB snapshot (retried; the backend may still be settling).
         let client = self.client.clone();
         let team = self.cfg.team_id.clone();
         let snap = with_retry("fetch db snapshot", || {
@@ -1188,7 +1593,7 @@ impl Engine {
         .await
         .context("listing projects/files for reconciliation")?;
 
-        // 3. Disk walk + semantic hashes. A tree that cannot be hashed
+        // 4. Disk walk + semantic hashes. A tree that cannot be hashed
         //    (broken JSON) is surfaced and skipped — never fatal, never
         //    destructive.
         let mut disk: BTreeMap<String, String> = BTreeMap::new();
@@ -1205,7 +1610,7 @@ impl Engine {
             }
         }
 
-        // 4. Join: one decision per identity.
+        // 5. Join: one decision per identity.
         let mut actions: Vec<ReconcileAction> = Vec::new();
         for (file_id, entry) in &self.manifest.files {
             if broken.contains(&entry.path) {
@@ -1267,7 +1672,7 @@ impl Engine {
             }
         }
 
-        // 5. Execute: forgets, then imports (so the DB reflects the disk
+        // 6. Execute: forgets, then imports (so the DB reflects the disk
         //    before any exports), then exports, then no-op seeding.
         // Per-file failures are logged loudly and skipped (never fatal): a
         // single permanently-broken file must not wedge the whole daemon in
@@ -1406,7 +1811,7 @@ impl Engine {
             }
         }
 
-        // 6. Seed the tracker (and correct advisory revn/modifiedAt) for what
+        // 7. Seed the tracker (and correct advisory revn/modifiedAt) for what
         //    we just imported: the import reset revn to the binfile's value.
         if !imported_ids.is_empty() {
             let client = self.client.clone();

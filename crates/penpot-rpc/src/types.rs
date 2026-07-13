@@ -146,6 +146,19 @@ impl CreatedFile {
     }
 }
 
+/// Response of `rename-file` (2.16.2 openapi title: "SimplifiedFile"),
+/// verified live in M5: the updated name plus the **bumped** `modifiedAt`
+/// (a rename IS a DB change on the poll surface).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamedFile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    pub modified_at: String,
+}
+
 /// Response of `update-file` (rpc-endpoints.md §update-file).
 ///
 /// `revn` is the file revision **before** this update; `lagged` contains all

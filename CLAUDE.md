@@ -36,3 +36,11 @@ Before claiming sync/round-trip work done: start the spike stack
 (`docker compose -f m0/docker/docker-compose.yaml up -d`) and run `python3 scripts/roundtrip.py`
 — it is idempotent and must report identical semantic hashes A=B=C. This script is the seed of
 the e2e harness (grows into `just e2e` per PLAN.md).
+
+The milestone suites are that harness grown up — they must stay green before claiming any
+milestone-touching work done (each has a dedicated port set; see the script headers):
+`cargo test --workspace`, `scripts/m1-smoke.sh` (`just smoke`), `scripts/m2-invariant.sh`
+(`just invariant` — THE core invariant), `scripts/m3-sync.sh` (`just m3`),
+`scripts/m4-artifact-test.sh` (rebuild `scripts/build-dmg.sh` first if dist/ is stale),
+`scripts/m5-features.sh` (`just m5` — needs the dev-mode exporter: fetch-penpot.sh
+--with-browsers + host node).

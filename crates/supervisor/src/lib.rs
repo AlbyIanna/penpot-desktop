@@ -61,12 +61,14 @@ pub const DEFAULT_POSTGRES_VERSION: &str = "=15.18.0";
 pub const DEFAULT_PENPOT_FLAGS: &str =
     "enable-access-tokens disable-email-verification disable-secure-session-cookies disable-onboarding";
 
-/// The three supervised services, in start order.
+/// The supervised services, in start order. `Exporter` is optional (M5) and
+/// only present when [`SupervisorConfig::exporter`] is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Service {
     Postgres,
     Valkey,
     Backend,
+    Exporter,
 }
 
 impl fmt::Display for Service {
@@ -75,6 +77,7 @@ impl fmt::Display for Service {
             Service::Postgres => write!(f, "postgres"),
             Service::Valkey => write!(f, "valkey"),
             Service::Backend => write!(f, "backend"),
+            Service::Exporter => write!(f, "exporter"),
         }
     }
 }
@@ -195,6 +198,60 @@ impl JvmSpec {
     }
 }
 
+/// How to run the optional `penpot-exporter` node service (M5 per-board
+/// SVG/PNG rendering; **dev-mode only** — packaging it is out of scope).
+///
+/// Host requirements (documented, not bundled):
+/// - a host `node` binary (upstream image pins v24.16.0; v25.8.1 verified
+///   working end-to-end on macOS arm64 — the extracted app is pure JS with
+///   zero native `.node` bindings);
+/// - the extracted exporter app (`scripts/fetch-penpot.sh` →
+///   `runtime/exporter/`, entry `app.js`);
+/// - a playwright-managed chromium under `browsers_path`
+///   (`scripts/fetch-penpot.sh --with-browsers`) — the exporter calls
+///   playwright's `chromium.launch()` with no `executablePath`, so the
+///   system Chrome is never used.
+///
+/// Known upstream limitation (verified on 2.16.2): the exporter's HTTP
+/// server binds **0.0.0.0** — the listen host is not configurable in the
+/// compiled bundle. Dev-mode accepts the LAN exposure; the packaging phase
+/// must firewall or patch it.
+#[derive(Debug, Clone)]
+pub struct ExporterSpec {
+    /// Host `node` binary.
+    pub node_path: PathBuf,
+    /// Directory containing the extracted exporter (`app.js`,
+    /// `node_modules/`); also the child's working directory.
+    pub exporter_dir: PathBuf,
+    /// `PENPOT_HTTP_SERVER_PORT` (readiness probe: `GET /readyz` → 200).
+    pub port: u16,
+    /// `PLAYWRIGHT_BROWSERS_PATH` — playwright-managed browser cache.
+    pub browsers_path: PathBuf,
+    /// `PENPOT_TEMPDIR`; `None` = `<data_dir>/exporter-tmp`.
+    pub tempdir: Option<PathBuf>,
+    /// Readiness timeout (startup is ~30 ms — the browser pool is lazy —
+    /// but allow slack for slow disks/first runs).
+    pub ready_timeout: Duration,
+}
+
+impl ExporterSpec {
+    pub fn new(
+        node_path: impl Into<PathBuf>,
+        exporter_dir: impl Into<PathBuf>,
+        port: u16,
+        browsers_path: impl Into<PathBuf>,
+    ) -> Self {
+        ExporterSpec {
+            node_path: node_path.into(),
+            exporter_dir: exporter_dir.into(),
+            port,
+            browsers_path: browsers_path.into(),
+            tempdir: None,
+            ready_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Crash-restart policy (per service).
 #[derive(Debug, Clone, Copy)]
 pub struct RestartPolicy {
@@ -266,6 +323,9 @@ pub struct SupervisorConfig {
     /// `bin/` with `identify`/`node`, or dirs derived from env overrides).
     /// Empty = inherit the parent PATH untouched (dev behavior).
     pub child_path_prepend: Vec<PathBuf>,
+    /// Optional `penpot-exporter` child (M5 board rendering). `None` (the
+    /// default) = no exporter process, byte-identical to pre-M5 behavior.
+    pub exporter: Option<ExporterSpec>,
     /// Postgres database name provisioned on first start.
     pub db_name: String,
     /// Password for the embedded Postgres `postgres` superuser.
@@ -317,6 +377,7 @@ impl SupervisorConfig {
             extra_backend_env: Vec::new(),
             postgres_install_dir: None,
             child_path_prepend: Vec::new(),
+            exporter: None,
             db_name: "penpot".to_string(),
             db_password: "penpot".to_string(),
             postgres_version: VersionReq::parse(DEFAULT_POSTGRES_VERSION)
@@ -455,6 +516,41 @@ pub fn backend_command(config: &SupervisorConfig) -> (PathBuf, Vec<String>, Vec<
     (config.jvm.java_path.clone(), args, env)
 }
 
+/// Command line + environment for the optional `penpot-exporter` node child,
+/// replicating the recipe verified live in the M5 spike (macOS arm64,
+/// Penpot 2.16.2). Pure function → unit-tested without spawning anything.
+///
+/// Env contract (config names are `PENPOT_` + kebab-case, case-insensitive):
+/// - `PENPOT_SECRET_KEY` **must match the backend's** — the exporter derives
+///   its management key via HKDF(blake2b512, secret, "exporter"); a mismatch
+///   makes `upload-tempfile` fail on every render.
+/// - `PENPOT_PUBLIC_URI` is the proxy origin: the exporter's browser loads
+///   `<public-uri>/render.html` and POSTs
+///   `<public-uri>/api/management/methods/upload-tempfile`.
+/// - `PENPOT_REDIS_URI` shares the supervised valkey (connected at startup;
+///   the image default `redis://redis/0` would fail).
+pub fn exporter_command(
+    config: &SupervisorConfig,
+    spec: &ExporterSpec,
+) -> (PathBuf, Vec<String>, Vec<(String, String)>) {
+    let tempdir = spec
+        .tempdir
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("exporter-tmp"));
+    let env: Vec<(String, String)> = vec![
+        ("PENPOT_SECRET_KEY".into(), config.secret_key.clone()),
+        ("PENPOT_PUBLIC_URI".into(), config.public_uri.clone()),
+        ("PENPOT_REDIS_URI".into(), format!("redis://127.0.0.1:{}/0", config.ports.valkey)),
+        ("PENPOT_HTTP_SERVER_PORT".into(), spec.port.to_string()),
+        ("PENPOT_TEMPDIR".into(), tempdir.to_string_lossy().into_owned()),
+        (
+            "PLAYWRIGHT_BROWSERS_PATH".into(),
+            spec.browsers_path.to_string_lossy().into_owned(),
+        ),
+    ];
+    (spec.node_path.clone(), vec!["app.js".into()], env)
+}
+
 /// Command line for `valkey-server`: localhost-only bind, configured port, no
 /// persistence (msgbus only).
 pub fn valkey_command(config: &SupervisorConfig) -> (PathBuf, Vec<String>) {
@@ -486,6 +582,7 @@ pub struct Supervisor {
     postgres_watchdog: Option<tokio::task::JoinHandle<()>>,
     valkey: Option<ServiceHandle>,
     backend: Option<ServiceHandle>,
+    exporter: Option<ServiceHandle>,
     /// SIGKILL orphan watchdog (parent-death cleanup; see [`watchdog`]).
     #[cfg(unix)]
     orphan_watchdog: Option<Arc<std::sync::Mutex<watchdog::WatchdogHandle>>>,
@@ -505,6 +602,7 @@ impl Supervisor {
             postgres_watchdog: None,
             valkey: None,
             backend: None,
+            exporter: None,
             #[cfg(unix)]
             orphan_watchdog: None,
             #[cfg(unix)]
@@ -593,10 +691,43 @@ impl Supervisor {
         })?;
         self.backend = Some(backend);
         #[cfg(unix)]
-        {
+        self.push_watchdog_pids();
+
+        // --- 4. Exporter (optional, M5) -----------------------------------
+        if let Some(spec) = self.config.exporter.clone() {
+            self.notifier.emit(SupervisorEvent::Starting { service: Service::Exporter });
+            let (program, args, envs) = exporter_command(&self.config, &spec);
+            // PENPOT_TEMPDIR must exist (the exporter writes render tempfiles
+            // there before uploading them).
+            if let Some((_, tempdir)) = envs.iter().find(|(k, _)| k == "PENPOT_TEMPDIR") {
+                std::fs::create_dir_all(tempdir)?;
+            }
+            let exporter_spec = ChildSpec {
+                service: Service::Exporter,
+                program,
+                args,
+                envs,
+                cwd: Some(spec.exporter_dir.clone()),
+                probe: Probe::HttpOk { port: spec.port, path: "/readyz".into() },
+                ready_timeout: spec.ready_timeout,
+            };
+            let exporter = ServiceHandle::spawn(
+                exporter_spec,
+                self.config.restart,
+                self.config.shutdown_grace,
+                self.notifier.clone(),
+            );
+            exporter.wait_ready().await.map_err(|reason| SupervisorError::ServiceFailed {
+                service: Service::Exporter,
+                reason,
+            })?;
+            self.exporter = Some(exporter);
+            #[cfg(unix)]
             self.push_watchdog_pids();
-            self.spawn_watchdog_feeder();
         }
+
+        #[cfg(unix)]
+        self.spawn_watchdog_feeder();
 
         Ok(Readiness {
             postgres_uri,
@@ -621,6 +752,9 @@ impl Supervisor {
         // Stop the watchdog first so it doesn't resurrect postgres below.
         if let Some(watchdog) = self.postgres_watchdog.take() {
             watchdog.abort();
+        }
+        if let Some(exporter) = self.exporter.take() {
+            exporter.shutdown().await;
         }
         if let Some(backend) = self.backend.take() {
             backend.shutdown().await;
@@ -712,6 +846,11 @@ impl Supervisor {
                 pids.push(pid);
             }
         }
+        if let Some(handle) = &self.exporter {
+            if let Some(pid) = handle.current_pid() {
+                pids.push(pid);
+            }
+        }
         pids.sort_unstable();
         pids.dedup();
         pids
@@ -744,6 +883,9 @@ impl Supervisor {
             slots.push(handle.pid_slot());
         }
         if let Some(handle) = &self.backend {
+            slots.push(handle.pid_slot());
+        }
+        if let Some(handle) = &self.exporter {
             slots.push(handle.pid_slot());
         }
         let mut last = self.collect_child_pids();
@@ -793,6 +935,9 @@ impl Drop for Supervisor {
         }
         if let Some(watchdog) = self.postgres_watchdog.take() {
             watchdog.abort();
+        }
+        if let Some(exporter) = self.exporter.take() {
+            exporter.kill_now();
         }
         if let Some(backend) = self.backend.take() {
             backend.kill_now();
@@ -1026,6 +1171,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exporter_command_replicates_the_spike_recipe() {
+        let config = test_config();
+        let spec = ExporterSpec::new(
+            "/usr/bin/node",
+            "/data/penpot-local/runtime/exporter",
+            6467,
+            "/data/penpot-local/runtime/exporter-browsers",
+        );
+        let (program, args, env) = exporter_command(&config, &spec);
+        assert_eq!(program, PathBuf::from("/usr/bin/node"));
+        assert_eq!(args, vec!["app.js"]);
+        // Secret key MUST be the backend's (HKDF-derived exporter key).
+        assert_eq!(env_get(&env, "PENPOT_SECRET_KEY"), Some("sekrit"));
+        // Public URI is the proxy origin (render.html + upload-tempfile).
+        assert_eq!(env_get(&env, "PENPOT_PUBLIC_URI"), Some("http://localhost:8686"));
+        // Shares the supervised valkey (default redis://redis/0 would fail).
+        assert_eq!(env_get(&env, "PENPOT_REDIS_URI"), Some("redis://127.0.0.1:6380/0"));
+        assert_eq!(env_get(&env, "PENPOT_HTTP_SERVER_PORT"), Some("6467"));
+        assert_eq!(
+            env_get(&env, "PENPOT_TEMPDIR"),
+            Some("/data/penpot-local/exporter-tmp"),
+            "tempdir defaults under the data dir"
+        );
+        assert_eq!(
+            env_get(&env, "PLAYWRIGHT_BROWSERS_PATH"),
+            Some("/data/penpot-local/runtime/exporter-browsers")
+        );
+    }
+
+    #[test]
+    fn exporter_tempdir_override_wins() {
+        let config = test_config();
+        let mut spec = ExporterSpec::new("/usr/bin/node", "/x", 6467, "/b");
+        spec.tempdir = Some(PathBuf::from("/custom/tmp"));
+        let (_, _, env) = exporter_command(&config, &spec);
+        assert_eq!(env_get(&env, "PENPOT_TEMPDIR"), Some("/custom/tmp"));
+    }
+
+    #[test]
+    fn exporter_is_off_by_default() {
+        assert!(test_config().exporter.is_none());
     }
 
     #[test]

@@ -179,6 +179,7 @@ async fn start_stack() -> Stack {
         static_dir,
         storage_dir,
         accel_prefix: "/internal/assets/".into(),
+        exporter_addr: None,
     };
     let proxy = Proxy::bind(config).await.unwrap();
     let proxy_addr = proxy.local_addr();
@@ -299,6 +300,7 @@ async fn api_with_dead_backend_is_502_not_hang_or_panic() {
         static_dir: tmp.path().to_path_buf(),
         storage_dir: tmp.path().to_path_buf(),
         accel_prefix: "/internal/assets/".into(),
+        exporter_addr: None,
     };
     let proxy = Proxy::bind(config).await.unwrap();
     let addr = proxy.local_addr();
@@ -474,6 +476,7 @@ async fn serve_with_shutdown_stops_the_listener() {
         static_dir: tmp.path().to_path_buf(),
         storage_dir: tmp.path().to_path_buf(),
         accel_prefix: "/internal/assets/".into(),
+        exporter_addr: None,
     };
     let proxy = Proxy::bind(config).await.unwrap();
     let addr = proxy.local_addr();

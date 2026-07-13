@@ -10,9 +10,12 @@
 //! - **`/api/**`** — transparent reverse proxy to the Penpot backend
 //!   ([`ProxyConfig::backend_addr`]): method, headers (incl. `Cookie` /
 //!   `Authorization`) and bodies are streamed through unchanged in both
-//!   directions. Exception: `/api/export` (the separate `penpot-exporter`
-//!   service, not bundled in M1) answers `502 Bad Gateway` with a clear
-//!   message instead of hanging.
+//!   directions. Exception: `/api/export` belongs to the separate
+//!   `penpot-exporter` service — when [`ProxyConfig::exporter_addr`] is set
+//!   (M5, exporter child running) it is proxied there (cookie passthrough
+//!   included, exactly like upstream nginx's `location /api/export`);
+//!   otherwise it answers `502 Bad Gateway` with a clear message instead of
+//!   hanging.
 //! - **`/ws/notifications`** — WebSocket proxy: the HTTP/1.1 upgrade is
 //!   forwarded to the backend and, once both sides switch protocols, bytes are
 //!   tunneled verbatim in both directions (no frame re-encoding).
@@ -42,6 +45,7 @@
 //!     static_dir: "/path/to/penpot-frontend".into(),
 //!     storage_dir: "/path/to/assets".into(),    // PENPOT_OBJECTS_STORAGE_FS_DIRECTORY
 //!     accel_prefix: "/internal/assets/".into(), // default; = PENPOT_ASSETS_PATH
+//!     exporter_addr: None,                      // default; Some(addr) proxies /api/export
 //! };
 //! let proxy = Proxy::bind(config).await?;      // binds the listener
 //! let addr = proxy.local_addr();               // real port (use port 0 for ephemeral)
@@ -94,6 +98,11 @@ pub struct ProxyConfig {
     /// (`PENPOT_ASSETS_PATH`). Default `/internal/assets/`. A trailing `/`
     /// is appended if missing.
     pub accel_prefix: String,
+    /// `penpot-exporter` service address. `None` (the default) keeps the
+    /// `502` stub on `/api/export`; `Some(addr)` reverse-proxies
+    /// `/api/export/**` there (the upstream nginx `location /api/export`
+    /// equivalent — body streamed, cookies passed through).
+    pub exporter_addr: Option<SocketAddr>,
 }
 
 /// Default proxy listen port (see docs/milestones/m1.md port conventions).
@@ -112,6 +121,7 @@ impl ProxyConfig {
             static_dir: static_dir.into(),
             storage_dir: storage_dir.into(),
             accel_prefix: DEFAULT_ACCEL_PREFIX.to_owned(),
+            exporter_addr: None,
         }
     }
 }
@@ -146,6 +156,7 @@ impl Proxy {
             backend_addr: config.backend_addr,
             storage_dir: config.storage_dir,
             accel_prefix,
+            exporter_addr: config.exporter_addr,
         };
         let router = build_router(state, &config.static_dir).merge(extra);
         tracing::info!(%local_addr, backend = %config.backend_addr, "proxy bound");
@@ -181,15 +192,17 @@ struct AppState {
     backend_addr: SocketAddr,
     storage_dir: PathBuf,
     accel_prefix: String,
+    exporter_addr: Option<SocketAddr>,
 }
 
 fn build_router(state: AppState, static_dir: &Path) -> Router {
     let spa = ServeDir::new(static_dir)
         .fallback(ServeFile::new(static_dir.join("index.html")));
     Router::new()
-        // /api/export is the penpot-exporter service — not bundled in M1.
-        .route("/api/export", any(export_unavailable))
-        .route("/api/export/{*rest}", any(export_unavailable))
+        // /api/export is the penpot-exporter service: proxied when the
+        // exporter child runs (M5), a clear 502 otherwise.
+        .route("/api/export", any(export_proxy))
+        .route("/api/export/{*rest}", any(export_proxy))
         .route("/api", any(api_proxy))
         .route("/api/{*rest}", any(api_proxy))
         .route("/ws/notifications", any(ws_proxy))
@@ -214,12 +227,22 @@ async fn api_proxy(State(state): State<AppState>, req: Request) -> Response {
     }
 }
 
-async fn export_unavailable() -> Response {
-    (
-        StatusCode::BAD_GATEWAY,
-        "export service unavailable: the penpot-exporter is not bundled in this build",
-    )
-        .into_response()
+/// `/api/export` → the penpot-exporter service (when configured). The
+/// exporter ignores the request path (only `/readyz` is special), so plain
+/// forwarding with cookie passthrough is exactly what upstream nginx does.
+async fn export_proxy(State(state): State<AppState>, req: Request) -> Response {
+    let Some(exporter_addr) = state.exporter_addr else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "export service unavailable: the penpot-exporter is not running in this build \
+             (enable it with PENPOT_LOCAL_EXPORTS=1)",
+        )
+            .into_response();
+    };
+    match forward_to(&state, exporter_addr, req).await {
+        Ok(resp) => passthrough_response(resp),
+        Err(resp) => resp,
+    }
 }
 
 async fn internal_blocked() -> Response {
@@ -230,6 +253,16 @@ async fn internal_blocked() -> Response {
 /// On failure returns a ready-made `502` response.
 async fn forward_to_backend(
     state: &AppState,
+    req: Request,
+) -> Result<http::Response<hyper::body::Incoming>, Response> {
+    forward_to(state, state.backend_addr, req).await
+}
+
+/// Rewrite the request URI onto `upstream` and send it, streaming the body.
+/// On failure returns a ready-made `502` response.
+async fn forward_to(
+    state: &AppState,
+    upstream: SocketAddr,
     mut req: Request,
 ) -> Result<http::Response<hyper::body::Incoming>, Response> {
     let path_and_query = req
@@ -237,7 +270,7 @@ async fn forward_to_backend(
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
-    let uri: Uri = format!("http://{}{}", state.backend_addr, path_and_query)
+    let uri: Uri = format!("http://{upstream}{path_and_query}")
         .parse()
         .map_err(|e| bad_gateway(format!("bad upstream uri: {e}")))?;
     *req.uri_mut() = uri;
@@ -246,7 +279,7 @@ async fn forward_to_backend(
         .client
         .request(req)
         .await
-        .map_err(|e| bad_gateway(format!("backend unreachable: {e}")))
+        .map_err(|e| bad_gateway(format!("upstream {upstream} unreachable: {e}")))
 }
 
 /// Convert a hyper response into an axum response, streaming the body.

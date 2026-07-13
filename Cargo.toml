@@ -7,6 +7,7 @@ members = [
     "crates/penpot-rpc",
     "crates/sync-core",
     "crates/sync-daemon",
+    "crates/board-export",
 ]
 
 [workspace.package]
