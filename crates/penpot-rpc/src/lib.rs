@@ -28,7 +28,8 @@ mod types;
 pub use error::{Error, Result};
 pub use sse::{parse_sse, SseEvent};
 pub use types::{
-    AccessToken, ExportedBinfile, LoginOutcome, PrepareRegister, Profile, RegisterOutcome,
+    AccessToken, CreatedFile, ExportedBinfile, FileSummary, LoginOutcome, PrepareRegister,
+    Profile, ProjectInfo, RegisterOutcome, UpdateFileOutcome,
 };
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, COOKIE, SET_COOKIE};
@@ -244,6 +245,112 @@ impl PenpotClient {
             params["expiration"] = json!(exp);
         }
         self.rpc("create-access-token", &params).await
+    }
+
+    // ------------------------------------------------------------------
+    // Projects & files (the M2 sync daemon's poll/CRUD surface)
+    // ------------------------------------------------------------------
+
+    /// `get-projects` — all projects of a team. The default project is named
+    /// "Drafts" with `isDefault: true`.
+    pub async fn get_projects(&self, team_id: &str) -> Result<Vec<ProjectInfo>> {
+        self.rpc("get-projects", &json!({ "teamId": team_id })).await
+    }
+
+    /// `get-project-files` — file summaries (no `data`) for a project.
+    /// This is the sync daemon's poll surface: `revn` + `modifiedAt`.
+    pub async fn get_project_files(&self, project_id: &str) -> Result<Vec<FileSummary>> {
+        self.rpc("get-project-files", &json!({ "projectId": project_id }))
+            .await
+    }
+
+    /// `create-project` — creates a project in a team and returns its summary.
+    pub async fn create_project(&self, team_id: &str, name: &str) -> Result<ProjectInfo> {
+        self.rpc("create-project", &json!({ "teamId": team_id, "name": name }))
+            .await
+    }
+
+    /// `create-file` — creates an (empty, one-page) file in a project and
+    /// returns the complete file object including `data`; keep
+    /// [`CreatedFile::first_page_id`] around, `update-file` changes need it.
+    pub async fn create_file(&self, project_id: &str, name: &str) -> Result<CreatedFile> {
+        self.rpc("create-file", &json!({ "name": name, "projectId": project_id }))
+            .await
+    }
+
+    /// `create-file` with a **client-chosen file uuid** (`id` is an optional
+    /// schema param). Verified live on 2.16.2: the file is created under
+    /// exactly that id, and a subsequent in-place [`Self::import_binfile`]
+    /// onto it replaces the content — this create-then-import pair is the
+    /// **resurrect recipe** the M2 core invariant relies on, because
+    /// `import-binfile` with a `file-id` that does not currently exist in the
+    /// DB fails (SSE `error` event `object-not-found`, verified live) rather
+    /// than creating the file. Fails with HTTP 500 if the id already exists —
+    /// including **soft-deleted** files (delete-file keeps the row ~7 days).
+    pub async fn create_file_with_id(
+        &self,
+        project_id: &str,
+        name: &str,
+        file_id: &str,
+    ) -> Result<CreatedFile> {
+        self.rpc(
+            "create-file",
+            &json!({ "name": name, "projectId": project_id, "id": file_id }),
+        )
+        .await
+    }
+
+    /// `get-file` — the full file object including `data.pages` and
+    /// `data.pagesIndex.<pageId>.objects`. Returned as raw JSON: the sync
+    /// daemon only ever inspects it, the durable format is the binfile.
+    pub async fn get_file(&self, file_id: &str) -> Result<serde_json::Value> {
+        self.rpc("get-file", &json!({ "id": file_id })).await
+    }
+
+    /// `update-file` — apply a list of change objects (e.g. `add-obj`, see
+    /// docs/m0/rpc-endpoints.md §update-file for the full verified recipe).
+    ///
+    /// `session_id` is any client-generated uuid v4 identifying this editing
+    /// session. `revn`/`vern` are the values the client believes current
+    /// (from [`Self::get_project_files`] or [`Self::get_file`]). A stale
+    /// `revn` is **not** rejected — inspect [`UpdateFileOutcome::lagged`] to
+    /// detect concurrent edits.
+    pub async fn update_file(
+        &self,
+        file_id: &str,
+        session_id: &str,
+        revn: i64,
+        vern: i64,
+        changes: &[serde_json::Value],
+    ) -> Result<UpdateFileOutcome> {
+        self.rpc(
+            "update-file",
+            &json!({
+                "id": file_id,
+                "sessionId": session_id,
+                "revn": revn,
+                "vern": vern,
+                "changes": changes,
+            }),
+        )
+        .await
+    }
+
+    /// `delete-file` — answers `204 No Content` (verified in M0).
+    pub async fn delete_file(&self, file_id: &str) -> Result<()> {
+        self.rpc_response("delete-file", &json!({ "id": file_id }))
+            .await?;
+        Ok(())
+    }
+
+    /// `delete-project` — answers `204 No Content`, but is a **soft delete**
+    /// (verified live on 2.16.2): the project keeps appearing in
+    /// [`Self::get_projects`] with [`ProjectInfo::deleted_at`] set to the
+    /// scheduled GC time (~7 days out). Filter on `deleted_at.is_none()`.
+    pub async fn delete_project(&self, project_id: &str) -> Result<()> {
+        self.rpc_response("delete-project", &json!({ "id": project_id }))
+            .await?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------

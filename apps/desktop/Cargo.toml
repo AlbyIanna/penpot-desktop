@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 supervisor = { path = "../../crates/supervisor" }
 proxy = { path = "../../crates/proxy" }
 penpot-rpc = { path = "../../crates/penpot-rpc" }
+sync-daemon = { path = "../../crates/sync-daemon" }
 axum = "0.8"
 http = "1"
 directories = "5"

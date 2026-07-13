@@ -19,6 +19,11 @@ test:
 smoke:
     bash scripts/m1-smoke.sh
 
+# THE core-invariant test (M2 exit criterion): wipe the Postgres data dir, restart,
+# everything rebuilt from the designs folder with the same file ids. P0 if it fails.
+invariant:
+    bash scripts/m2-invariant.sh
+
 # Run the desktop app in dev mode
 dev:
     {{cargo_env}} cd apps/desktop && cargo tauri dev

@@ -56,6 +56,9 @@ pub struct AppConfig {
     pub java_path: PathBuf,
     /// `valkey-server` binary (`PENPOT_LOCAL_VALKEY`).
     pub valkey_path: PathBuf,
+    /// The user's designs folder the sync daemon mirrors the DB into
+    /// (`PENPOT_LOCAL_DESIGNS_DIR`, default `<data_dir>/designs`).
+    pub designs_dir: PathBuf,
 }
 
 fn env_port(name: &str, default: u16) -> anyhow::Result<u16> {
@@ -96,6 +99,10 @@ impl AppConfig {
             std::env::var("PENPOT_LOCAL_VALKEY")
                 .unwrap_or_else(|_| "/opt/homebrew/bin/valkey-server".to_string()),
         );
+        let designs_dir = match std::env::var_os("PENPOT_LOCAL_DESIGNS_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => data_dir.join("designs"),
+        };
         Ok(AppConfig {
             data_dir,
             runtime_dir,
@@ -107,6 +114,7 @@ impl AppConfig {
             },
             java_path,
             valkey_path,
+            designs_dir,
         })
     }
 
@@ -331,6 +339,7 @@ pub struct RunningApp {
     supervisor: supervisor::Supervisor,
     proxy_shutdown: Option<oneshot::Sender<()>>,
     proxy_task: Option<JoinHandle<anyhow::Result<()>>>,
+    sync_daemon: Option<sync_daemon::SyncDaemonHandle>,
 }
 
 impl RunningApp {
@@ -339,9 +348,14 @@ impl RunningApp {
         format!("{}/__bootstrap", self.proxy_url)
     }
 
-    /// Orderly shutdown: stop the proxy, then the supervised children
-    /// (backend → valkey → postgres). Idempotent via consuming `self`.
+    /// Orderly shutdown: stop the sync daemon first (so no export/import is
+    /// in flight when the backend goes away), then the proxy, then the
+    /// supervised children (backend → valkey → postgres). Idempotent via
+    /// consuming `self`.
     pub async fn shutdown(mut self) {
+        if let Some(daemon) = self.sync_daemon.take() {
+            daemon.stop().await;
+        }
         if let Some(tx) = self.proxy_shutdown.take() {
             let _ = tx.send(());
         }
@@ -413,6 +427,31 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         let _ = shutdown_rx.await;
     }));
 
+    // --- sync daemon (M2: one-way DB→FS + startup reconciliation) ---------
+    // Hook point per docs/milestones/m1.md: right after provision() we hold
+    // the backend base URL + the persisted access token. Spawned after the
+    // proxy because export-binfile artifact downloads go through the proxy
+    // (`PENPOT_PUBLIC_URI` host).
+    let sync_daemon = match (&credentials.access_token, &profile.default_team_id) {
+        (Some(token), Some(team_id)) => {
+            let rpc = PenpotClient::new(&readiness.backend_base_url)
+                .with_auth(Auth::Token(token.clone()));
+            let sync_config = sync_daemon::SyncConfig::new(&config.designs_dir, team_id.clone());
+            tracing::info!(
+                root = %config.designs_dir.display(),
+                team = %team_id,
+                "starting sync daemon"
+            );
+            Some(sync_daemon::spawn(rpc, sync_config))
+        }
+        _ => {
+            tracing::warn!(
+                "sync daemon NOT started: missing access token or default team id in the provisioned profile"
+            );
+            None
+        }
+    };
+
     Ok(RunningApp {
         proxy_url: public_uri,
         profile,
@@ -420,6 +459,7 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         supervisor: sup,
         proxy_shutdown: Some(shutdown_tx),
         proxy_task: Some(proxy_task),
+        sync_daemon,
     })
 }
 

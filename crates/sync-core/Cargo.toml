@@ -1,0 +1,22 @@
+[package]
+name = "sync-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure library for Penpot Local sync: normalization, semantic tree hash, manifest, two-phase dir swap, deterministic zip. No network, no processes."
+
+[dependencies]
+serde = { workspace = true }
+# float_roundtrip is REQUIRED for Python parity: without it serde_json parses
+# decimal floats with up to ~1 ulp error, so shortest-repr round-trips drift.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# ryu (not std fmt) for float digits: on exact decimal ties (e.g.
+# 791929834541136.25) std rounds half-away-from-zero while CPython's repr and
+# ryu round half-to-even. Python parity requires ryu's digit choice.
+ryu = "1"
+sha2 = "0.10"
+thiserror = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,20 @@
+[package]
+name = "sync-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local sync daemon (M2): one-way DB→FS sync (poll + debounce + export-binfile) plus startup reconciliation on top of sync-core and penpot-rpc."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+penpot-rpc = { path = "../penpot-rpc" }
+sync-core = { path = "../sync-core" }
+
+[dev-dependencies]
+tempfile = "3"
+# test-util is not part of tokio's "full": needed for time::pause in tests.
+tokio = { version = "1", features = ["full", "test-util"] }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false }
