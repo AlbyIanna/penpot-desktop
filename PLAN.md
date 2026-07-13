@@ -147,7 +147,19 @@ independent verification in `docs/milestones/m3.md`.
 Direction B, loop prevention, conflict copies, error surfacing in a small status UI (tray/menubar: last sync, per-file state, pause button).
 **Exit criteria:** `git checkout` an older version of a file directory → it appears in Penpot within seconds; simultaneous-edit test produces a conflict copy, never data loss.
 
-### M4 — Packaging
+### M4 — Packaging — ✅ DONE 2026-07-13 (macOS arm64 verified end-to-end; AppImage CI-only; NixOS VM deferred)
+
+Single-artifact dmg (386 MB) verified with a fresh-machine approximation: offline first boot in
+14s under `env -i` + poisoned proxies (postgres pre-seeded — no downloads ever), all components
+resolved from the bundle, zero file opens under /opt/homebrew or the repo, watchdog reaps on
+SIGKILL. Honest asymmetry: **dmg = hand-verified locally; AppImage (486 MB, x86_64-only) = green
+in CI only** (runner ≠ fresh desktop; AppImage-excludelist host libs assumed); the **NixOS-VM leg
+of the exit criterion is explicitly deferred** (flake evaluates, `nix build .#headless` works, but
+nobody has booted the app from the nix package — blockers in `nix/README.md`). Found & fixed along
+the way: reqwest honored `http_proxy` for the loopback RPC client (corporate proxies would break
+first boot; now `no_proxy()`). `node` is NOT bundled — proven dead code for media on 2.16.2
+(re-probe on version bumps; the M5 exporter will need node v24.16.0). Evidence:
+`docs/milestones/m4.md`, CI run 29275580862.
 jlink-minimized JRE, pinned Penpot release fetch script, AppImage + dmg, **Nix flake** (dev shell + package).
 **Exit criteria:** a fresh machine (or clean NixOS VM) runs the app from a single artifact.
 
@@ -162,6 +174,14 @@ Notes from M3 verification for the git helper + user docs:
 - `.penpot` dirs are tool-owned generated trees: a foreign file dropped inside one triggers an
   import and is then silently swept by the next DB→FS export swap (verified live). Document it,
   and decide whether validate-time warnings or preserving unknown entries is worth it.
+Packaging debts from M4 verification:
+- `tauri-plugin-single-instance` (double launch today = sane loud failure, ugly second window).
+- Developer ID signing + notarization (ad-hoc today; Gatekeeper needs right-click-Open).
+- `--remap-path-prefix`/trim-paths (release binaries embed ~1k build-machine path strings).
+- The NixOS-VM validation recipe in `nix/README.md` is the outstanding M4 exit-criterion debt.
+- Path pre-flight for the non-BMP JDK limitation (risk 8).
+- Exporter bundling needs node v24.16.0 (upstream pin) and re-opens the dmg-size levers
+  (source maps 55.9 MB, images/features 90.2 MB, builtin-templates 93.7 MB).
 
 ## Known risks (read before coding)
 
@@ -188,6 +208,11 @@ Notes from M3 verification for the git helper + user docs:
    image loading. The bundled proxy must implement X-Accel-style internal redirects (or serve the
    assets directory directly) in addition to proxying `/api` and the `/ws/notifications` WebSocket.
    Characterize the exact behavior in M0.
+7. **macOS floor is 15.4, not 12** — the theseus postgres darwin binaries link `_strchrnul`
+   (CI-proven: initdb aborts on Sonoma). Any postgres pin bump must re-check the floor.
+8. **JDK 26 cannot load jars from paths containing non-BMP characters** (emoji/surrogate pairs) —
+   an install path like `Applicazioni 🎨/` breaks backend boot (loud failure, watchdog cleans up).
+   BMP unicode + spaces are fine. M5 should pre-flight install/data/Designs paths.
 
 ## Claude Code readiness
 
