@@ -49,7 +49,7 @@ jobs:
 
       - name: Install tauri-cli
         uses: cargo-bins/cargo-binstall@802977a265b5f8825ebef2176db5f5f3edc82280 # main 2026-07
-      - run: cargo binstall -y tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked
+      - run: cargo binstall -y --force tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked --force
 
       - name: Build the Linux penpot-runtime bundle (docker path + proofs)
         run: bash scripts/build-runtime-bundle-linux.sh
@@ -199,7 +199,7 @@ jobs:
 
       - name: Install tauri-cli
         uses: cargo-bins/cargo-binstall@802977a265b5f8825ebef2176db5f5f3edc82280 # main 2026-07
-      - run: cargo binstall -y tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked
+      - run: cargo binstall -y --force tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked --force
 
       - name: Build the macOS penpot-runtime bundle (crane path + proofs)
         run: bash scripts/build-runtime-bundle.sh --no-docker
