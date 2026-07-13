@@ -35,6 +35,7 @@
 mod child;
 mod postgres;
 mod probe;
+pub mod watchdog;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -266,6 +267,15 @@ pub struct SupervisorConfig {
     pub backend_ready_timeout: Duration,
     /// How often the postgres watchdog probes the port (0 disables it).
     pub postgres_check_interval: Duration,
+    /// Spawn the SIGKILL orphan watchdog (see the [`watchdog`] module docs).
+    /// If the watchdog binary cannot be located, boot proceeds with a loud
+    /// warning rather than failing.
+    pub orphan_watchdog: bool,
+    /// Explicit path to the `penpot-watchdog` binary. Default resolution:
+    /// `PENPOT_WATCHDOG_BIN` env → this field → sibling of the current exe.
+    pub orphan_watchdog_bin: Option<PathBuf>,
+    /// Orphan-watchdog SIGTERM→SIGKILL grace period after parent death.
+    pub orphan_watchdog_grace: Duration,
     pub notify: Option<NotifyHook>,
 }
 
@@ -299,6 +309,9 @@ impl SupervisorConfig {
             valkey_ready_timeout: Duration::from_secs(15),
             backend_ready_timeout: Duration::from_secs(180),
             postgres_check_interval: Duration::from_secs(5),
+            orphan_watchdog: true,
+            orphan_watchdog_bin: None,
+            orphan_watchdog_grace: watchdog::DEFAULT_GRACE,
             notify: None,
         }
     }
@@ -411,6 +424,12 @@ pub struct Supervisor {
     postgres_watchdog: Option<tokio::task::JoinHandle<()>>,
     valkey: Option<ServiceHandle>,
     backend: Option<ServiceHandle>,
+    /// SIGKILL orphan watchdog (parent-death cleanup; see [`watchdog`]).
+    #[cfg(unix)]
+    orphan_watchdog: Option<Arc<std::sync::Mutex<watchdog::WatchdogHandle>>>,
+    /// Task re-feeding the current child pid set to the orphan watchdog.
+    #[cfg(unix)]
+    watchdog_feeder: Option<tokio::task::JoinHandle<()>>,
     shutdown_done: bool,
 }
 
@@ -424,6 +443,10 @@ impl Supervisor {
             postgres_watchdog: None,
             valkey: None,
             backend: None,
+            #[cfg(unix)]
+            orphan_watchdog: None,
+            #[cfg(unix)]
+            watchdog_feeder: None,
             shutdown_done: false,
         }
     }
@@ -437,6 +460,10 @@ impl Supervisor {
         std::fs::create_dir_all(&self.config.storage_dir)?;
         std::fs::create_dir_all(self.config.valkey_dir())?;
 
+        // --- 0. SIGKILL orphan watchdog (armed before any child spawns) --
+        #[cfg(unix)]
+        self.spawn_orphan_watchdog();
+
         // --- 1. Postgres (embedded) -------------------------------------
         self.notifier.emit(SupervisorEvent::Starting { service: Service::Postgres });
         let mut pg = EmbeddedPostgres::new(self.config.postgres_config());
@@ -444,6 +471,8 @@ impl Supervisor {
         self.notifier.emit(SupervisorEvent::Ready { service: Service::Postgres });
         let pg_settings = pg.settings_clone();
         self.postgres = Some(pg);
+        #[cfg(unix)]
+        self.push_watchdog_pids();
         if !self.config.postgres_check_interval.is_zero() {
             self.postgres_watchdog = Some(tokio::spawn(postgres::watchdog(
                 pg_settings,
@@ -476,6 +505,8 @@ impl Supervisor {
             reason,
         })?;
         self.valkey = Some(valkey);
+        #[cfg(unix)]
+        self.push_watchdog_pids();
 
         // --- 3. Backend JVM ------------------------------------------------
         let (program, args, envs) = backend_command(&self.config);
@@ -499,6 +530,11 @@ impl Supervisor {
             reason,
         })?;
         self.backend = Some(backend);
+        #[cfg(unix)]
+        {
+            self.push_watchdog_pids();
+            self.spawn_watchdog_feeder();
+        }
 
         Ok(Readiness {
             postgres_uri,
@@ -515,6 +551,11 @@ impl Supervisor {
         }
         self.shutdown_done = true;
 
+        // Stop the pid feeder first so it doesn't race the teardown below.
+        #[cfg(unix)]
+        if let Some(feeder) = self.watchdog_feeder.take() {
+            feeder.abort();
+        }
         // Stop the watchdog first so it doesn't resurrect postgres below.
         if let Some(watchdog) = self.postgres_watchdog.take() {
             watchdog.abort();
@@ -531,6 +572,150 @@ impl Supervisor {
             }
             self.notifier.emit(SupervisorEvent::Stopped { service: Service::Postgres });
         }
+
+        // CLEAN shutdown: the children above were stopped properly, so close
+        // the protocol with `bye` — the orphan watchdog exits WITHOUT killing
+        // anything. (Every other exit path leaves the pipe to hit EOF, which
+        // IS the kill trigger.)
+        #[cfg(unix)]
+        if let Some(watchdog) = self.orphan_watchdog.take() {
+            let watchdog = Arc::clone(&watchdog);
+            // `bye` blocks up to a few seconds waiting for the watchdog to
+            // exit; do it off the async runtime.
+            let joined = tokio::task::spawn_blocking(move || {
+                watchdog
+                    .lock()
+                    .expect("watchdog mutex")
+                    .bye(Duration::from_secs(3));
+            })
+            .await;
+            if joined.is_err() {
+                warn!("orphan watchdog bye task panicked");
+            } else {
+                info!("orphan watchdog dismissed (bye)");
+            }
+        }
+    }
+
+    /// Spawn the SIGKILL orphan watchdog (never fails the boot; logs loudly
+    /// when the binary is missing). See [`watchdog`] module docs.
+    #[cfg(unix)]
+    fn spawn_orphan_watchdog(&mut self) {
+        if !self.config.orphan_watchdog {
+            return;
+        }
+        let pgdata = self.config.postgres_config().data_dir;
+        let Some(bin) =
+            watchdog::WatchdogHandle::locate_bin(self.config.orphan_watchdog_bin.as_deref())
+        else {
+            warn!(
+                "orphan watchdog binary '{}' not found ({} env, config, or sibling of the \
+                 current executable) — if this process is SIGKILLed, postgres/valkey/backend \
+                 will be orphaned and keep holding their ports",
+                watchdog::WATCHDOG_BIN_NAME,
+                watchdog::WATCHDOG_BIN_ENV,
+            );
+            return;
+        };
+        match watchdog::WatchdogHandle::spawn(
+            &bin,
+            self.config.orphan_watchdog_grace,
+            Some(&pgdata),
+        ) {
+            Ok(handle) => {
+                info!(pid = handle.pid(), bin = %bin.display(), "orphan watchdog armed");
+                self.orphan_watchdog = Some(Arc::new(std::sync::Mutex::new(handle)));
+            }
+            Err(error) => {
+                warn!(%error, bin = %bin.display(), "failed to spawn orphan watchdog");
+            }
+        }
+    }
+
+    /// Current child pid set: postmaster (from `postmaster.pid`, since
+    /// pg_ctl detaches it) + valkey + backend supervised pids.
+    #[cfg(unix)]
+    fn collect_child_pids(&self) -> Vec<u32> {
+        let mut pids = Vec::new();
+        if let Some(pid) =
+            watchdog::read_postmaster_pid(&self.config.postgres_config().data_dir)
+        {
+            pids.push(pid);
+        }
+        if let Some(handle) = &self.valkey {
+            if let Some(pid) = handle.current_pid() {
+                pids.push(pid);
+            }
+        }
+        if let Some(handle) = &self.backend {
+            if let Some(pid) = handle.current_pid() {
+                pids.push(pid);
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    /// Send the current pid set to the orphan watchdog (best-effort).
+    #[cfg(unix)]
+    fn push_watchdog_pids(&self) {
+        let Some(watchdog) = &self.orphan_watchdog else { return };
+        let pids = self.collect_child_pids();
+        if let Err(error) = watchdog
+            .lock()
+            .expect("watchdog mutex")
+            .send_pids(&pids)
+        {
+            warn!(%error, "orphan watchdog pipe write failed");
+        }
+    }
+
+    /// Background task re-sending the pid set whenever it changes (crash
+    /// respawns give children new pids; the watchdog must track the CURRENT
+    /// set, not the boot-time one).
+    #[cfg(unix)]
+    fn spawn_watchdog_feeder(&mut self) {
+        let Some(watchdog) = &self.orphan_watchdog else { return };
+        let watchdog = Arc::clone(watchdog);
+        let pgdata = self.config.postgres_config().data_dir;
+        let mut slots = Vec::new();
+        if let Some(handle) = &self.valkey {
+            slots.push(handle.pid_slot());
+        }
+        if let Some(handle) = &self.backend {
+            slots.push(handle.pid_slot());
+        }
+        let mut last = self.collect_child_pids();
+        self.watchdog_feeder = Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut pids = Vec::new();
+                if let Some(pid) = watchdog::read_postmaster_pid(&pgdata) {
+                    pids.push(pid);
+                }
+                for slot in &slots {
+                    if let Some(pid) = *slot.lock().expect("pid mutex") {
+                        pids.push(pid);
+                    }
+                }
+                pids.sort_unstable();
+                pids.dedup();
+                if pids != last {
+                    let result = watchdog
+                        .lock()
+                        .expect("watchdog mutex")
+                        .send_pids(&pids);
+                    match result {
+                        Ok(()) => last = pids,
+                        Err(error) => {
+                            warn!(%error, "orphan watchdog pipe closed; stopping pid feeder");
+                            return;
+                        }
+                    }
+                }
+            }
+        }));
     }
 }
 
@@ -541,6 +726,10 @@ impl Drop for Supervisor {
     fn drop(&mut self) {
         if self.shutdown_done {
             return;
+        }
+        #[cfg(unix)]
+        if let Some(feeder) = self.watchdog_feeder.take() {
+            feeder.abort();
         }
         if let Some(watchdog) = self.postgres_watchdog.take() {
             watchdog.abort();
@@ -553,6 +742,11 @@ impl Drop for Supervisor {
         }
         // `self.postgres` drops after this body: postgresql_embedded's Drop
         // runs `pg_ctl stop` synchronously if the server is still up.
+        //
+        // `self.orphan_watchdog` (if any) also drops WITHOUT `bye`: the pipe
+        // write end closes when this process exits, and the watchdog then
+        // re-checks/kills the last-known pids — a deliberate backstop for
+        // this best-effort path (panic, early drop, boot failure).
     }
 }
 

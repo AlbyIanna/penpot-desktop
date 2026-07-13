@@ -66,13 +66,18 @@ produces identical bytes (modulo regenerated IDs — see Known risks).
 
 ### Direction B: filesystem → DB (external edit: git checkout, script, hand-edit)
 1. Watch the root with the `notify` crate; debounce events 2s per file-directory.
-2. Compute tree hash. If it matches the ledger (own write), skip.
+2. Compute tree hash. If it matches the ledger (own write), skip. The symmetric half is
+   required too (verified in M3): after an FS→DB import, read back `(revn, modifiedAt)` into
+   manifest+tracker so our own import never looks like a DB change — both halves together
+   give loop-freedom.
 3. Validate: parseable JSON, binfile manifest sane. On failure → surface error in UI, do nothing destructive.
 4. Zip the directory, call `import-binfile` passing the existing `file-id` → **in-place import**
    (supported since 1.20 for single-file binfile-v3 archives): same file ID, no manifest churn.
    Fallback if in-place import fails: import-as-new → delete the old file, update the manifest mapping.
-5. Conflict rule: if DB `revn` also advanced since `lastSyncedHash`, do **not** import.
-   Export the DB version as `<name>.conflict-<timestamp>.penpot/` next to the file and notify. Never silently overwrite either side.
+5. Conflict rule: if the DB side also changed since `lastSyncedHash`, export the DB version as
+   `<name>.conflict-<timestamp>.penpot/` next to the file, then import the disk version in-place
+   (folder tree is the source of truth; the DB version survives in the copy) and surface it.
+   Never silently overwrite either side; conflict copies are never watched, synced, or auto-deleted.
 
 ### Startup reconciliation
 On boot, walk the folder tree vs the manifest vs the DB:
@@ -128,7 +133,17 @@ in-place import onto it; a soft-deleted id 500s (~7-day GC) → fallback import-
 Direction A above, plus startup import of anything on disk. Ship the manifest + hash ledger.
 **Exit criteria:** the core-invariant test passes: `rm -rf` the Postgres data dir, restart, all files restored from disk.
 
-### M3 — Two-way sync + conflicts
+### M3 — Two-way sync + conflicts — ✅ DONE 2026-07-13
+
+Both exit criteria met, executable via `scripts/m3-sync.sh` (`just m3`, 33 checks, run twice +
+unicode probe): git checkout → visible in Penpot in ~2.2s (the 2s fs debounce dominates);
+simultaneous edit → exactly one conflict copy, both versions preserved, resume→copy in
+0.08–0.6s. Also landed: tray status UI (last sync, per-file state, pause) and the
+`penpot-watchdog` deadman child that closes m2.md's hard-crash orphan hazard — SIGKILL now
+reaps all children (verified mid-import in two crash windows, no data loss). **M4 packaging
+must bundle `penpot-watchdog` next to the app executable** (or set `PENPOT_WATCHDOG_BIN`);
+`cargo build -p penpot-desktop` alone does not build dependency-crate bins. Evidence +
+independent verification in `docs/milestones/m3.md`.
 Direction B, loop prevention, conflict copies, error surfacing in a small status UI (tray/menubar: last sync, per-file state, pause button).
 **Exit criteria:** `git checkout` an older version of a file directory → it appears in Penpot within seconds; simultaneous-edit test produces a conflict copy, never data loss.
 
@@ -139,6 +154,14 @@ jlink-minimized JRE, pinned Penpot release fetch script, AppImage + dmg, **Nix f
 ### M5 — Freedom features
 Per-board SVG/PNG auto-export next to sources (needs the exporter service), `git init` helper +
 sensible `.gitignore`, "reveal in file manager", file/project create-rename-move from the OS side reflected in Penpot.
+Notes from M3 verification for the git helper + user docs:
+- Plain `git checkout <commit> -- <dir>` is overlay mode — it does NOT delete files added since
+  that commit, so reverting a file that gained shapes silently imports a merged tree. Teach
+  `git checkout --no-overlay` or `git restore --source=<commit> --worktree --staged` (defaults
+  to no-overlay, verified).
+- `.penpot` dirs are tool-owned generated trees: a foreign file dropped inside one triggers an
+  import and is then silently swept by the next DB→FS export swap (verified live). Document it,
+  and decide whether validate-time warnings or preserving unknown entries is worth it.
 
 ## Known risks (read before coding)
 

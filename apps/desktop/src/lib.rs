@@ -6,6 +6,9 @@
 //! backend JVM) → first-boot single-user provisioning over RPC → start the
 //! local proxy with the `/__bootstrap` auto-login route → expose readiness.
 
+pub mod status;
+pub mod tray;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -346,6 +349,18 @@ impl RunningApp {
     /// The URL the webview should open: performs auto-login then lands on `/`.
     pub fn bootstrap_url(&self) -> String {
         format!("{}/__bootstrap", self.proxy_url)
+    }
+
+    /// The sync daemon's status stream (tray UI), if the daemon started.
+    pub fn sync_status(
+        &self,
+    ) -> Option<tokio::sync::watch::Receiver<sync_daemon::SyncStatusSnapshot>> {
+        self.sync_daemon.as_ref().map(|d| d.status())
+    }
+
+    /// The sync daemon's pause/resume handle, if the daemon started.
+    pub fn sync_control(&self) -> Option<sync_daemon::SyncControl> {
+        self.sync_daemon.as_ref().map(|d| d.control())
     }
 
     /// Orderly shutdown: stop the sync daemon first (so no export/import is

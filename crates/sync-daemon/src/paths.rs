@@ -13,7 +13,30 @@ use sync_core::Manifest;
 /// Directory suffix marking a Penpot file dir (`homepage.penpot/`).
 pub const PENPOT_DIR_SUFFIX: &str = ".penpot";
 
+/// Marker inside a conflict-copy directory name
+/// (`homepage.conflict-2026-07-13T09-04-42Z.penpot/`). Conflict copies are
+/// never watched, never synced (the disk walker skips them), never
+/// auto-deleted — the user resolves and removes them manually.
+pub const CONFLICT_MARKER: &str = ".conflict-";
+
 const MAX_COMPONENT_CHARS: usize = 100;
+
+/// Is this directory name a conflict copy (ends with `.penpot` AND contains
+/// the conflict marker)? [`allocate_file_path`] never *produces* such names
+/// for regular files, so the check is unambiguous.
+pub fn is_conflict_dir_name(name: &str) -> bool {
+    name.ends_with(PENPOT_DIR_SUFFIX) && name.contains(CONFLICT_MARKER)
+}
+
+/// Conflict-copy path for a file dir: `client-x/home.penpot` →
+/// `client-x/home.conflict-<ts>.penpot` (NEXT TO the file, per the conflict
+/// rule). The RFC 3339 timestamp has `:` replaced with `-` so the name is
+/// portable (Windows) and Finder-friendly.
+pub fn conflict_path_for(rel: &str, timestamp_rfc3339: &str) -> String {
+    let stem = rel.strip_suffix(PENPOT_DIR_SUFFIX).unwrap_or(rel);
+    let ts = timestamp_rfc3339.replace(':', "-");
+    format!("{stem}{CONFLICT_MARKER}{ts}{PENPOT_DIR_SUFFIX}")
+}
 
 /// Sanitize an arbitrary Penpot name into a single safe path component:
 /// path separators / control chars / Windows-reserved chars become `-`,
@@ -111,7 +134,10 @@ pub fn allocate_file_path(
     if let Some(entry) = manifest.files.get(file_id) {
         return entry.path.clone();
     }
-    let base = sanitize_component(file_name);
+    // A file named e.g. `x.conflict-1` would otherwise produce a dir name
+    // that [`is_conflict_dir_name`] matches — and conflict copies are
+    // ignored by the watcher and the disk walker. Keep real files watchable.
+    let base = sanitize_component(file_name).replace(CONFLICT_MARKER, "-conflict-");
     let taken = |rel: &str| {
         manifest.entry_by_path(rel).is_some() || sync_root.join(rel).symlink_metadata().is_ok()
     };
@@ -149,6 +175,7 @@ mod tests {
             project_id: project_id.to_string(),
             project_name: "P".to_string(),
             revn: 0,
+            db_modified_at: String::new(),
             last_synced_hash: "h".to_string(),
             last_synced_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -235,6 +262,33 @@ mod tests {
         // A user-created (unmanaged) dir occupies the natural path → suffix.
         let p = allocate_file_path(&m, tmp.path(), "Client", "abcd1234-1", "home");
         assert_eq!(p, "Client/home-abcd1234.penpot");
+    }
+
+    #[test]
+    fn conflict_names_are_recognized_and_timestamp_is_fs_safe() {
+        let p = conflict_path_for("Client/home.penpot", "2026-07-13T09:04:42Z");
+        assert_eq!(p, "Client/home.conflict-2026-07-13T09-04-42Z.penpot");
+        assert!(!p.contains(':'));
+        assert!(is_conflict_dir_name(p.rsplit('/').next().unwrap()));
+        // Regular file dirs are not conflict copies.
+        assert!(!is_conflict_dir_name("home.penpot"));
+        // The marker without the .penpot suffix is not a conflict copy either
+        // (e.g. a project dir the user named that way).
+        assert!(!is_conflict_dir_name("notes.conflict-old"));
+        // Root-level file dir.
+        assert_eq!(
+            conflict_path_for("home.penpot", "2026-01-02T03:04:05Z"),
+            "home.conflict-2026-01-02T03-04-05Z.penpot"
+        );
+    }
+
+    #[test]
+    fn allocated_paths_never_look_like_conflict_copies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = Manifest::default();
+        let p = allocate_file_path(&m, tmp.path(), "Client", "f1", "x.conflict-1");
+        assert_eq!(p, "Client/x-conflict-1.penpot");
+        assert!(!is_conflict_dir_name(p.rsplit('/').next().unwrap()));
     }
 
     #[test]

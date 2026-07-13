@@ -24,6 +24,14 @@ smoke:
 invariant:
     bash scripts/m2-invariant.sh
 
-# Run the desktop app in dev mode
+# M3 exit criteria: git-checkout an older file dir -> appears in Penpot within
+# seconds; simultaneous edit -> exactly one conflict copy, never data loss.
+m3:
+    bash scripts/m3-sync.sh
+
+# Run the desktop app in dev mode. The SIGKILL orphan watchdog is a separate
+# bin in crates/supervisor that `cargo tauri dev` won't build on its own —
+# build it first so boot finds the target/debug/penpot-watchdog sibling.
 dev:
+    {{cargo_env}} cargo build -p supervisor --bin penpot-watchdog
     {{cargo_env}} cd apps/desktop && cargo tauri dev

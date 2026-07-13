@@ -3,12 +3,14 @@ name = "sync-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Penpot Local sync daemon (M2): one-way DB→FS sync (poll + debounce + export-binfile) plus startup reconciliation on top of sync-core and penpot-rpc."
+description = "Penpot Local sync daemon (M3): two-way sync (DB→FS poll/export + FS→DB watch/import), conflict copies, startup reconciliation, status/pause surface — on top of sync-core and penpot-rpc."
 
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+notify = "8"
+serde_json = { workspace = true }
 penpot-rpc = { path = "../penpot-rpc" }
 sync-core = { path = "../sync-core" }
 

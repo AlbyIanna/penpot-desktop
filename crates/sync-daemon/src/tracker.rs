@@ -125,9 +125,10 @@ impl ChangeTracker {
         );
     }
 
-    #[cfg(test)]
-    fn pending_ids(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.pending.keys().map(String::as_str).collect();
+    /// Ids currently waiting out their debounce (sorted). Used to surface
+    /// `Pending` states in the status snapshot.
+    pub fn pending_ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.pending.keys().cloned().collect();
         v.sort();
         v
     }
@@ -181,15 +182,15 @@ mod tests {
         assert!(t.pending_ids().is_empty());
         // revn change alone.
         t.observe(Instant::now(), DEBOUNCE, &snap(&[state("f1", 2, "t1")]));
-        assert_eq!(t.pending_ids(), vec!["f1"]);
+        assert_eq!(t.pending_ids(), vec!["f1".to_string()]);
         t.mark_synced(&state("f1", 2, "t1"));
         // modifiedAt change alone.
         t.observe(Instant::now(), DEBOUNCE, &snap(&[state("f1", 2, "t2")]));
-        assert_eq!(t.pending_ids(), vec!["f1"]);
+        assert_eq!(t.pending_ids(), vec!["f1".to_string()]);
         // revn moved BACKWARD (in-place import) — still a change.
         t.mark_synced(&state("f1", 2, "t2"));
         t.observe(Instant::now(), DEBOUNCE, &snap(&[state("f1", 1, "t3")]));
-        assert_eq!(t.pending_ids(), vec!["f1"]);
+        assert_eq!(t.pending_ids(), vec!["f1".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -220,7 +221,7 @@ mod tests {
         let mut t = ChangeTracker::new();
         t.mark_synced(&state("f1", 1, "t1"));
         t.observe(Instant::now(), DEBOUNCE, &snap(&[state("f1", 2, "t2")]));
-        assert_eq!(t.pending_ids(), vec!["f1"]);
+        assert_eq!(t.pending_ids(), vec!["f1".to_string()]);
         // Back to the synced pair (e.g. our own in-place import echo).
         t.observe(Instant::now(), DEBOUNCE, &snap(&[state("f1", 1, "t1")]));
         assert!(t.pending_ids().is_empty());
@@ -245,7 +246,7 @@ mod tests {
         assert!(t.take_due(Instant::now()).is_empty());
         // Reappearing counts as a fresh change.
         t.observe(Instant::now(), DEBOUNCE, &snap(&[state("f1", 1, "t1")]));
-        assert_eq!(t.pending_ids(), vec!["f1"]);
+        assert_eq!(t.pending_ids(), vec!["f1".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]

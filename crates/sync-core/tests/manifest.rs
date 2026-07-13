@@ -11,6 +11,7 @@ fn sample() -> Manifest {
             project_id: "e4ebd8e6-e0d6-8139-8008-51ec9531fcd2".to_string(),
             project_name: "client-x".to_string(),
             revn: 7,
+            db_modified_at: "2026-07-13T09:04:40.123Z".to_string(),
             last_synced_hash:
                 "b2124a9b263292b7416d44db6f3c0a11328968917dc29987c1c386a9503d31b0".to_string(),
             last_synced_at: "2026-07-13T09:04:42Z".to_string(),
@@ -77,6 +78,33 @@ fn save_is_atomic_no_tmp_left_and_replaces_previous() {
             .revn,
         8
     );
+}
+
+#[test]
+fn m2_manifest_without_db_modified_at_still_loads() {
+    // Manifests written before M3 lack the dbModifiedAt key; the field
+    // defaults to "" (= unknown → revn-only DB-moved heuristic).
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join(MANIFEST_FILE_NAME),
+        br#"{
+  "files": {
+    "f1": {
+      "lastSyncedAt": "2026-07-13T09:04:42Z",
+      "lastSyncedHash": "abc",
+      "path": "p/x.penpot",
+      "projectId": "p1",
+      "projectName": "p",
+      "revn": 3
+    }
+  },
+  "schemaVersion": 1
+}"#,
+    )
+    .unwrap();
+    let m = Manifest::load(tmp.path()).unwrap().unwrap();
+    assert_eq!(m.files["f1"].db_modified_at, "");
+    assert_eq!(m.files["f1"].revn, 3);
 }
 
 #[test]
