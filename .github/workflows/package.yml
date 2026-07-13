@@ -54,15 +54,38 @@ jobs:
       - name: Build the Linux penpot-runtime bundle (docker path + proofs)
         run: bash scripts/build-runtime-bundle-linux.sh
 
-      - name: Build the AppImage
+      - name: Build the AppImage (slim — WITHOUT the runtime resources)
         run: |
-          # tauri-build re-copies resources next to the release binary and
-          # cannot overwrite the bundle's read-only files — pre-clear (same
-          # fix as scripts/build-dmg.sh on macOS).
+          # Deliberately no tauri.bundle.conf.json overlay here: linuxdeploy
+          # dependency-scans every ELF inside the AppDir and (a) hard-fails
+          # on the jlink'd JRE ("Could not find dependency: libjvm.so", run
+          # 29266059720) and (b) would rewrite the rpaths of the carefully
+          # relocated valkey/postgres payloads. The runtime bundle is
+          # injected AFTER linuxdeploy, below.
           rm -rf target/release/penpot-runtime
           cd apps/desktop
-          CI=true NO_STRIP=true cargo tauri build --verbose --bundles appimage --config tauri.bundle.conf.json
+          CI=true NO_STRIP=true cargo tauri build --verbose --bundles appimage
           ls -la ../../target/release/bundle/appimage/
+
+      - name: Inject penpot-runtime into the AppImage and repack
+        run: |
+          set -euxo pipefail
+          cd target/release/bundle/appimage
+          APPIMAGE="$(ls *.AppImage | head -1)"
+          ./"$APPIMAGE" --appimage-extract >/dev/null
+          # layout.rs discovery path: <exe_dir>/../lib/penpot-desktop/penpot-runtime
+          mkdir -p squashfs-root/usr/lib/penpot-desktop
+          cp -a "$GITHUB_WORKSPACE/dist/penpot-runtime" squashfs-root/usr/lib/penpot-desktop/penpot-runtime
+          rm -rf squashfs-root/usr/lib/penpot-desktop/penpot-runtime/.cache
+          # appimagetool = mksquashfs + embedded runtime, NO dependency
+          # analysis — the injected bundle stays byte-exact.
+          curl -fsSL --retry 3 -o appimagetool \
+            "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+          rm -f "$APPIMAGE"
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
+          rm -rf squashfs-root appimagetool
+          ls -la
 
       - name: Build headless + watchdog (release, incremental after tauri build)
         run: cargo build --release -p penpot-desktop --bin headless -p supervisor --bin penpot-watchdog
