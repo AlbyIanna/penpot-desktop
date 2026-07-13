@@ -1,0 +1,8 @@
+# Spike/scratch artifacts (zips, extracted trees from roundtrip runs)
+m0/roundtrip-work/
+
+# Local assistant session history
+.remember/
+
+# OS noise
+.DS_Store
