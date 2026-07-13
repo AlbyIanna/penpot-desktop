@@ -451,6 +451,12 @@ with open(os.path.join(staging, "MANIFEST.json"), "w") as f:
     f.write("\n")
 PYEOF
 
+  # Docker/tar extraction leaves some files read-only (jre legal docs,
+  # license texts). Downstream tooling must be able to re-copy and patch
+  # them (tauri-build resource re-copy; linuxdeploy's patchelf pass over
+  # every ELF in the AppDir) — normalize to user-writable.
+  chmod -R u+w "$STAGING"
+
   printf '%s' "$FINGERPRINT" > "$STAGING/.fingerprint"
 fi
 

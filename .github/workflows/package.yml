@@ -31,7 +31,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev libssl-dev build-essential curl wget file \
+            librsvg2-dev librsvg2-common libxdo-dev libssl-dev build-essential \
+            curl wget file gettext desktop-file-utils libglib2.0-bin \
             patchelf squashfs-tools xvfb libfuse2t64
 
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -60,7 +61,7 @@ jobs:
           # fix as scripts/build-dmg.sh on macOS).
           rm -rf target/release/penpot-runtime
           cd apps/desktop
-          CI=true NO_STRIP=true cargo tauri build --bundles appimage --config tauri.bundle.conf.json
+          CI=true NO_STRIP=true cargo tauri build --verbose --bundles appimage --config tauri.bundle.conf.json
           ls -la ../../target/release/bundle/appimage/
 
       - name: Build headless + watchdog (release, incremental after tauri build)
@@ -147,8 +148,10 @@ jobs:
   # macOS dmg: crane path (no docker on macOS runners) + build-dmg.sh + the
   # headless subset of the artifact test against the dmg's own .app resources.
   # ---------------------------------------------------------------------------
+  # macos-15 (not -14): the theseus postgres 15.18.0 darwin binaries link
+  # _strchrnul (libSystem >= macOS 15.4) — initdb aborts on Sonoma runners.
   macos-dmg:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
