@@ -23,6 +23,13 @@ jobs:
   linux-appimage:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      # M5 path hygiene: keep builder paths ($HOME/.cargo, $HOME/.rustup, the
+      # checkout) out of release binaries. Job-level so the tauri build and
+      # the later incremental headless build share one flag set (a mismatch
+      # would force a full rebuild AND ship unremapped binaries).
+      # build-dmg.sh sets the equivalent itself for the macOS leg.
+      RUSTFLAGS: --remap-path-prefix=/home/runner=/build
     steps:
       - uses: actions/checkout@v4
 

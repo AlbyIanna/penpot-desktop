@@ -234,6 +234,104 @@ async fn live_update_file_add_obj_and_delete_file() {
 }
 
 // ---------------------------------------------------------------------
+// rename-file / move-files / rename-project (M5: OS-side rename/move)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "needs a live stack (PENPOT_RPC_LIVE_BASE_URL / PENPOT_RPC_LIVE_TOKEN)"]
+async fn live_rename_file_move_files_and_rename_project() {
+    let client = client();
+    let team_id = default_team_id(&client).await;
+    let src = client
+        .create_project(&team_id, &format!("rpc-live-mv-src-{}", uuid_v4()))
+        .await
+        .expect("create-project src");
+    let dst = client
+        .create_project(&team_id, &format!("rpc-live-mv-dst-{}", uuid_v4()))
+        .await
+        .expect("create-project dst");
+    let file = client
+        .create_file(&src.id, "original-name")
+        .await
+        .expect("create-file");
+    let before = client
+        .get_project_files(&src.id)
+        .await
+        .expect("get-project-files")
+        .into_iter()
+        .find(|f| f.id == file.id)
+        .expect("file listed");
+
+    // rename-file: 200 + SimplifiedFile, name changed, modifiedAt BUMPED
+    // (the poll surface must see a rename as a change).
+    let renamed = client
+        .rename_file(&file.id, "renamed-from-os")
+        .await
+        .expect("rename-file");
+    assert_eq!(renamed.id, file.id);
+    assert_eq!(renamed.name, "renamed-from-os");
+    assert_ne!(
+        renamed.modified_at, before.modified_at,
+        "rename-file must bump modifiedAt"
+    );
+    let after = client
+        .get_project_files(&src.id)
+        .await
+        .expect("get-project-files")
+        .into_iter()
+        .find(|f| f.id == file.id)
+        .expect("file still listed");
+    assert_eq!(after.name, "renamed-from-os");
+    assert_eq!(after.revn, before.revn, "rename does not touch revn");
+
+    // move-files: 204; the file leaves src and appears in dst under the SAME
+    // id, with modifiedAt NOT bumped (verified live: moves are membership
+    // changes, not content changes).
+    client
+        .move_files(&[file.id.as_str()], &dst.id)
+        .await
+        .expect("move-files");
+    assert!(
+        client
+            .get_project_files(&src.id)
+            .await
+            .expect("src files")
+            .is_empty(),
+        "file must leave the source project"
+    );
+    let moved = client
+        .get_project_files(&dst.id)
+        .await
+        .expect("dst files")
+        .into_iter()
+        .find(|f| f.id == file.id)
+        .expect("file must appear in the target project under the same id");
+    assert_eq!(moved.project_id, dst.id);
+    assert_eq!(moved.name, "renamed-from-os");
+    assert_eq!(
+        moved.modified_at, after.modified_at,
+        "move-files must NOT bump modifiedAt (2.16.2 behavior the sync daemon relies on)"
+    );
+
+    // rename-project: 204; the new name is visible in get-projects.
+    let new_project_name = format!("rpc-live-mv-dst-renamed-{}", uuid_v4());
+    client
+        .rename_project(&dst.id, &new_project_name)
+        .await
+        .expect("rename-project");
+    let projects = client.get_projects(&team_id).await.expect("get-projects");
+    assert!(
+        projects
+            .iter()
+            .any(|p| p.id == dst.id && p.name == new_project_name),
+        "renamed project not visible: {projects:?}"
+    );
+
+    client.delete_project(&src.id).await.expect("delete src");
+    client.delete_project(&dst.id).await.expect("delete dst");
+}
+
+// ---------------------------------------------------------------------
 // export-binfile → download through the proxy → import as NEW file
 // ---------------------------------------------------------------------
 

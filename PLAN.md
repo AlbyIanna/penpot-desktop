@@ -163,7 +163,30 @@ first boot; now `no_proxy()`). `node` is NOT bundled — proven dead code for me
 jlink-minimized JRE, pinned Penpot release fetch script, AppImage + dmg, **Nix flake** (dev shell + package).
 **Exit criteria:** a fresh machine (or clean NixOS VM) runs the app from a single artifact.
 
-### M5 — Freedom features
+### M5 — Freedom features — ✅ DONE 2026-07-13 (exporter dev-mode only; notarization + NixOS VM still open)
+
+All feature blocks green via `scripts/m5-features.sh` (`just m5`, 46 checks): per-board
+SVG/PNG auto-export next to sources (new `crates/board-export` + optional exporter
+supervisor child, `PENPOT_LOCAL_EXPORTS=1`, **dev-mode only — not packaged**); OS-side
+rename/move of `.penpot` dirs re-keys the manifest under the SAME file id
+(rename-file/move-files/rename-project, no reimport); `designs-git-init.sh` (+ tray
+action) teaches the no-overlay lesson; reveal-in-file-manager in the tray; M4 debts
+paid: tauri-plugin-single-instance (GUI), non-BMP path pre-flight (risk 8 → clean
+refusal), `--remap-path-prefix` (0 `/Users/*` strings in release bins). Evidence +
+honest scope in `docs/milestones/m5.md`. Still open: Developer ID/notarization,
+NixOS-VM validation, exporter packaging (node v24.16.0 pin + bundled chromium).
+Post-M5 debts from independent verification (details in `docs/milestones/m5.md`):
+- **Stale-exporter adoption** (dev-mode): after an unclean kill during the boot window the
+  exporter node child can survive the watchdog; the next boot's /readyz probe adopts the
+  stale process and every render 403s on the secret-key mismatch. Boot should verify the
+  probed exporter is its own child or refuse the busy port.
+- **Shutdown hang while renders fail**: SIGTERM during a failing render batch delays exit
+  ~5–7 min (retry ladder not cancellation-aware; non-biased select). Healthy path is 1s.
+- Rename-A→B-while-creating-new-A follows path identity (documented edge, no data loss, but
+  the as-new import keeps the binfile's internal name); `sanitize_stem` passes Windows
+  device names (future Windows port trap); milestone suites must run solo (m4's lsof scans
+  are not concurrency-safe).
+
 Per-board SVG/PNG auto-export next to sources (needs the exporter service), `git init` helper +
 sensible `.gitignore`, "reveal in file manager", file/project create-rename-move from the OS side reflected in Penpot.
 Notes from M3 verification for the git helper + user docs:
@@ -175,11 +198,11 @@ Notes from M3 verification for the git helper + user docs:
   import and is then silently swept by the next DB→FS export swap (verified live). Document it,
   and decide whether validate-time warnings or preserving unknown entries is worth it.
 Packaging debts from M4 verification:
-- `tauri-plugin-single-instance` (double launch today = sane loud failure, ugly second window).
+- ~~`tauri-plugin-single-instance`~~ — paid in M5.
 - Developer ID signing + notarization (ad-hoc today; Gatekeeper needs right-click-Open).
-- `--remap-path-prefix`/trim-paths (release binaries embed ~1k build-machine path strings).
+- ~~`--remap-path-prefix`/trim-paths~~ — paid in M5 (0 `/Users/*` strings in release bins).
 - The NixOS-VM validation recipe in `nix/README.md` is the outstanding M4 exit-criterion debt.
-- Path pre-flight for the non-BMP JDK limitation (risk 8).
+- ~~Path pre-flight for the non-BMP JDK limitation (risk 8)~~ — paid in M5 (clean refusal).
 - Exporter bundling needs node v24.16.0 (upstream pin) and re-opens the dmg-size levers
   (source maps 55.9 MB, images/features 90.2 MB, builtin-templates 93.7 MB).
 

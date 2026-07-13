@@ -35,7 +35,7 @@ See [PLAN.md](PLAN.md) for the architecture, milestones, and risk register;
 | M2 — one-way sync (DB → FS) + startup reconciliation | ✅ done (`docs/milestones/m2.md`) |
 | M3 — two-way sync + conflicts | ✅ done (`docs/milestones/m3.md`) |
 | M4 — packaging (AppImage/dmg/Nix) | ✅ done — macOS dmg verified; AppImage CI-only; NixOS VM deferred (`docs/milestones/m4.md`) |
-| M5 — per-board exports, git helpers | next |
+| M5 — per-board exports, OS rename/move, git helpers, hardening | ✅ done — exporter dev-mode only; notarization + NixOS VM still open (`docs/milestones/m5.md`) |
 
 ## Running it (macOS, dev)
 
@@ -76,18 +76,29 @@ cargo run -p penpot-desktop --bin headless   # prints "READY <url>" — open it 
 cargo test --workspace      # unit + integration tests (proxy, supervisor, rpc client)
 bash scripts/m1-smoke.sh    # full-stack smoke test: fresh boot → auth → X-Accel
                             # asset round-trip → clean shutdown → reboot persistence
+bash scripts/m2-invariant.sh  # THE core invariant: wipe the DB, restart, rebuilt from disk
+bash scripts/m3-sync.sh       # two-way sync + conflict-copy exit criteria
+bash scripts/m5-features.sh   # M5: auto-export, OS rename/move, git helper, pre-flight
 python3 scripts/roundtrip.py  # M0 binfile round-trip check (needs the m0 docker stack:
                               # docker compose -f m0/docker/docker-compose.yaml up -d)
 ```
+
+Optional per-board SVG/PNG auto-export (M5, dev-mode only — needs a host `node` and a
+one-time `./scripts/fetch-penpot.sh --with-browsers` for the exporter + chromium):
+launch with `PENPOT_LOCAL_EXPORTS=1` and every board renders into `<file>.exports/`
+next to its sources.
 
 Repo layout:
 
 | Path | What |
 |---|---|
-| `apps/desktop` | Tauri v2 shell, boot sequence, headless bin |
-| `crates/supervisor` | child-process supervision: embedded Postgres, Valkey, backend JVM |
-| `crates/proxy` | local replacement for Penpot's nginx (SPA, `/api`, websockets, X-Accel assets) |
+| `apps/desktop` | Tauri v2 shell, boot sequence, tray UI, headless bin, boot pre-flight |
+| `crates/supervisor` | child-process supervision: embedded Postgres, Valkey, backend JVM, optional exporter |
+| `crates/proxy` | local replacement for Penpot's nginx (SPA, `/api`, websockets, X-Accel assets, `/api/export`) |
 | `crates/penpot-rpc` | typed client for the Penpot RPC surface |
-| `scripts/` | `fetch-penpot.sh` (extract pinned artifacts), smoke + round-trip tests |
-| `runtime/` | extracted Penpot backend/frontend (gitignored; regenerate with the fetch script) |
+| `crates/sync-core` | manifest, normalization/hash, atomic dir swaps |
+| `crates/sync-daemon` | two-way folder⇄DB sync, conflicts, OS rename/move re-keying |
+| `crates/board-export` | per-board SVG/PNG auto-export next to sources (M5) |
+| `scripts/` | `fetch-penpot.sh` (extract pinned artifacts), milestone test suites |
+| `runtime/` | extracted Penpot backend/frontend/exporter (gitignored; regenerate with the fetch script) |
 | `m0/docker/` | upstream Penpot compose stack used by the M0 spike and `roundtrip.py` |

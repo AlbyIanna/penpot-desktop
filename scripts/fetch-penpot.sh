@@ -14,24 +14,38 @@
 #   runtime/nginx-reference.conf  <- the image's /tmp/nginx.conf.template + override
 #                                    snippets, concatenated as reference docs for the proxy
 #   runtime/VERSION               <- the pinned tag
+#   runtime/exporter/             <- penpotapp/exporter:$PENPOT_VERSION /opt/penpot/exporter
+#                                    (app.js single bundle + node_modules — pure JS,
+#                                     zero native .node bindings, so the linux image's
+#                                     node_modules run on macOS as-is; M5 exporter spike)
+#   runtime/exporter/VERSION      <- the pinned tag (separate idempotency check, so an
+#                                    existing runtime/ gains the exporter without --force)
+#   runtime/exporter-browsers/    <- OPTIONAL (--with-browsers): playwright-managed
+#                                    chromium for the exporter (~500 MB on disk; the
+#                                    exporter launches playwright's bundled chromium —
+#                                    the system Chrome is NOT used). Needs a host node.
 #
 # Idempotent: if runtime/VERSION already matches $PENPOT_VERSION and the key
-# artifacts exist, extraction is skipped (pass --force to re-extract).
+# artifacts exist, extraction is skipped (pass --force to re-extract). The
+# exporter extraction has its own VERSION check with the same semantics.
 # Extraction goes to a staging dir and is swapped in only on success, so an
 # interrupted run never leaves a half-populated runtime/.
 #
 # The final verification step ALWAYS runs (even on skip): jar size, frontend
 # index.html, and a host-JVM launch sanity check of penpot.jar.
 #
-# Usage: scripts/fetch-penpot.sh [--force] [--no-java-check]
-# Env:   PENPOT_VERSION (default 2.16.2), JAVA_CMD (default /opt/homebrew/opt/openjdk/bin/java)
+# Usage: scripts/fetch-penpot.sh [--force] [--no-java-check] [--no-exporter] [--with-browsers]
+# Env:   PENPOT_VERSION (default 2.16.2), JAVA_CMD (default /opt/homebrew/opt/openjdk/bin/java),
+#        NODE_CMD (default /opt/homebrew/bin/node — used only by --with-browsers)
 
 set -euo pipefail
 
 PENPOT_VERSION="${PENPOT_VERSION:-2.16.2}"
 BACKEND_IMAGE="penpotapp/backend:${PENPOT_VERSION}"
 FRONTEND_IMAGE="penpotapp/frontend:${PENPOT_VERSION}"
+EXPORTER_IMAGE="penpotapp/exporter:${PENPOT_VERSION}"
 JAVA_CMD="${JAVA_CMD:-/opt/homebrew/opt/openjdk/bin/java}"
+NODE_CMD="${NODE_CMD:-/opt/homebrew/bin/node}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="${REPO_ROOT}/runtime"
@@ -52,10 +66,14 @@ PENPOT_JAVA_OPTS=(
 
 FORCE=0
 JAVA_CHECK=1
+EXPORTER=1
+BROWSERS=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
     --no-java-check) JAVA_CHECK=0 ;;
+    --no-exporter) EXPORTER=0 ;;
+    --with-browsers) BROWSERS=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -162,6 +180,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Exporter extraction (M5; separately versioned so an existing runtime/ gains
+# it without --force). Same docker create/cp/rm dance — no container runs.
+# ---------------------------------------------------------------------------
+exporter_is_current() {
+  [[ -f "${RUNTIME_DIR}/exporter/VERSION" ]] \
+    && [[ "$(cat "${RUNTIME_DIR}/exporter/VERSION")" == "${PENPOT_VERSION}" ]] \
+    && [[ -s "${RUNTIME_DIR}/exporter/app.js" ]] \
+    && [[ -d "${RUNTIME_DIR}/exporter/node_modules" ]]
+}
+
+if [[ "$EXPORTER" -eq 1 ]]; then
+  if [[ "$FORCE" -eq 0 ]] && exporter_is_current; then
+    log "runtime/exporter already at ${PENPOT_VERSION} — skipping extraction"
+  else
+    mkdir -p "${RUNTIME_DIR}"
+    EXP_STAGING="$(mktemp -d "${RUNTIME_DIR}/.staging-exporter.XXXXXX")"
+    EXP_CID=""
+    exp_cleanup() {
+      [[ -n "${EXP_CID}" ]] && docker rm -f "${EXP_CID}" >/dev/null 2>&1 || true
+      rm -rf "${EXP_STAGING}"
+      return 0
+    }
+    trap exp_cleanup EXIT
+    log "extracting exporter from ${EXPORTER_IMAGE} ..."
+    EXP_CID="$(docker create "${EXPORTER_IMAGE}")"
+    docker cp -q "${EXP_CID}:/opt/penpot/exporter" "${EXP_STAGING}/exporter"
+    docker rm "${EXP_CID}" >/dev/null
+    EXP_CID=""
+    printf '%s\n' "${PENPOT_VERSION}" > "${EXP_STAGING}/exporter/VERSION"
+    rm -rf "${RUNTIME_DIR:?}/exporter"
+    mv "${EXP_STAGING}/exporter" "${RUNTIME_DIR}/exporter"
+    trap - EXIT
+    exp_cleanup 2>/dev/null || true
+    log "exporter extraction complete"
+  fi
+
+  [[ -s "${RUNTIME_DIR}/exporter/app.js" ]] \
+    || die "verification failed: runtime/exporter/app.js missing"
+  log "OK exporter/app.js"
+
+  # Playwright chromium for the exporter (~500 MB on disk after download).
+  # The compiled exporter calls playwright's chromium.launch() with no
+  # executablePath/channel, so the playwright-managed browser is the only
+  # no-code-change option (system Chrome is NOT used). Opt-in because of the
+  # download size; the app's boot pre-flight points here when it's missing.
+  BROWSERS_DIR="${RUNTIME_DIR}/exporter-browsers"
+  browsers_present() {
+    compgen -G "${BROWSERS_DIR}/chromium*" >/dev/null 2>&1
+  }
+  if [[ "$BROWSERS" -eq 1 ]]; then
+    if browsers_present && [[ "$FORCE" -eq 0 ]]; then
+      log "exporter browsers already present under ${BROWSERS_DIR} — skipping"
+    else
+      [[ -x "${NODE_CMD}" ]] || die "node not found at ${NODE_CMD} (set NODE_CMD; needed for --with-browsers)"
+      log "installing playwright chromium into ${BROWSERS_DIR} (large download) ..."
+      (cd "${RUNTIME_DIR}/exporter" \
+        && PLAYWRIGHT_BROWSERS_PATH="${BROWSERS_DIR}" \
+           "${NODE_CMD}" node_modules/playwright/cli.js install chromium)
+      browsers_present || die "playwright install finished but no chromium* under ${BROWSERS_DIR}"
+    fi
+    log "OK exporter-browsers"
+  elif ! browsers_present; then
+    log "NOTE: exporter browsers not installed (run with --with-browsers to enable server-side renders)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Verification (always runs)
 # ---------------------------------------------------------------------------
 JAR="${RUNTIME_DIR}/backend/penpot.jar"
@@ -233,6 +318,8 @@ override the binary with \`JAVA_CMD=...\`, skip with \`--no-java-check\`).
 | \`frontend/\` | \`penpotapp/frontend:${PENPOT_VERSION}\` \`/var/www/app\` | static SPA. Upstream's entrypoint rewrites \`js/config.js\` at boot (injects \`penpotFlags\` / \`penpotPublicURI\`); our proxy must do the equivalent when serving it. |
 | \`nginx-reference.conf\` | frontend image \`/tmp/nginx.conf.template\` + \`/etc/nginx/overrides/*\` | reference-only concatenation of the upstream nginx config the proxy crate must functionally replicate (SPA, \`/api\`, \`/ws/notifications\`, X-Accel \`/internal/assets\`). Never loaded by anything. |
 | \`VERSION\` | pin | the extracted tag; the idempotency check compares against it |
+| \`exporter/\` | \`penpotapp/exporter:${PENPOT_VERSION}\` \`/opt/penpot/exporter\` | \`app.js\` compiled bundle + \`node_modules\` (pure JS — the linux modules run on macOS as-is). Dev-mode only (M5): run with a host node (upstream image pins v24.16.0; v25 verified working). Skip with \`--no-exporter\`. |
+| \`exporter-browsers/\` | playwright download (\`--with-browsers\`) | playwright-managed chromium for the exporter (\`PLAYWRIGHT_BROWSERS_PATH\`). The exporter never uses the system Chrome. |
 
 ## JVM launch contract (what the supervisor must replicate)
 

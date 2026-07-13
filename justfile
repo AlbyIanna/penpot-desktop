@@ -29,6 +29,17 @@ invariant:
 m3:
     bash scripts/m3-sync.sh
 
+# M5 freedom features: per-board auto-export (needs the dev-mode exporter:
+# scripts/fetch-penpot.sh --with-browsers + host node), OS-side rename/move,
+# git-init helper, non-BMP pre-flight, single-instance behavior.
+m5:
+    bash scripts/m5-features.sh
+
+# M5: enable git versioning for a designs folder (idempotent; the tray's
+# "Enable git versioning" action runs this same script).
+git-init designs_dir:
+    bash scripts/designs-git-init.sh "{{designs_dir}}"
+
 # Run the desktop app in dev mode. The SIGKILL orphan watchdog is a separate
 # bin in crates/supervisor that `cargo tauri dev` won't build on its own —
 # build it first so boot finds the target/debug/penpot-watchdog sibling.

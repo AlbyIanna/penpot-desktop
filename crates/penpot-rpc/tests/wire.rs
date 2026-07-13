@@ -736,3 +736,71 @@ async fn delete_file_and_delete_project_tolerate_204_no_content() {
     client.delete_file(FILE_ID).await.unwrap();
     client.delete_project(PROJECT_ID).await.unwrap();
 }
+
+// ---------------------------------------------------------------------
+// rename-file / move-files / rename-project (M5: OS-side rename/move)
+// Shapes verified live against 2.16.2 (openapi + curl probes): rename-file
+// answers 200 with a "SimplifiedFile" body and a BUMPED modifiedAt;
+// move-files and rename-project answer 204 No Content.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn rename_file_sends_id_and_name_and_parses_simplified_file() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/rename-file"))
+        .and(header("content-type", "application/json"))
+        .and(body_json(json!({"id": FILE_ID, "name": "new-name"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": FILE_ID,
+            "name": "new-name",
+            "createdAt": "2026-07-13T20:24:41.764637Z",
+            "modifiedAt": "2026-07-13T20:24:42.264374Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    let renamed = client.rename_file(FILE_ID, "new-name").await.unwrap();
+    assert_eq!(renamed.id, FILE_ID);
+    assert_eq!(renamed.name, "new-name");
+    // The bumped modifiedAt is the field the sync daemon's poll tracker
+    // needs to see the rename as a DB change.
+    assert_eq!(renamed.modified_at, "2026-07-13T20:24:42.264374Z");
+}
+
+#[tokio::test]
+async fn move_files_sends_ids_array_and_camel_case_project_id_tolerating_204() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/move-files"))
+        .and(header("content-type", "application/json"))
+        // ids is a JSON array (the schema is a set); projectId is camelCase.
+        .and(body_json(json!({"ids": [FILE_ID], "projectId": PROJECT_ID})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    client.move_files(&[FILE_ID], PROJECT_ID).await.unwrap();
+}
+
+#[tokio::test]
+async fn rename_project_sends_id_and_name_tolerating_204() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/rpc/command/rename-project"))
+        .and(body_json(json!({"id": PROJECT_ID, "name": "Renamed Project"})))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = PenpotClient::new(server.uri()).with_auth(Auth::Token("tok".into()));
+    client
+        .rename_project(PROJECT_ID, "Renamed Project")
+        .await
+        .unwrap();
+}

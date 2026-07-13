@@ -58,6 +58,31 @@ pub(crate) fn map_event_path(sync_root: &Path, event_path: &Path) -> Option<Stri
     None // event outside any .penpot dir (project dirs, stray files, root)
 }
 
+/// Is this a *structural* event: a path inside the root that is NOT inside
+/// (or itself) any `.penpot` dir, the manifest, our swap machinery or a dot
+/// dir? Project-folder renames/moves surface ONLY as such events on macOS
+/// (FSEvents fires for the renamed directory itself, never for its
+/// children), so the engine reacts to them with a debounced re-key sweep
+/// (M5). Pure — unit-tested below.
+pub(crate) fn is_structural_event(sync_root: &Path, event_path: &Path) -> bool {
+    let Ok(rel) = event_path.strip_prefix(sync_root) else {
+        return false;
+    };
+    let mut any = false;
+    for comp in rel.components() {
+        let name = comp.as_os_str().to_string_lossy();
+        if name.starts_with('.')
+            || name.contains(".penpot.tmp-")
+            || name.contains(".penpot.old-")
+            || name.ends_with(paths::PENPOT_DIR_SUFFIX)
+        {
+            return false; // ignored or owned by map_event_path
+        }
+        any = true;
+    }
+    any // the sync root itself is not structural
+}
+
 /// Start a recursive watcher on `root`, forwarding every event path into
 /// `tx` (filtering/mapping happens on the async side, keeping the watcher
 /// callback trivial). The returned watcher must be kept alive.
@@ -215,6 +240,29 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn structural_events_are_non_penpot_paths_inside_the_root() {
+        let r = Path::new("/designs");
+        let s = |p: &str| is_structural_event(r, Path::new(p));
+        // Project folder renamed/moved: THE case this exists for.
+        assert!(s("/designs/Client B"));
+        assert!(s("/designs/Client B/nested"));
+        // Stray files in project folders are structural too (harmless: the
+        // sweep is a no-op when nothing vanished).
+        assert!(s("/designs/Client A/readme.txt"));
+        // Not structural: the root itself, anything outside it…
+        assert!(!s("/designs"));
+        assert!(!s("/elsewhere/Client B"));
+        // …anything already owned by map_event_path or ignored by it.
+        assert!(!s("/designs/Client A/home.penpot"));
+        assert!(!s("/designs/Client A/home.penpot/files/x.json"));
+        assert!(!s("/designs/.penpot-sync.json"));
+        assert!(!s("/designs/.git/objects/ab"));
+        assert!(!s("/designs/Client/home.penpot.tmp-0123/x.json"));
+        assert!(!s("/designs/Client/home.penpot.old-0123"));
+        assert!(!s("/designs/Client/home.conflict-2026-07-13T09-04-42Z.penpot"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -168,6 +168,27 @@ impl RuntimeLayout {
     }
 }
 
+/// Dev-mode fallback runtime dir (lowest precedence).
+///
+/// Debug builds embed the repo path via `CARGO_MANIFEST_DIR` — the pre-M4
+/// behavior every dev script relies on. Release binaries must NOT embed
+/// build-machine paths (M5 path hygiene: this was the one string
+/// `--remap-path-prefix` cannot rewrite, since `env!` expands at compile
+/// time), so they fall back to a cwd-relative `runtime/`. Packaged installs
+/// never reach this branch (env override or bundle always wins), and a
+/// release binary run bare still fails with the clear "runtime artifacts not
+/// found under runtime" error instead of leaking the builder's home dir.
+fn dev_runtime_dir() -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        PathBuf::from("runtime")
+    }
+}
+
 /// Is `dir` a valid `penpot-runtime/` bundle?
 pub fn is_bundle(dir: &Path) -> bool {
     dir.join(BUNDLE_MARKER).is_file()
@@ -232,10 +253,7 @@ pub fn resolve_layout(env: &EnvOverrides, bundle: Option<&Path>) -> RuntimeLayou
             // The bundle contract has backend/ + frontend/ at its root, the
             // exact shape the proxy/supervisor expect of a runtime dir.
             Some(b) => Resolved::new(b, Source::Bundle),
-            None => Resolved::new(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime"),
-                Source::Dev,
-            ),
+            None => Resolved::new(dev_runtime_dir(), Source::Dev),
         },
     };
 

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+pub use board_export::ExportStatusSnapshot;
 pub use sync_daemon::{FileState, SyncStatusSnapshot};
 
 /// Control handle the UI uses to pause/resume syncing. Implemented by
@@ -124,6 +125,46 @@ impl SyncControl for DaemonStatusBridge {
             Some(control) => control.resume(),
             None => self.tx.send_modify(|s| s.paused = false),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExportStatusBridge — same late binding for the board-export service (M5)
+// ---------------------------------------------------------------------------
+
+/// Bridges the tray's "Exports:" line (subscribed at `setup`) to the
+/// board-export service (spawned at the end of boot). Read-only counterpart
+/// of [`DaemonStatusBridge`]: no control surface, just snapshot forwarding.
+pub struct ExportStatusBridge {
+    tx: watch::Sender<ExportStatusSnapshot>,
+}
+
+impl ExportStatusBridge {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Arc<Self> {
+        let (tx, _rx) = watch::channel(ExportStatusSnapshot::default());
+        Arc::new(ExportStatusBridge { tx })
+    }
+
+    /// The receiver half the tray consumes.
+    pub fn subscribe(&self) -> watch::Receiver<ExportStatusSnapshot> {
+        self.tx.subscribe()
+    }
+
+    /// Forward every service snapshot into the bridge channel. Must be
+    /// called from within a tokio runtime (the boot task).
+    pub fn attach(self: &Arc<Self>, mut rx: watch::Receiver<ExportStatusSnapshot>) {
+        let bridge = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let snapshot = rx.borrow_and_update().clone();
+                let _ = bridge.tx.send(snapshot);
+                if rx.changed().await.is_err() {
+                    tracing::warn!("board-export status channel closed; tray exports line frozen");
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -330,6 +371,34 @@ mod tests {
         ));
         let client = penpot_rpc::PenpotClient::new("http://127.0.0.1:9");
         sync_daemon::spawn(client, sync_daemon::SyncConfig::new(root, "team"))
+    }
+
+    #[tokio::test]
+    async fn export_bridge_forwards_service_snapshots() {
+        let bridge = ExportStatusBridge::new();
+        let mut ui_rx = bridge.subscribe();
+        assert_eq!(*ui_rx.borrow(), ExportStatusSnapshot::default());
+
+        let (service_tx, service_rx) = watch::channel(ExportStatusSnapshot::default());
+        bridge.attach(service_rx);
+        service_tx.send_modify(|s| {
+            s.files_up_to_date = 2;
+            s.rendering = Some("proj/home.penpot".into());
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if ui_rx.borrow().files_up_to_date == 2 {
+                    break;
+                }
+                ui_rx.changed().await.expect("bridge channel open");
+            }
+        })
+        .await
+        .expect("service snapshot must reach the tray channel");
+        assert_eq!(
+            ui_rx.borrow().rendering.as_deref(),
+            Some("proj/home.penpot")
+        );
     }
 
     #[tokio::test]

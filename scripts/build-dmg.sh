@@ -57,6 +57,15 @@ fi
 
 # --- 2. tauri build (app + dmg) ----------------------------------------------
 echo "== cargo tauri build (release + app + dmg)"
+# M5 path hygiene: release binaries used to embed ~1k build-machine path
+# strings (panic/tracing Location metadata pointing into $HOME/.cargo,
+# $HOME/.rustup and the repo checkout — username disclosure). Rewrite them at
+# compile time; $HOME covers all three roots (std is already shipped as
+# /rustc/<hash> by upstream). The CARGO_MANIFEST_DIR dev-fallback (the one
+# string remap cannot touch) is compiled out of release builds in
+# apps/desktop/src/layout.rs. Verify with:
+#   strings target/release/penpot-desktop | grep -c "$HOME"   # must be 0
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${HOME}=/build"
 # tauri-build copies bundle.resources next to the release binary
 # (target/release/penpot-runtime). The bundle contains read-only files (jre
 # legal docs, license texts, mode 444) and std::fs::copy cannot overwrite a

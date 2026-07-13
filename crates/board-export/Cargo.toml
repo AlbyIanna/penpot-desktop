@@ -1,0 +1,22 @@
+[package]
+name = "board-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local per-board SVG/PNG auto-export (M5): watches the .penpot-sync.json manifest (read-only), renders every board of a changed file through the penpot-exporter service, and atomically maintains a <name>.exports/ directory next to each .penpot source dir."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+penpot-rpc = { path = "../penpot-rpc" }
+sync-core = { path = "../sync-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+# test-util is not part of tokio's "full": needed for time::pause in tests.
+tokio = { version = "1", features = ["full", "test-util"] }

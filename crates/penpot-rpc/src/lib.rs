@@ -29,7 +29,7 @@ pub use error::{Error, Result};
 pub use sse::{parse_sse, SseEvent};
 pub use types::{
     AccessToken, CreatedFile, ExportedBinfile, FileSummary, LoginOutcome, PrepareRegister,
-    Profile, ProjectInfo, RegisterOutcome, UpdateFileOutcome,
+    Profile, ProjectInfo, RegisterOutcome, RenamedFile, UpdateFileOutcome,
 };
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, COOKIE, SET_COOKIE};
@@ -343,6 +343,38 @@ impl PenpotClient {
             }),
         )
         .await
+    }
+
+    /// `rename-file` — `{id, name}`, verified live on 2.16.2 (M5): answers
+    /// `200` with a "SimplifiedFile" body (`id`, `name`, `createdAt`,
+    /// `modifiedAt`) and **bumps the file's `modifiedAt`** — the poll surface
+    /// sees a rename as a change (the exported binfile embeds the name, so a
+    /// follow-up export is semantically real, not noise).
+    pub async fn rename_file(&self, file_id: &str, name: &str) -> Result<RenamedFile> {
+        self.rpc("rename-file", &json!({ "id": file_id, "name": name }))
+            .await
+    }
+
+    /// `move-files` — move files to another project of the same team:
+    /// `{ids: [fileId…], projectId: <target>}`. Verified live on 2.16.2 (M5):
+    /// answers `204 No Content` and does **not** bump the moved files'
+    /// `modifiedAt` (their content is untouched; only the project membership
+    /// changes, observable via `get-project-files`).
+    pub async fn move_files(&self, file_ids: &[&str], target_project_id: &str) -> Result<()> {
+        self.rpc_response(
+            "move-files",
+            &json!({ "ids": file_ids, "projectId": target_project_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `rename-project` — `{id, name}`. Verified live on 2.16.2 (M5):
+    /// answers `204 No Content`.
+    pub async fn rename_project(&self, project_id: &str, name: &str) -> Result<()> {
+        self.rpc_response("rename-project", &json!({ "id": project_id, "name": name }))
+            .await?;
+        Ok(())
     }
 
     /// `delete-file` — answers `204 No Content` (verified in M0).
