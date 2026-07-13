@@ -1,0 +1,37 @@
+[package]
+name = "penpot-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "penpot-desktop"
+
+[lib]
+name = "penpot_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "penpot-desktop"
+path = "src/main.rs"
+
+[[bin]]
+name = "headless"
+path = "src/bin/headless.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+supervisor = { path = "../../crates/supervisor" }
+proxy = { path = "../../crates/proxy" }
+penpot-rpc = { path = "../../crates/penpot-rpc" }
+axum = "0.8"
+http = "1"
+directories = "5"
+rand = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
