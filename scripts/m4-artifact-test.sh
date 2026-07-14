@@ -26,6 +26,10 @@
 #   (f) RENDERS ON: a seeded board renders to <name>.exports/*.{svg,png}
 #       through the BUNDLED node + headless chromium — no host node on PATH,
 #       poisoned proxies (N2 exit criterion);
+#   (g) PACKAGED SEARCH: the bundled N1 vault-index service indexes the seeded
+#       designs offline and /__api/vault/search returns the 'Cover' board hit
+#       (kind=board, alpha fileId, /#/workspace deep link) — the surface N3's
+#       board grid depends on, proven present in the shipped artifact;
 #   (e) SIGTERM -> clean exit, no orphans; then a SIGKILL run -> the watchdog
 #       reaps every child (incl. the exporter node child — the M5 orphan gap).
 #
@@ -366,6 +370,51 @@ if echo "$EXPORTER_NODE_CMD" | grep -qF "Resources/penpot-runtime/bin/node"; the
     pass "(f4) exporter child runs on the BUNDLED node inside the .app"
 else
     fail "(f4) exporter child not on the bundled node: $EXPORTER_NODE_CMD"
+fi
+
+# (g) PACKAGED SEARCH: the N1 offline vault index must ship in the artifact -------------
+# N3's board grid + the /__search surface both consume /__api/vault/search; that
+# route only exists if the bundled vault-index service booted, watched the
+# packaged designs dir, and indexed the seeded boards — all offline (proxies
+# poisoned). Prove a seeded board name ("Cover") is searchable through the
+# installed .app. Depends on the (f1) RPC seed + the sync daemon mirroring the
+# boards to <data>/designs, which the exports checks above already confirmed.
+ALPHA_FILE_ID="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['files']['alpha']['fileId'])" "$WORK/expect.json" 2>/dev/null || true)"
+SEARCH_RESP=""
+SEARCH_OK=0
+G_DEADLINE=$(($(date +%s) + 120))
+while [ "$(date +%s)" -lt "$G_DEADLINE" ]; do
+    SEARCH_RESP="$(curl -sS "$BASE/__api/vault/search?q=Cover&kind=board&limit=10" 2>/dev/null || true)"
+    if echo "$SEARCH_RESP" | python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+hits = d.get("hits", [])
+for h in hits:
+    if h.get("kind") == "board" and "Cover" in h.get("name", ""):
+        # deep link must be a same-origin workspace navigation
+        if not str(h.get("deepLink", "")).startswith("/#/workspace"):
+            continue
+        # if we know alpha, insist the hit belongs to it
+        if want and h.get("fileId") != want:
+            continue
+        sys.exit(0)
+sys.exit(1)
+' "$ALPHA_FILE_ID" 2>/dev/null; then
+        SEARCH_OK=1
+        break
+    fi
+    sleep 3
+done
+SEARCH_COUNT="$(echo "$SEARCH_RESP" | json_field count 2>/dev/null || echo '?')"
+if [ "$SEARCH_OK" -eq 1 ]; then
+    pass "(g1) /__api/vault/search served OFFLINE through the .app: seeded 'Cover' board hit (kind=board, alpha fileId, /#/workspace deep link; count=$SEARCH_COUNT)"
+else
+    fail "(g1) /__api/vault/search returned no seeded 'Cover' board hit within 120s (packaged N1 index surface)"
+    echo "last search response: $SEARCH_RESP" >&2
 fi
 
 # (e) SIGTERM: clean exit, no orphans ---------------------------------------------------

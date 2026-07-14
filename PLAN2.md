@@ -151,7 +151,7 @@ run a hash-gated no-op; degraded mode exercised in the same script; kill -9 duri
 render batch → restart adopts nothing stale and shutdown stays <20s (regression tests for
 both m5 bugs); `docs/milestones/n2.md` records the final dmg-size delta and per-board latency.
 
-### N3 — Lighttable home + activity strip (the app opens on the vault; needs N1+N2)
+### N3 — Lighttable home + activity strip (the app opens on the vault; needs N1+N2) — ✅ DONE 2026-07-14 (`/__home` is the post-boot landing view; `/__api/vault/boards` grid over the 100×10 fixture with exact `/#/workspace` deep links, project filter + recency/name sort, escape hatch; degraded + real thumbnails; activity/conflict strip fed by the daemon (mock in CI) with a working reveal-both-versions action; `scripts/routes-gate.sh` (bundled chromium + playwright, offline) + `scripts/n3-home.sh` all-green; grid-load 49.8 ms/1000 boards, edit→card 5.6 s; serialized gate ladder re-run one-stack-at-a-time all green — routes-gate → n3-home → m1 → m2 → m3 → m5 → n1 → n2 → fresh dmg → m4-artifact-test (renders ON + packaged `/__api/vault/search` offline hit) → `just e2e`)
 Goal: `/__home` becomes the landing view: board grid with N2 thumbnails, project filter,
 recency sort, escape hatch, live activity/conflict strip. Largest of the ladder; if it
 overruns a day, the pre-drawn split is N3a grid+deep-links / N3b strip+conflict-surface.

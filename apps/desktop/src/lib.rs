@@ -8,6 +8,7 @@
 
 pub mod dialog;
 pub mod gitinit;
+pub mod home;
 pub mod layout;
 pub mod preflight;
 pub mod reveal;
@@ -482,9 +483,12 @@ async fn bootstrap_login(State(state): State<Arc<BootstrapState>>) -> Response {
                 "auth-token={}; Path=/; HttpOnly; SameSite=Lax",
                 outcome.auth_token
             );
+            // N3: land on the lighttable home (our page), not the SPA. The
+            // auth cookie is set here, so card clicks deep-link straight into
+            // `/#/workspace?…` with the session already established.
             (
                 StatusCode::FOUND,
-                [(header::SET_COOKIE, cookie), (header::LOCATION, "/".to_string())],
+                [(header::SET_COOKIE, cookie), (header::LOCATION, "/__home".to_string())],
             )
                 .into_response()
         }
@@ -698,9 +702,20 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         config.data_dir.join("vault-index").join("index.sqlite3"),
     ));
     let team_id = profile.default_team_id.clone().unwrap_or_default();
-    let vault_routes = vault_index::router(&vault_index, team_id);
+    let vault_routes = vault_index::router(&vault_index, team_id.clone(), &config.designs_dir);
 
-    let extra = extra_router(bootstrap_state, config_js).merge(vault_routes);
+    // --- lighttable home + activity/conflict strip (N3) -------------------
+    // The strip serves a status source late-bound below: the real sync daemon
+    // (production) or the MockStatusSource (PENPOT_LOCAL_TRAY_DEMO=1 — so the
+    // strip is drivable windowless in CI). The channel exists now; its feeder
+    // task is spawned after the daemon so the router can be built here.
+    let (strip_tx, strip_rx) =
+        tokio::sync::watch::channel(sync_daemon::SyncStatusSnapshot::default());
+    let home_routes = home::router(config.designs_dir.clone(), strip_rx);
+
+    let extra = extra_router(bootstrap_state, config_js)
+        .merge(vault_routes)
+        .merge(home_routes);
 
     let mut proxy_config = proxy::ProxyConfig::new(
         config.runtime_dir.join("frontend"),
@@ -747,6 +762,44 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
             None
         }
     };
+
+    // --- activity/conflict strip feeder (N3) ------------------------------
+    // Bind the strip's status source: the MockStatusSource demo loop when
+    // PENPOT_LOCAL_TRAY_DEMO=1 (drivable windowless in CI — it exercises the
+    // Conflict/Error states and the reveal action deterministically), else
+    // the real sync daemon's live snapshots.
+    if env_flag("PENPOT_LOCAL_TRAY_DEMO") {
+        tracing::info!("N3 strip: serving MockStatusSource demo frames (PENPOT_LOCAL_TRAY_DEMO)");
+        tokio::spawn(async move {
+            let frames = status::MockStatusSource::demo_frames();
+            let mut i = 0usize;
+            loop {
+                let frame = frames[i % frames.len()].clone();
+                i += 1;
+                if strip_tx.send(frame).is_err() {
+                    break; // strip receiver gone (proxy stopped)
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    } else if let Some(daemon) = &sync_daemon {
+        let mut rx = daemon.status();
+        tokio::spawn(async move {
+            loop {
+                let snapshot = rx.borrow_and_update().clone();
+                if strip_tx.send(snapshot).is_err() {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break; // daemon gone
+                }
+            }
+        });
+    } else {
+        // No daemon and not in demo mode: leave the strip on its default
+        // (empty) snapshot. Dropping strip_tx here would be fine too.
+        drop(strip_tx);
+    }
 
     // --- board-export service (M5: per-board SVG/PNG next to sources) -----
     // Self-contained consumer of the sync manifest (read-only) — it never

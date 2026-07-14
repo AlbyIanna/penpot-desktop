@@ -48,6 +48,20 @@ n1:
 n2:
     bash scripts/n2-thumbs.sh
 
+# N3 lighttable home: /__home board grid over the 100x10 torture fixture with
+# exact /#/workspace deep links, project filter + recency/name sort, degraded
+# + planted thumbnails, live headless-browser routes-gate, edit→card+strip
+# update, and the mock-driven conflict strip + reveal action.
+n3:
+    bash scripts/n3-home.sh
+
+# SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
+# of the compiled bundle + a live headless-browser navigation assert. Boots its
+# own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
+# (with roundtrip.py) first after any Penpot version bump.
+routes-gate:
+    bash scripts/routes-gate.sh
+
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
 # so never run them in parallel. Chains every landed n-gate (N1, N2).
@@ -61,6 +75,7 @@ e2e:
     bash scripts/m5-features.sh
     bash scripts/n1-index.sh
     bash scripts/n2-thumbs.sh
+    bash scripts/n3-home.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

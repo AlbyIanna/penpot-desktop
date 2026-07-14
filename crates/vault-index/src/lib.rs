@@ -26,13 +26,18 @@
 //! *read* (manifest + one small SELECT); nothing is written unless a hash
 //! moved, an entry vanished, or a path was re-keyed.
 
+pub mod boards;
 pub mod db;
 pub mod extract;
 pub mod query;
 
 mod http;
 
-pub use db::{Hit, IndexDb, SearchError, SearchHandle, SCHEMA_VERSION};
+pub use boards::{
+    assemble_cards, exports_rel_path, load_stem_map, resolve_thumb_path, thumb_url, BoardCard,
+    BoardListing, FileMeta, Sort,
+};
+pub use db::{BoardRow, Hit, IndexDb, SearchError, SearchHandle, SCHEMA_VERSION};
 pub use extract::{extract_docs, DocKind, DocRow, ROOT_FRAME_ID};
 pub use http::router;
 pub use query::{build_match_query, workspace_deep_link};

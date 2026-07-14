@@ -1,0 +1,342 @@
+<!--
+  N3 lighttable home — the vault's front door. Plain HTML + vanilla JS, no
+  framework, served same-origin at /__home (auth cookie already set by
+  /__bootstrap). Card clicks deep-link into the SPA at /#/workspace?…; the
+  escape hatch drops to the upstream dashboard at /#/dashboard/recent.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Penpot Local — Vault</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e3e6ea; --text: #14181d;
+    --muted: #6b7580; --accent: #4b5fd6; --accent-text: #ffffff;
+    --placeholder: #eef0f3; --shadow: 0 1px 3px rgba(20,24,29,.08);
+    --synced: #2f9e57; --pending: #b7791f; --active: #4b5fd6; --conflict: #d1453b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14181d; --panel: #1c2127; --border: #2b3138; --text: #e7ebef;
+      --muted: #9aa4af; --accent: #6b7ff0; --accent-text: #0d1013;
+      --placeholder: #232830; --shadow: 0 1px 3px rgba(0,0,0,.4);
+      --synced: #47c072; --pending: #e0a13c; --active: #7d8ff5; --conflict: #ef6a60;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif; color: var(--text);
+    background: var(--bg);
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; display: flex; align-items: center;
+    gap: 14px; padding: 12px 18px; background: var(--panel);
+    border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .controls { display: flex; align-items: center; gap: 10px; margin-left: auto; flex-wrap: wrap; }
+  label.ctl { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  select, input[type=search] {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px;
+  }
+  a.escape {
+    text-decoration: none; color: var(--accent); border: 1px solid var(--border);
+    padding: 5px 11px; border-radius: 7px; background: var(--bg); white-space: nowrap;
+  }
+  a.escape:hover { border-color: var(--accent); }
+
+  main { padding: 18px; }
+  #grid {
+    display: grid; gap: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  }
+  a.board-card {
+    display: flex; flex-direction: column; text-decoration: none; color: inherit;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; box-shadow: var(--shadow); transition: border-color .12s, transform .12s;
+  }
+  a.board-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .thumb {
+    aspect-ratio: 4 / 3; background: var(--placeholder); position: relative;
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+  }
+  .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .thumb .placeholder {
+    color: var(--muted); font-size: 12px; text-align: center; padding: 8px;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+  }
+  .thumb .placeholder svg { opacity: .5; }
+  .meta { padding: 9px 11px 11px; display: flex; flex-direction: column; gap: 3px; }
+  .meta .bname { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta .bsub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+
+  /* activity / conflict strip */
+  #strip {
+    position: sticky; bottom: 0; z-index: 6; background: var(--panel);
+    border-top: 1px solid var(--border); padding: 8px 14px; font-size: 13px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-height: 40px;
+  }
+  #strip .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .st-synced { background: var(--synced); }
+  .st-pending { background: var(--pending); }
+  .st-importing, .st-exporting { background: var(--active); }
+  .st-conflict, .st-error { background: var(--conflict); }
+  #strip .line { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  #strip .line b { color: var(--text); font-weight: 600; }
+  #strip .conflict-line {
+    color: var(--conflict); background: color-mix(in srgb, var(--conflict) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--conflict) 40%, transparent);
+    padding: 3px 8px; border-radius: 7px; display: inline-flex; align-items: center; gap: 8px;
+  }
+  #strip .reveal {
+    font: inherit; cursor: pointer; border: 1px solid var(--conflict); color: var(--conflict);
+    background: transparent; border-radius: 6px; padding: 2px 8px;
+  }
+  #strip .reveal:hover { background: color-mix(in srgb, var(--conflict) 18%, transparent); }
+  #strip .paused { color: var(--pending); font-weight: 600; }
+  #strip .spacer { margin-left: auto; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Vault</h1>
+    <span class="count" id="count">…</span>
+    <div class="controls">
+      <label class="ctl">Project
+        <select id="project"><option value="">All</option></select>
+      </label>
+      <label class="ctl">Sort
+        <select id="sort">
+          <option value="recency">Recency</option>
+          <option value="name">Name</option>
+        </select>
+      </label>
+      <input type="search" id="filter" placeholder="Filter by name…" />
+      <a class="escape" id="escape-hatch" href="/#/dashboard/recent">Open dashboard ↗</a>
+    </div>
+  </header>
+
+  <main>
+    <div id="grid"></div>
+    <div class="empty" id="empty" hidden>No boards in this vault yet. Create one from the dashboard, then it appears here.</div>
+  </main>
+
+  <div id="strip"><span class="line">Loading activity…</span></div>
+
+<script>
+(function () {
+  "use strict";
+  var grid = document.getElementById("grid");
+  var emptyEl = document.getElementById("empty");
+  var countEl = document.getElementById("count");
+  var projectSel = document.getElementById("project");
+  var sortSel = document.getElementById("sort");
+  var filterInput = document.getElementById("filter");
+  var stripEl = document.getElementById("strip");
+  var allBoards = [];
+
+  function placeholderSvg() {
+    return '<span class="placeholder">' +
+      '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">' +
+      '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 15l5-4 4 3 5-5 4 4"/>' +
+      '<circle cx="8.5" cy="8.5" r="1.5"/></svg><span>No preview yet</span></span>';
+  }
+
+  function cardEl(b) {
+    var a = document.createElement("a");
+    a.className = "board-card";
+    a.href = b.deepLink;
+    a.setAttribute("data-deeplink", b.deepLink);
+    a.setAttribute("data-board-id", b.boardId);
+    a.setAttribute("data-project", b.project);
+    a.setAttribute("data-name", b.name);
+
+    var thumb = document.createElement("div");
+    thumb.className = "thumb";
+    if (b.thumb) {
+      var img = document.createElement("img");
+      img.loading = "lazy";
+      img.alt = b.name;
+      img.src = b.thumb;
+      img.onerror = function () { thumb.innerHTML = placeholderSvg(); };
+      thumb.appendChild(img);
+    } else {
+      thumb.innerHTML = placeholderSvg();
+    }
+
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    var bn = document.createElement("div");
+    bn.className = "bname";
+    bn.textContent = b.name || "(unnamed board)";
+    var bs = document.createElement("div");
+    bs.className = "bsub";
+    bs.textContent = b.project;
+    meta.appendChild(bn);
+    meta.appendChild(bs);
+
+    a.appendChild(thumb);
+    a.appendChild(meta);
+    return a;
+  }
+
+  function render() {
+    var needle = filterInput.value.trim().toLowerCase();
+    var shown = allBoards.filter(function (b) {
+      return !needle || (b.name && b.name.toLowerCase().indexOf(needle) !== -1);
+    });
+    grid.innerHTML = "";
+    shown.forEach(function (b) { grid.appendChild(cardEl(b)); });
+    countEl.textContent = shown.length + (shown.length === 1 ? " board" : " boards");
+    emptyEl.hidden = shown.length !== 0;
+  }
+
+  function loadBoards() {
+    var params = new URLSearchParams();
+    if (projectSel.value) params.set("project", projectSel.value);
+    params.set("sort", sortSel.value);
+    fetch("/__api/vault/boards?" + params.toString())
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        allBoards = data.boards || [];
+        // Rebuild the project filter preserving the current selection.
+        var cur = projectSel.value;
+        projectSel.innerHTML = '<option value="">All projects</option>';
+        (data.projects || []).forEach(function (p) {
+          var o = document.createElement("option");
+          o.value = p; o.textContent = p;
+          if (p === cur) o.selected = true;
+          projectSel.appendChild(o);
+        });
+        render();
+      })
+      .catch(function (e) {
+        countEl.textContent = "index warming up…";
+        setTimeout(loadBoards, 1500);
+      });
+  }
+
+  // ---- activity / conflict strip -----------------------------------------
+  function agoText(iso) {
+    if (!iso) return "";
+    var t = Date.parse(iso);
+    if (isNaN(t)) return "";
+    var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.round(s / 60) + "m ago";
+    return Math.round(s / 3600) + "h ago";
+  }
+
+  function revealBtn(label, path) {
+    var b = document.createElement("button");
+    b.className = "reveal";
+    b.type = "button";
+    b.textContent = label;
+    b.setAttribute("data-reveal-path", path);
+    b.onclick = function () {
+      fetch("/__api/vault/reveal?path=" + encodeURIComponent(path));
+    };
+    return b;
+  }
+
+  function renderStrip(m) {
+    stripEl.innerHTML = "";
+    // Conflicts FIRST-CLASS, rendered before everything else.
+    var conflicts = (m.rows || []).filter(function (r) { return r.isConflict; });
+    conflicts.forEach(function (r) {
+      var box = document.createElement("span");
+      box.className = "conflict-line";
+      box.setAttribute("data-conflict-for", r.relPath);
+      var txt = document.createElement("span");
+      txt.innerHTML = "⚠ Conflict: <b>" + escapeHtml(r.name) + "</b> — both versions preserved";
+      box.appendChild(txt);
+      box.appendChild(revealBtn("Reveal my version", r.relPath));
+      if (r.conflictCopyPath) box.appendChild(revealBtn("Reveal saved copy", r.conflictCopyPath));
+      stripEl.appendChild(box);
+    });
+
+    // A compact activity summary for the rest.
+    var active = (m.rows || []).filter(function (r) {
+      return r.state === "importing" || r.state === "exporting" || r.state === "pending";
+    });
+    var errors = (m.rows || []).filter(function (r) { return r.state === "error"; });
+
+    var line = document.createElement("span");
+    line.className = "line";
+    line.id = "strip-summary";
+    var dot = document.createElement("span");
+    var synced = (m.rows || []).filter(function (r) { return r.state === "synced"; }).length;
+    if (m.paused) {
+      dot.className = "dot st-pending";
+      line.appendChild(dot);
+      var p = document.createElement("span");
+      p.className = "paused";
+      p.textContent = "Sync paused";
+      line.appendChild(p);
+    } else if (active.length) {
+      dot.className = "dot st-importing";
+      line.appendChild(dot);
+      var a = active[0];
+      line.innerHTML += "<span><b>" + escapeHtml(a.name) + "</b> " + a.state + "…</span>";
+    } else {
+      dot.className = "dot st-synced";
+      line.appendChild(dot);
+      var when = agoText(m.lastSyncAt);
+      var msg = document.createElement("span");
+      msg.textContent = synced
+        ? ("All synced" + (when ? " · last activity " + when : ""))
+        : "Idle";
+      line.appendChild(msg);
+    }
+    stripEl.appendChild(line);
+
+    errors.forEach(function (r) {
+      var e = document.createElement("span");
+      e.className = "line";
+      e.innerHTML = '<span class="dot st-error"></span><span><b>' +
+        escapeHtml(r.name) + "</b> — " + escapeHtml(r.detail || "error") + "</span>";
+      stripEl.appendChild(e);
+    });
+
+    var spacer = document.createElement("span");
+    spacer.className = "spacer";
+    stripEl.appendChild(spacer);
+    var tag = document.createElement("span");
+    tag.className = "line";
+    tag.textContent = (m.conflicts ? (m.conflicts + " conflict" + (m.conflicts > 1 ? "s" : "") + " · ") : "") +
+      ((m.rows || []).length) + " tracked";
+    stripEl.appendChild(tag);
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function pollStrip() {
+    fetch("/__api/vault/strip")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(renderStrip)
+      .catch(function () { /* keep last render */ });
+  }
+
+  projectSel.addEventListener("change", loadBoards);
+  sortSel.addEventListener("change", loadBoards);
+  filterInput.addEventListener("input", render);
+
+  loadBoards();
+  pollStrip();
+  setInterval(pollStrip, 1200);
+  // Refresh the grid periodically so card thumbnails/recency reflect syncs.
+  setInterval(loadBoards, 5000);
+})();
+</script>
+</body>
+</html>
