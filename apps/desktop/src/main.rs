@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use penpot_desktop::overlay::{self, ProxyUrlSlot};
 use penpot_desktop::{boot, AppConfig, RunningApp};
 use tauri::{Manager, RunEvent};
 use tokio::sync::Mutex;
@@ -26,6 +27,26 @@ fn main() {
     let running: SharedApp = Arc::new(Mutex::new(None));
     let running_setup = running.clone();
 
+    // N4: the palette overlay's proxy origin, filled once boot completes.
+    // Shared by the global shortcut handler and the tray "Quick open…" entry.
+    let proxy_slot: ProxyUrlSlot = Arc::new(std::sync::Mutex::new(None));
+    let proxy_slot_setup = proxy_slot.clone();
+    let proxy_slot_boot = proxy_slot.clone();
+    let proxy_slot_shortcut = proxy_slot.clone();
+
+    // N4: the global shortcut (default Cmd/Ctrl+K, configurable via
+    // PENPOT_LOCAL_PALETTE_SHORTCUT) toggling the palette overlay window.
+    let palette_shortcut = overlay::configured_shortcut();
+    let global_shortcut_plugin = tauri_plugin_global_shortcut::Builder::new()
+        .with_shortcut(palette_shortcut)
+        .expect("valid palette shortcut")
+        .with_handler(move |app, _shortcut, event| {
+            if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                overlay::toggle_palette(app, &proxy_slot_shortcut);
+            }
+        })
+        .build();
+
     let app = tauri::Builder::default()
         // M5: single-instance guard — MUST be the first plugin registered so
         // it runs before anything else. A second launch never boots its own
@@ -40,6 +61,7 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(global_shortcut_plugin)
         .setup(move |app| {
             let handle = app.handle().clone();
             let running = running_setup.clone();
@@ -82,6 +104,7 @@ fn main() {
                     mock.control(),
                     designs_dir,
                     None,
+                    proxy_slot_setup.clone(),
                 );
                 tauri::async_runtime::spawn(async move {
                     mock.play_demo(std::time::Duration::from_secs(4)).await;
@@ -94,6 +117,7 @@ fn main() {
                     bridge.control(),
                     designs_dir,
                     exports_rx,
+                    proxy_slot_setup.clone(),
                 )
             };
             if let Err(e) = tray_result {
@@ -108,6 +132,11 @@ fn main() {
                 };
                 match booted {
                     Ok(running_app) => {
+                        // N4: publish the proxy origin so the palette overlay
+                        // (global shortcut + tray) can reach /__palette.
+                        if let Ok(mut slot) = proxy_slot_boot.lock() {
+                            *slot = Some(running_app.proxy_url.clone());
+                        }
                         let url: tauri::Url = running_app
                             .bootstrap_url()
                             .parse()

@@ -6,10 +6,12 @@
 //! backend JVM) → first-boot single-user provisioning over RPC → start the
 //! local proxy with the `/__bootstrap` auto-login route → expose readiness.
 
+pub mod checkpoint;
 pub mod dialog;
 pub mod gitinit;
 pub mod home;
 pub mod layout;
+pub mod overlay;
 pub mod preflight;
 pub mod reveal;
 pub mod status;
@@ -713,9 +715,13 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         tokio::sync::watch::channel(sync_daemon::SyncStatusSnapshot::default());
     let home_routes = home::router(config.designs_dir.clone(), strip_rx);
 
+    // --- N4b "Checkpoint now" (manual, git-native vault checkpoint) --------
+    let checkpoint_routes = checkpoint::router(config.designs_dir.clone());
+
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
-        .merge(home_routes);
+        .merge(home_routes)
+        .merge(checkpoint_routes);
 
     let mut proxy_config = proxy::ProxyConfig::new(
         config.runtime_dir.join("frontend"),

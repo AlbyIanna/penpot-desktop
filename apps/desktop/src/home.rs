@@ -36,6 +36,7 @@ use tokio::sync::watch;
 use sync_daemon::{FileState, SyncStatusSnapshot};
 
 const HOME_PAGE_HTML: &str = include_str!("home.html");
+const PALETTE_PAGE_HTML: &str = include_str!("palette.html");
 
 struct HomeState {
     vault_root: PathBuf,
@@ -48,6 +49,7 @@ pub fn router(vault_root: impl Into<PathBuf>, strip_rx: watch::Receiver<SyncStat
     let state = Arc::new(HomeState { vault_root: vault_root.into(), strip_rx });
     Router::new()
         .route("/__home", get(home_page))
+        .route("/__palette", get(palette_page))
         .route("/__api/vault/thumb", get(thumb))
         .route("/__api/vault/strip", get(strip))
         .route("/__api/vault/reveal", get(reveal_action))
@@ -56,6 +58,11 @@ pub fn router(vault_root: impl Into<PathBuf>, strip_rx: watch::Receiver<SyncStat
 
 async fn home_page() -> Html<&'static str> {
     Html(HOME_PAGE_HTML)
+}
+
+/// The N4 quick-open palette page (shown in the overlay window / tray).
+async fn palette_page() -> Html<&'static str> {
+    Html(PALETTE_PAGE_HTML)
 }
 
 // ---------------------------------------------------------------------------

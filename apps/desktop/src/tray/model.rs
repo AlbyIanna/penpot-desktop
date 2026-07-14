@@ -15,6 +15,11 @@ pub const QUIT_ID: &str = "sync-quit";
 pub const OPEN_DESIGNS_ID: &str = "open-designs-folder";
 /// Menu item id of "Enable git versioning" (M5 git helper).
 pub const GIT_INIT_ID: &str = "designs-git-init";
+/// Menu item id of "Quick open…" (N4 palette — reachable from the tray so the
+/// palette is usable/testable without the global shortcut, PLAN2.md risk 7).
+pub const QUICK_OPEN_ID: &str = "quick-open-palette";
+/// Menu item id of "Checkpoint now" (N4b manual git checkpoint verb).
+pub const CHECKPOINT_ID: &str = "vault-checkpoint-now";
 /// Per-file rows have id `sync-file:<relative path>`; the wiring layer strips
 /// this prefix to get the path to reveal.
 pub const FILE_ROW_PREFIX: &str = "sync-file:";
@@ -47,6 +52,10 @@ pub enum MenuEntry {
     OpenDesigns { label: String },
     /// "Enable git versioning" (enabled). Always has id [`GIT_INIT_ID`].
     GitInit { label: String },
+    /// "Quick open…" — opens the N4 palette overlay. Id [`QUICK_OPEN_ID`].
+    QuickOpen { label: String },
+    /// "Checkpoint now" — the N4b manual git checkpoint. Id [`CHECKPOINT_ID`].
+    Checkpoint { label: String },
     /// The pause/resume toggle (enabled). Always has id [`PAUSE_TOGGLE_ID`].
     PauseToggle { label: String },
     Separator,
@@ -242,6 +251,12 @@ pub fn build_menu_model(
 
     if designs_available {
         entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::QuickOpen {
+            label: "Quick open…".to_string(),
+        });
+        entries.push(MenuEntry::Checkpoint {
+            label: "Checkpoint now".to_string(),
+        });
         entries.push(MenuEntry::OpenDesigns {
             label: "Open Designs Folder".to_string(),
         });

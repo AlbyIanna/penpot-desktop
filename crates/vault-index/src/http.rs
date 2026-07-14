@@ -19,7 +19,7 @@ use tokio::sync::watch;
 
 use crate::boards::{self, FileMeta, Sort};
 use crate::db::{SearchError, SearchHandle};
-use crate::{query, IndexStatusSnapshot, VaultIndexHandle};
+use crate::{palette, query, IndexStatusSnapshot, VaultIndexHandle};
 
 const SEARCH_PAGE_HTML: &str = include_str!("search_page.html");
 
@@ -53,9 +53,88 @@ pub fn router(
     Router::new()
         .route("/__api/vault/search", get(search))
         .route("/__api/vault/boards", get(list_boards))
+        .route("/__api/vault/palette", get(list_palette))
         .route("/__api/vault/status", get(status))
         .route("/__search", get(search_page))
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct PaletteParams {
+    #[serde(default)]
+    q: String,
+    limit: Option<usize>,
+}
+
+/// `GET /__api/vault/palette?q=&limit=` — the N4 quick-open ranking. Assembles
+/// the palette corpus (projects/files/boards) from the index rows + manifest,
+/// fuzzy-ranks it against `q`, and returns hits best-first each carrying its
+/// exact deep link (the Enter payload). An empty `q` returns the corpus in its
+/// natural order (boards/files/projects), capped at `limit`.
+async fn list_palette(
+    State(state): State<Arc<RouterState>>,
+    Query(params): Query<PaletteParams>,
+) -> Response {
+    let search = state.search.clone();
+    let vault_root = state.vault_root.clone();
+    let team_id = state.team_id.clone();
+    let q = params.q.clone();
+    let limit = params.limit.unwrap_or(30).min(MAX_LIMIT);
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || -> Result<_, SearchError> {
+        let rows = search.all_boards()?;
+        let manifest = sync_core::Manifest::load(&vault_root)
+            .map_err(|e| SearchError::Other(anyhow::anyhow!("{e}")))?
+            .unwrap_or_default();
+        let meta: std::collections::BTreeMap<String, FileMeta> = manifest
+            .files
+            .iter()
+            .map(|(id, e)| {
+                (
+                    id.clone(),
+                    FileMeta {
+                        project: e.project_name.clone(),
+                        rel_path: e.path.clone(),
+                        last_synced_at: e.last_synced_at.clone(),
+                    },
+                )
+            })
+            .collect();
+        let items = palette::assemble_items(&rows, &meta, &team_id);
+        Ok(palette::rank(&items, &q, limit))
+    })
+    .await;
+    let took_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok(Ok(hits)) => Json(json!({
+            "query": params.q,
+            "tookMs": took_ms,
+            "count": hits.len(),
+            "hits": hits,
+        }))
+        .into_response(),
+        Ok(Err(SearchError::NotReady)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "index not ready yet"})),
+        )
+            .into_response(),
+        Ok(Err(SearchError::Other(e))) => {
+            tracing::error!(error = format!("{e:#}"), "vault palette listing failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "palette listing failed"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "vault palette task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "palette listing failed"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

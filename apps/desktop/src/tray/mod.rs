@@ -22,10 +22,12 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Runtime};
 use tokio::sync::watch;
 
+use crate::overlay::{self, ProxyUrlSlot};
 use crate::status::{ExportStatusSnapshot, SyncControl, SyncStatusSnapshot};
 use model::{
-    build_menu_model, icon_pixels, AggregateState, MenuEntry, MenuModel, FILE_ROW_PREFIX,
-    GIT_INIT_ID, ICON_SIZE, OPEN_DESIGNS_ID, PAUSE_TOGGLE_ID, QUIT_ID,
+    build_menu_model, icon_pixels, AggregateState, MenuEntry, MenuModel, CHECKPOINT_ID,
+    FILE_ROW_PREFIX, GIT_INIT_ID, ICON_SIZE, OPEN_DESIGNS_ID, PAUSE_TOGGLE_ID, QUICK_OPEN_ID,
+    QUIT_ID,
 };
 
 const TRAY_ID: &str = "penpot-sync-status";
@@ -65,6 +67,12 @@ fn build_tauri_menu<R: Runtime>(
             }
             MenuEntry::GitInit { label } => {
                 menu.append(&MenuItem::with_id(app, GIT_INIT_ID, label, true, None::<&str>)?)?;
+            }
+            MenuEntry::QuickOpen { label } => {
+                menu.append(&MenuItem::with_id(app, QUICK_OPEN_ID, label, true, None::<&str>)?)?;
+            }
+            MenuEntry::Checkpoint { label } => {
+                menu.append(&MenuItem::with_id(app, CHECKPOINT_ID, label, true, None::<&str>)?)?;
             }
             MenuEntry::PauseToggle { label } => {
                 menu.append(&MenuItem::with_id(
@@ -110,6 +118,7 @@ pub fn spawn_tray<R: Runtime>(
     control: Arc<dyn SyncControl>,
     designs_dir: Option<PathBuf>,
     exports_rx: Option<watch::Receiver<ExportStatusSnapshot>>,
+    proxy_slot: ProxyUrlSlot,
 ) -> tauri::Result<()> {
     let designs_available = designs_dir.is_some();
     let exports_snapshot = exports_rx.as_ref().map(|r| r.borrow().clone());
@@ -122,6 +131,8 @@ pub fn spawn_tray<R: Runtime>(
     let menu = build_tauri_menu(app, &initial)?;
 
     let rx_for_events = rx.clone();
+    let proxy_slot_for_events = proxy_slot.clone();
+    let designs_for_checkpoint = designs_dir.clone();
     let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon(initial.aggregate))
         .icon_as_template(true)
@@ -147,6 +158,34 @@ pub fn spawn_tray<R: Runtime>(
                 if let Some(designs) = &designs_dir {
                     tracing::info!(dir = %designs.display(), "tray: open designs folder");
                     crate::reveal::open_folder(designs);
+                }
+            }
+            QUICK_OPEN_ID => {
+                tracing::info!("tray: quick open (palette)");
+                overlay::toggle_palette(app, &proxy_slot_for_events);
+            }
+            CHECKPOINT_ID => {
+                if let Some(designs) = designs_for_checkpoint.clone() {
+                    tracing::info!(dir = %designs.display(), "tray: checkpoint now");
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let label = crate::checkpoint::default_label();
+                        match crate::checkpoint::checkpoint(&designs, &label) {
+                            Ok(out) => {
+                                tracing::info!("checkpoint: {}", out.message);
+                                crate::dialog::native_info_dialog(
+                                    "Penpot Local — Checkpoint",
+                                    &out.message,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!("checkpoint failed: {e:#}");
+                                crate::dialog::native_error_dialog(
+                                    "Penpot Local — Checkpoint failed",
+                                    &format!("{e:#}"),
+                                );
+                            }
+                        }
+                    });
                 }
             }
             GIT_INIT_ID => {

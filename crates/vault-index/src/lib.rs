@@ -29,6 +29,7 @@
 pub mod boards;
 pub mod db;
 pub mod extract;
+pub mod palette;
 pub mod query;
 
 mod http;
@@ -39,6 +40,7 @@ pub use boards::{
 };
 pub use db::{BoardRow, Hit, IndexDb, SearchError, SearchHandle, SCHEMA_VERSION};
 pub use extract::{extract_docs, DocKind, DocRow, ROOT_FRAME_ID};
+pub use palette::{assemble_items as assemble_palette_items, rank as rank_palette, PaletteHit, PaletteItem, PaletteKind};
 pub use http::router;
 pub use query::{build_match_query, workspace_deep_link};
 

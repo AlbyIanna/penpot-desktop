@@ -55,6 +55,15 @@ n2:
 n3:
     bash scripts/n3-home.sh
 
+# N4 quick-open palette + Peek + Checkpoint now: fuzzy ranking over
+# /__api/vault/palette (target board first, Enter = exact deep link), a
+# headless-browser palette-Enter nav + grid-scroll/focus-preservation assert
+# (the N3-debt diff/patch fix), Peek preview from .exports (200 + content
+# hash), reveal, and the Checkpoint-now git decision table (fresh→1 commit,
+# no-op, +1 no-rewrite, dirty→loud refusal). Renders stay OFF (planted render).
+n4:
+    bash scripts/n4-palette.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -76,6 +85,7 @@ e2e:
     bash scripts/n1-index.sh
     bash scripts/n2-thumbs.sh
     bash scripts/n3-home.sh
+    bash scripts/n4-palette.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

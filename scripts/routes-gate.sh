@@ -87,7 +87,8 @@ fi
 # --- (STATIC) route strings present in the compiled bundle -----------------
 # Each fragment must appear in at least one non-.map .js file.
 STATIC_OK=1
-for frag in "workspace" "dashboard/recent" "team-id" "file-id" "page-id"; do
+# N3 shapes (workspace/dashboard) + N4 viewer shape (view/frame-id/section).
+for frag in "workspace" "dashboard/recent" "view" "team-id" "file-id" "page-id" "frame-id" "section"; do
     if grep -rlq --include='*.js' -- "$frag" "$FRONTEND_JS" 2>/dev/null; then
         :
     else
@@ -95,7 +96,7 @@ for frag in "workspace" "dashboard/recent" "team-id" "file-id" "page-id"; do
         STATIC_OK=0
     fi
 done
-[ "$STATIC_OK" = "1" ] && pass "(static) all 5 hash-route strings present in runtime/frontend/js/*.js"
+[ "$STATIC_OK" = "1" ] && pass "(static) all 8 hash-route strings present in runtime/frontend/js/*.js (incl. N4 viewer view/frame-id/section)"
 
 # --- resolve/boot the live stack -------------------------------------------
 BASE="${ROUTES_GATE_BASE:-}"
@@ -148,6 +149,7 @@ NAV_RC=$?
 if [ "$NAV_RC" = "0" ] && echo "$NAV_OUT" | grep -q '"ok":true'; then
     pass "(live) card-click landed on the exact /#/workspace deep link"
     pass "(live) escape hatch landed on /#/dashboard/recent"
+    pass "(live) viewer link (Peek Present) landed on /#/view?file-id&page-id&frame-id&section"
     echo "   nav: $NAV_OUT"
 else
     fail "(live) navigation asserts failed (rc=$NAV_RC): $NAV_OUT"

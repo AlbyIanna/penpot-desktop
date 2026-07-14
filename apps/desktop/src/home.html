@@ -3,6 +3,13 @@
   framework, served same-origin at /__home (auth cookie already set by
   /__bootstrap). Card clicks deep-link into the SPA at /#/workspace?…; the
   escape hatch drops to the upstream dashboard at /#/dashboard/recent.
+
+  N4 (grid fix + Peek): the board grid refreshes by keyed DIFF/PATCH — never
+  `innerHTML=""` on the interval or on filter — so scroll position AND the
+  focused/selected card survive a refresh. This is the substrate Peek needs:
+  arrow keys move a persistent focus between cards; Space opens a full-size
+  preview served from the board's .exports; arrows flip through siblings; Esc
+  closes; "Present" opens the upstream viewer (/#/view?…).
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -44,6 +51,11 @@
     font: inherit; color: var(--text); background: var(--bg);
     border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px;
   }
+  button.bar {
+    font: inherit; color: var(--accent); border: 1px solid var(--border);
+    padding: 5px 11px; border-radius: 7px; background: var(--bg); white-space: nowrap; cursor: pointer;
+  }
+  button.bar:hover { border-color: var(--accent); }
   a.escape {
     text-decoration: none; color: var(--accent); border: 1px solid var(--border);
     padding: 5px 11px; border-radius: 7px; background: var(--bg); white-space: nowrap;
@@ -59,8 +71,12 @@
     display: flex; flex-direction: column; text-decoration: none; color: inherit;
     background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
     overflow: hidden; box-shadow: var(--shadow); transition: border-color .12s, transform .12s;
+    outline: none;
   }
   a.board-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  a.board-card:focus, a.board-card.focused {
+    border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent);
+  }
   .thumb {
     aspect-ratio: 4 / 3; background: var(--placeholder); position: relative;
     display: flex; align-items: center; justify-content: center; overflow: hidden;
@@ -75,6 +91,33 @@
   .meta .bname { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .meta .bsub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .empty { color: var(--muted); padding: 40px; text-align: center; }
+
+  /* Peek — full-size Quick-Look-style preview */
+  #peek {
+    position: fixed; inset: 0; z-index: 20; background: rgba(8,10,13,.82);
+    display: none; align-items: center; justify-content: center; flex-direction: column;
+    padding: 32px;
+  }
+  #peek.open { display: flex; }
+  #peek .frame {
+    max-width: min(92vw, 1400px); max-height: 80vh; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-width: 320px; min-height: 200px;
+  }
+  #peek .frame img { max-width: 92vw; max-height: 80vh; object-fit: contain; display: block; }
+  #peek .frame .placeholder { color: var(--muted); padding: 60px; text-align: center; }
+  #peek .peekbar {
+    margin-top: 14px; display: flex; align-items: center; gap: 14px; color: #e7ebef;
+    background: rgba(28,33,39,.9); border: 1px solid #2b3138; border-radius: 10px; padding: 8px 14px;
+  }
+  #peek .peekbar b { color: #fff; }
+  #peek .peekbar .sub { color: #9aa4af; font-size: 12px; }
+  #peek .peekbar button {
+    font: inherit; cursor: pointer; border: 1px solid #3a424c; color: #e7ebef;
+    background: transparent; border-radius: 7px; padding: 4px 10px;
+  }
+  #peek .peekbar button.present { border-color: var(--accent); color: #fff; }
+  #peek .hint { margin-top: 10px; color: #8a94a0; font-size: 12px; }
 
   /* activity / conflict strip */
   #strip {
@@ -99,6 +142,10 @@
     background: transparent; border-radius: 6px; padding: 2px 8px;
   }
   #strip .reveal:hover { background: color-mix(in srgb, var(--conflict) 18%, transparent); }
+  #strip .checkpoint {
+    font: inherit; cursor: pointer; border: 1px solid var(--synced); color: var(--synced);
+    background: transparent; border-radius: 6px; padding: 2px 8px;
+  }
   #strip .paused { color: var(--pending); font-weight: 600; }
   #strip .spacer { margin-left: auto; }
 </style>
@@ -118,6 +165,7 @@
         </select>
       </label>
       <input type="search" id="filter" placeholder="Filter by name…" />
+      <button class="bar" id="checkpoint-btn" title="One labeled git commit of the vault">Checkpoint now</button>
       <a class="escape" id="escape-hatch" href="/#/dashboard/recent">Open dashboard ↗</a>
     </div>
   </header>
@@ -126,6 +174,18 @@
     <div id="grid"></div>
     <div class="empty" id="empty" hidden>No boards in this vault yet. Create one from the dashboard, then it appears here.</div>
   </main>
+
+  <!-- Peek overlay (N4 pillar 5) -->
+  <div id="peek" aria-hidden="true">
+    <div class="frame" id="peek-frame"></div>
+    <div class="peekbar">
+      <span><b id="peek-name">—</b> <span class="sub" id="peek-sub"></span></span>
+      <button class="present" id="peek-present" type="button">Present ↗</button>
+      <button id="peek-open" type="button">Open in editor</button>
+      <button id="peek-close" type="button">Close</button>
+    </div>
+    <div class="hint">← → flip boards · Esc close · Enter open</div>
+  </div>
 
   <div id="strip"><span class="line">Loading activity…</span></div>
 
@@ -139,7 +199,15 @@
   var sortSel = document.getElementById("sort");
   var filterInput = document.getElementById("filter");
   var stripEl = document.getElementById("strip");
+  var checkpointBtn = document.getElementById("checkpoint-btn");
+
   var allBoards = [];
+  // Keyed card cache: boardId -> { el, data, imgSrc }. THE grid-fix substrate:
+  // cards are reused across refreshes (add/remove/update in place), never a
+  // full innerHTML rebuild, so scroll + focus survive.
+  var cardMap = new Map();
+  var shownBoards = [];       // the currently-visible boards, in order
+  var focusedId = null;       // boardId of the persistent focused card
 
   function placeholderSvg() {
     return '<span class="placeholder">' +
@@ -148,17 +216,7 @@
       '<circle cx="8.5" cy="8.5" r="1.5"/></svg><span>No preview yet</span></span>';
   }
 
-  function cardEl(b) {
-    var a = document.createElement("a");
-    a.className = "board-card";
-    a.href = b.deepLink;
-    a.setAttribute("data-deeplink", b.deepLink);
-    a.setAttribute("data-board-id", b.boardId);
-    a.setAttribute("data-project", b.project);
-    a.setAttribute("data-name", b.name);
-
-    var thumb = document.createElement("div");
-    thumb.className = "thumb";
+  function fillThumb(thumb, b) {
     if (b.thumb) {
       var img = document.createElement("img");
       img.loading = "lazy";
@@ -169,6 +227,21 @@
     } else {
       thumb.innerHTML = placeholderSvg();
     }
+  }
+
+  function cardEl(b) {
+    var a = document.createElement("a");
+    a.className = "board-card";
+    a.href = b.deepLink;
+    a.tabIndex = 0;
+    a.setAttribute("data-deeplink", b.deepLink);
+    a.setAttribute("data-board-id", b.boardId);
+    a.setAttribute("data-project", b.project);
+    a.setAttribute("data-name", b.name);
+
+    var thumb = document.createElement("div");
+    thumb.className = "thumb";
+    fillThumb(thumb, b);
 
     var meta = document.createElement("div");
     meta.className = "meta";
@@ -183,18 +256,90 @@
 
     a.appendChild(thumb);
     a.appendChild(meta);
+
+    a.addEventListener("focus", function () { focusedId = b.boardId; });
     return a;
   }
 
+  // Update a reused card's mutable bits in place (name, project, deep link,
+  // thumbnail) without recreating the node — preserves focus + scroll.
+  function patchCard(el, b, prev) {
+    if (!prev || prev.deepLink !== b.deepLink) {
+      el.href = b.deepLink;
+      el.setAttribute("data-deeplink", b.deepLink);
+    }
+    if (!prev || prev.name !== b.name) {
+      el.setAttribute("data-name", b.name);
+      el.querySelector(".bname").textContent = b.name || "(unnamed board)";
+    }
+    if (!prev || prev.project !== b.project) {
+      el.setAttribute("data-project", b.project);
+      el.querySelector(".bsub").textContent = b.project;
+    }
+    // Only rebuild the thumbnail if its URL actually changed (avoid flicker).
+    if (!prev || prev.thumb !== b.thumb) {
+      var thumb = el.querySelector(".thumb");
+      thumb.innerHTML = "";
+      fillThumb(thumb, b);
+    }
+    el.__data = b;
+  }
+
+  function dataChanged(a, b) {
+    return !a || a.name !== b.name || a.project !== b.project ||
+      a.deepLink !== b.deepLink || a.thumb !== b.thumb;
+  }
+
+  // Keyed diff/patch reconciliation. Never clears the grid; reuses nodes so
+  // scrollTop is untouched and the focused card keeps focus.
   function render() {
     var needle = filterInput.value.trim().toLowerCase();
-    var shown = allBoards.filter(function (b) {
+    shownBoards = allBoards.filter(function (b) {
       return !needle || (b.name && b.name.toLowerCase().indexOf(needle) !== -1);
     });
-    grid.innerHTML = "";
-    shown.forEach(function (b) { grid.appendChild(cardEl(b)); });
-    countEl.textContent = shown.length + (shown.length === 1 ? " board" : " boards");
-    emptyEl.hidden = shown.length !== 0;
+    var desired = new Set(shownBoards.map(function (b) { return b.boardId; }));
+
+    // Remember what had DOM focus so we can restore it after moves.
+    var active = document.activeElement;
+    var hadFocus = active && active.classList && active.classList.contains("board-card");
+
+    // 1. Remove cards no longer shown.
+    cardMap.forEach(function (entry, id) {
+      if (!desired.has(id)) {
+        entry.el.remove();
+        cardMap.delete(id);
+      }
+    });
+
+    // 2. Add / update / order in place.
+    var prevEl = null;
+    shownBoards.forEach(function (b) {
+      var entry = cardMap.get(b.boardId);
+      if (!entry) {
+        entry = { el: cardEl(b), data: b };
+        cardMap.set(b.boardId, entry);
+      } else if (dataChanged(entry.data, b)) {
+        patchCard(entry.el, b, entry.data);
+        entry.data = b;
+      }
+      // Ensure the node sits right after the previous one (stable order).
+      var ref = prevEl ? prevEl.nextSibling : grid.firstChild;
+      if (entry.el !== ref) {
+        grid.insertBefore(entry.el, ref);
+      }
+      prevEl = entry.el;
+    });
+
+    countEl.textContent = shownBoards.length + (shownBoards.length === 1 ? " board" : " boards");
+    emptyEl.hidden = shownBoards.length !== 0;
+
+    // Restore focus to the tracked card if it is still shown (moves via
+    // insertBefore can drop focus in some engines).
+    if (focusedId && !desired.has(focusedId)) { focusedId = null; }
+    if (hadFocus && focusedId) {
+      var keep = cardMap.get(focusedId);
+      if (keep && document.activeElement !== keep.el) { keep.el.focus({ preventScroll: true }); }
+    }
   }
 
   function loadBoards() {
@@ -205,7 +350,6 @@
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (data) {
         allBoards = data.boards || [];
-        // Rebuild the project filter preserving the current selection.
         var cur = projectSel.value;
         projectSel.innerHTML = '<option value="">All projects</option>';
         (data.projects || []).forEach(function (p) {
@@ -216,10 +360,110 @@
         });
         render();
       })
-      .catch(function (e) {
+      .catch(function () {
         countEl.textContent = "index warming up…";
         setTimeout(loadBoards, 1500);
       });
+  }
+
+  // ---- keyboard navigation + Peek ----------------------------------------
+  var peek = document.getElementById("peek");
+  var peekFrame = document.getElementById("peek-frame");
+  var peekName = document.getElementById("peek-name");
+  var peekSub = document.getElementById("peek-sub");
+  var peekPresent = document.getElementById("peek-present");
+  var peekOpen = document.getElementById("peek-open");
+  var peekIndex = -1;
+
+  function shownIndexOf(id) {
+    for (var i = 0; i < shownBoards.length; i++) {
+      if (shownBoards[i].boardId === id) return i;
+    }
+    return -1;
+  }
+
+  function focusIndex(i) {
+    if (i < 0 || i >= shownBoards.length) return;
+    var id = shownBoards[i].boardId;
+    var entry = cardMap.get(id);
+    if (entry) { focusedId = id; entry.el.focus({ preventScroll: false }); }
+  }
+
+  function presentLink(b) {
+    // Upstream viewer route (verified params): file-id, page-id, frame-id,
+    // section. frame-id is the board's object id.
+    return "/#/view?file-id=" + encodeURIComponent(b.fileId) +
+      "&page-id=" + encodeURIComponent(b.pageId) +
+      "&frame-id=" + encodeURIComponent(b.boardId) +
+      "&section=interactions";
+  }
+
+  function openPeek(i) {
+    if (i < 0 || i >= shownBoards.length) return;
+    peekIndex = i;
+    var b = shownBoards[i];
+    peekName.textContent = b.name || "(unnamed board)";
+    peekSub.textContent = b.project + (b.relPath ? " · " + b.relPath : "");
+    peekFrame.innerHTML = "";
+    if (b.thumb) {
+      var img = document.createElement("img");
+      img.alt = b.name;
+      img.src = b.thumb;              // full-size render from .exports
+      img.onerror = function () {
+        peekFrame.innerHTML = '<div class="placeholder">No render yet for this board.<br>It will appear once the exporter renders it.</div>';
+      };
+      peekFrame.appendChild(img);
+    } else {
+      peekFrame.innerHTML = '<div class="placeholder">No render yet for this board.<br>It will appear once the exporter renders it.</div>';
+    }
+    peekPresent.onclick = function () { window.location.assign(presentLink(b)); };
+    peekOpen.onclick = function () { window.location.assign(b.deepLink); };
+    peek.classList.add("open");
+    peek.setAttribute("aria-hidden", "false");
+  }
+
+  function flipPeek(delta) {
+    var next = peekIndex + delta;
+    if (next < 0 || next >= shownBoards.length) return;
+    openPeek(next);
+  }
+
+  function closePeek() {
+    peek.classList.remove("open");
+    peek.setAttribute("aria-hidden", "true");
+    if (peekIndex >= 0) focusIndex(peekIndex);
+    peekIndex = -1;
+  }
+
+  document.getElementById("peek-close").addEventListener("click", closePeek);
+  peek.addEventListener("click", function (e) { if (e.target === peek) closePeek(); });
+
+  document.addEventListener("keydown", function (e) {
+    // Peek is modal when open.
+    if (peek.classList.contains("open")) {
+      if (e.key === "Escape") { e.preventDefault(); closePeek(); }
+      else if (e.key === "ArrowRight" || e.key === "ArrowDown") { e.preventDefault(); flipPeek(1); }
+      else if (e.key === "ArrowLeft" || e.key === "ArrowUp") { e.preventDefault(); flipPeek(-1); }
+      else if (e.key === "Enter") { e.preventDefault(); flipPeek(0); window.location.assign(shownBoards[peekIndex].deepLink); }
+      return;
+    }
+    // Don't hijack typing in the filter/search field.
+    var t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
+
+    var idx = focusedId != null ? shownIndexOf(focusedId) : -1;
+    if (e.key === "ArrowRight") { e.preventDefault(); focusIndex(idx < 0 ? 0 : idx + 1); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); focusIndex(idx <= 0 ? 0 : idx - 1); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); focusIndex(idx < 0 ? 0 : idx + gridCols()); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); focusIndex(idx < 0 ? 0 : Math.max(0, idx - gridCols())); }
+    else if (e.key === " " && idx >= 0) { e.preventDefault(); openPeek(idx); }
+  });
+
+  // Approximate the column count of the responsive grid for up/down nav.
+  function gridCols() {
+    var style = getComputedStyle(grid);
+    var cols = style.gridTemplateColumns.split(" ").filter(Boolean).length;
+    return Math.max(1, cols);
   }
 
   // ---- activity / conflict strip -----------------------------------------
@@ -247,7 +491,6 @@
 
   function renderStrip(m) {
     stripEl.innerHTML = "";
-    // Conflicts FIRST-CLASS, rendered before everything else.
     var conflicts = (m.rows || []).filter(function (r) { return r.isConflict; });
     conflicts.forEach(function (r) {
       var box = document.createElement("span");
@@ -261,7 +504,6 @@
       stripEl.appendChild(box);
     });
 
-    // A compact activity summary for the rest.
     var active = (m.rows || []).filter(function (r) {
       return r.state === "importing" || r.state === "exporting" || r.state === "pending";
     });
@@ -327,6 +569,23 @@
       .catch(function () { /* keep last render */ });
   }
 
+  // ---- Checkpoint now (N4b) ----------------------------------------------
+  checkpointBtn.addEventListener("click", function () {
+    checkpointBtn.disabled = true;
+    var prev = checkpointBtn.textContent;
+    checkpointBtn.textContent = "Checkpointing…";
+    fetch("/__api/vault/checkpoint", { method: "POST" })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (res) {
+        checkpointBtn.textContent = res.body.message || (res.body.ok ? "Checkpointed" : "Refused");
+        setTimeout(function () { checkpointBtn.textContent = prev; checkpointBtn.disabled = false; }, 3500);
+      })
+      .catch(function () {
+        checkpointBtn.textContent = "Checkpoint failed";
+        setTimeout(function () { checkpointBtn.textContent = prev; checkpointBtn.disabled = false; }, 3500);
+      });
+  });
+
   projectSel.addEventListener("change", loadBoards);
   sortSel.addEventListener("change", loadBoards);
   filterInput.addEventListener("input", render);
@@ -335,6 +594,7 @@
   pollStrip();
   setInterval(pollStrip, 1200);
   // Refresh the grid periodically so card thumbnails/recency reflect syncs.
+  // This now diff/patches (scroll + focus preserved) instead of rebuilding.
   setInterval(loadBoards, 5000);
 })();
 </script>
