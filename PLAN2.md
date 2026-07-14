@@ -12,6 +12,15 @@ Obsidian's vault, and the Arduino IDE — a plain folder of plain files as the w
 IDE a thin shell around a toolchain it doesn't own, an Examples menu built from files
 shipped on disk. Every original surface lives beside or above the webview — never inside it.
 
+The project's durable values are now written down in [docs/ecosystem-concept.md](docs/ecosystem-concept.md)
+(the ecosystem design sketch they imply is in `docs/ecosystem-design.md`). Two of those
+principles are load-bearing for this chapter: **surface, don't apply** (updates and conflicts
+are shown, never applied silently — the conflict strip and "Checkpoint now" both instantiate it)
+and **git repos, not a registry** (checkpoints and, later, package distribution are plain git).
+When a chapter-2 feature touches sharing, versioning, or templates, it must not contradict those
+values; where it can't yet honor them (e.g. the palette's "New file from template" verb, which
+is the first foothold of the package ecosystem), it defers to N6 rather than half-building them.
+
 ## Vision
 
 > Your designs are just a folder on your disk — and now the app treats it that way. It
@@ -165,12 +174,22 @@ RPC edit updates card and strip within the poll+debounce window; an injected
 simultaneous-edit conflict appears in the strip within one sync window with a working
 reveal-both-versions action; the strip's SSE endpoint runs off `MockStatusSource` in CI.
 
-### N4 — Quick-open palette + peek + Checkpoint now (needs N1+N3)
+### N4 — Quick-open palette + peek + Checkpoint now (needs N1+N3) — ✅ DONE 2026-07-14 (`just e2e` all-green incl. N4-PALETTE; packaged palette offline in the dmg; checkpoint proven never to touch user history; grid rebuild-churn fixed; `docs/milestones/n4.md`)
 Goal: keyboard-first navigation over the whole vault, contact-sheet review, and the manual
 git checkpoint verb. Second-largest; pre-drawn split: N4a palette+peek / N4b checkpoint.
+"Checkpoint now" is the concrete instance of the **surface, don't apply** + **git repos, not a
+registry** values (`docs/ecosystem-concept.md`): manual-only, one labeled commit on explicit
+action, never auto-chronicle, never rewriting history. The palette's "New file from template"
+verb is a stub here — it opens the (empty until N6) template surface; templates ship in N6, so
+N4 must not half-build the ecosystem. **Prerequisite fix (N3 debt):** `/__home` (and the new
+peek/contact-sheet) must stop rebuilding the whole grid DOM every 5 s — replace the
+`innerHTML=""`-on-interval with diff/patch that preserves scroll and selection, or Peek's
+keyboard flipping is unusable at vault scale. Gate it: after a card update the scroll position
+and focused card are unchanged (assert via the headless-browser leg).
 **Exit criteria:** `scripts/n4-palette.sh`: ranking and verbs asserted over HTTP against
 `/__api/vault/*` (a fuzzy query ranks the target board first; the Enter payload is its
-exact deep link) plus one headless-browser navigation assert; the OS pieces (global
+exact deep link) plus one headless-browser navigation assert; a headless-browser assert that a
+board-list refresh preserves scroll + focused card (the N3-debt grid fix); the OS pieces (global
 shortcut, overlay focus) get Linux-CI coverage + an explicit manual-QA checklist —
 **tauri-driver does not support macOS**, no exit criterion may depend on it locally; Space
 serves the board's preview from `.exports` (HTTP 200 + content hash, render currency per

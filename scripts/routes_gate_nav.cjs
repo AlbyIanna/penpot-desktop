@@ -11,6 +11,11 @@
  *      (read from its data-deeplink attribute — same string the
  *      /__api/vault/boards payload emitted).
  *   2. Trigger the escape hatch, assert the landed URL is /#/dashboard/recent.
+ *   3. (N4) Build the viewer deep link for the first board from the
+ *      /__api/vault/boards payload (file-id, page-id, frame-id=board-id,
+ *      section=interactions — the Peek "Present" route) and assert it commits
+ *      as a /#/view navigation. This covers the ONE new upstream coupling N4
+ *      adds beyond N3's workspace/dashboard shapes.
  *
  * We assert on navigation COMMIT (not full SPA load) so the heavy ClojureScript
  * app never has to finish booting — the URL is what the gate is about.
@@ -104,6 +109,40 @@ function fail(msg) {
     };
     if (!result.dashboard.pass) {
       fail("escape hatch landed on " + landedDash + " but expected " + expectedDash);
+    }
+
+    // --- (3) N4 viewer route -> /#/view (Peek "Present") -----------------
+    await page.goto(BASE + "/__home", { waitUntil: "domcontentloaded" });
+    const board = await page.evaluate(async () => {
+      const r = await fetch("/__api/vault/boards");
+      if (!r.ok) return null;
+      const j = await r.json();
+      return (j.boards && j.boards[0]) || null;
+    });
+    if (!board || !board.fileId || !board.pageId || !board.boardId) {
+      fail("could not read a board from /__api/vault/boards for the viewer leg");
+    }
+    const viewerLink =
+      "/#/view?file-id=" + encodeURIComponent(board.fileId) +
+      "&page-id=" + encodeURIComponent(board.pageId) +
+      "&frame-id=" + encodeURIComponent(board.boardId) +
+      "&section=interactions";
+    const expectedViewer = BASE + viewerLink;
+    await Promise.all([
+      page.waitForURL((u) => u.toString().includes("#/view"), {
+        waitUntil: "commit",
+        timeout: NAV_TIMEOUT,
+      }),
+      page.evaluate((href) => { window.location.assign(href); }, viewerLink),
+    ]);
+    const landedViewer = page.url();
+    result.viewer = {
+      expected: expectedViewer,
+      landed: landedViewer,
+      pass: landedViewer === expectedViewer,
+    };
+    if (!result.viewer.pass) {
+      fail("viewer link landed on " + landedViewer + " but expected " + expectedViewer);
     }
 
     result.ok = true;

@@ -417,6 +417,48 @@ else
     echo "last search response: $SEARCH_RESP" >&2
 fi
 
+# (g2) PACKAGED PALETTE: N4's quick-open surface must ship + rank offline in the .app ----
+# Two things N4 adds to the artifact: the /__palette overlay page (served by the
+# desktop router) and the ranked /__api/vault/palette API (served by the bundled
+# vault-index). Both must work OFFLINE through the installed .app (proxies still
+# poisoned). Assert the page serves and a fuzzy "Cover" query ranks the seeded
+# board first with kind=board + an exact /#/workspace Enter payload.
+PALETTE_PAGE_CODE="$(curl -s -o "$WORK/palette.html" -w '%{http_code}' "$BASE/__palette" 2>/dev/null || echo 000)"
+if [ "$PALETTE_PAGE_CODE" = "200" ] && grep -qi "Quick open" "$WORK/palette.html" && grep -q 'id="q"' "$WORK/palette.html"; then
+    pass "(g2a) /__palette overlay page served OFFLINE through the .app (HTTP 200)"
+else
+    fail "(g2a) /__palette page not served (code=$PALETTE_PAGE_CODE)"
+fi
+PAL_RESP="$(curl -sS "$BASE/__api/vault/palette?q=Cover&limit=10" 2>/dev/null || true)"
+if echo "$PAL_RESP" | python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+hits = d.get("hits", [])
+if not hits:
+    sys.exit(1)
+# The seeded "Cover" board must be the top-ranked hit for a fuzzy "Cover" query.
+top = hits[0]
+if top.get("kind") != "board":
+    sys.exit(1)
+if "Cover" not in top.get("label", ""):
+    sys.exit(1)
+if not str(top.get("deepLink", "")).startswith("/#/workspace"):
+    sys.exit(1)
+if want and top.get("fileId") != want:
+    sys.exit(1)
+sys.exit(0)
+' "$ALPHA_FILE_ID" 2>/dev/null; then
+    PAL_MS="$(echo "$PAL_RESP" | json_field tookMs 2>/dev/null || echo '?')"
+    pass "(g2b) /__api/vault/palette ranked the seeded 'Cover' board first OFFLINE (kind=board, exact /#/workspace Enter payload; tookMs=$PAL_MS)"
+else
+    fail "(g2b) /__api/vault/palette did not rank the seeded 'Cover' board first (packaged N4 palette surface)"
+    echo "last palette response: $PAL_RESP" >&2
+fi
+
 # (e) SIGTERM: clean exit, no orphans ---------------------------------------------------
 CHILL_PIDS="$(stack_pids)"
 kill -TERM "$APP_PID" 2>/dev/null

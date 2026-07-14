@@ -1,0 +1,224 @@
+<!--
+  N4 quick-open palette (pillar 4). Plain HTML + vanilla JS, served same-origin
+  at /__palette; shown in a Tauri overlay window toggled by the global shortcut
+  (Cmd/Ctrl+K) or the tray. Fuzzy-ranks projects/files/boards from the index
+  via /__api/vault/palette?q=; Enter navigates to the selected item's EXACT
+  deep link. Verbs on the selection: Reveal in Finder, Export board, Copy board
+  link, Checkpoint now, and the deferring stubs (New file from template → N6,
+  Switch vault → N5).
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Quick open</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #ffffff; --border: #e3e6ea; --text: #14181d;
+    --muted: #6b7580; --accent: #4b5fd6; --accent-text: #ffffff; --sel: #eef1fd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c2127; --panel: #1c2127; --border: #2b3138; --text: #e7ebef;
+      --muted: #9aa4af; --accent: #7d8ff5; --accent-text: #0d1013; --sel: #23304f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text); background: var(--bg); display: flex; flex-direction: column; height: 100vh;
+  }
+  #q {
+    font: 16px/1.5 inherit; color: var(--text); background: var(--bg); border: none;
+    border-bottom: 1px solid var(--border); padding: 14px 16px; outline: none; width: 100%;
+  }
+  #results { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; }
+  li.hit {
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px;
+    cursor: pointer;
+  }
+  li.hit.sel { background: var(--sel); }
+  li.hit .kind {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; flex: none; min-width: 52px; text-align: center;
+  }
+  li.hit .label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  li.hit .sub { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+  #verbs {
+    display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 12px; border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #verbs button {
+    font: inherit; font-size: 12px; cursor: pointer; border: 1px solid var(--border); color: var(--text);
+    background: var(--bg); border-radius: 7px; padding: 4px 9px;
+  }
+  #verbs button:hover { border-color: var(--accent); }
+  #verbs button:disabled { opacity: .4; cursor: default; }
+  #note { color: var(--muted); font-size: 12px; padding: 0 12px 8px; min-height: 16px; }
+  .empty { color: var(--muted); padding: 20px; text-align: center; }
+</style>
+</head>
+<body>
+  <input id="q" type="text" placeholder="Search boards, files, projects…  (Enter to open)" autocomplete="off" autofocus />
+  <ul id="results"></ul>
+  <div id="verbs">
+    <button data-verb="open" id="v-open">Open ↵</button>
+    <button data-verb="present" id="v-present">Present</button>
+    <button data-verb="reveal" id="v-reveal">Reveal in Finder</button>
+    <button data-verb="export" id="v-export">Export board</button>
+    <button data-verb="copy" id="v-copy">Copy board link</button>
+    <button data-verb="checkpoint" id="v-checkpoint">Checkpoint now</button>
+    <button data-verb="template" id="v-template">New from template…</button>
+    <button data-verb="switch" id="v-switch">Switch vault…</button>
+  </div>
+  <div id="note"></div>
+
+<script>
+(function () {
+  "use strict";
+  var q = document.getElementById("q");
+  var results = document.getElementById("results");
+  var verbs = document.getElementById("verbs");
+  var note = document.getElementById("note");
+  var hits = [];
+  var sel = 0;
+  var timer = null;
+
+  function setNote(msg) { note.textContent = msg || ""; }
+
+  function presentLink(h) {
+    return "/#/view?file-id=" + encodeURIComponent(h.fileId) +
+      "&page-id=" + encodeURIComponent(h.pageId) +
+      "&frame-id=" + encodeURIComponent(h.boardId) +
+      "&section=interactions";
+  }
+
+  function renderHits() {
+    results.innerHTML = "";
+    if (!hits.length) {
+      var li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = q.value.trim() ? "No matches." : "Type to search the vault.";
+      results.appendChild(li);
+      updateVerbs();
+      return;
+    }
+    hits.forEach(function (h, i) {
+      var li = document.createElement("li");
+      li.className = "hit" + (i === sel ? " sel" : "");
+      li.setAttribute("data-deeplink", h.deepLink);
+      li.setAttribute("data-kind", h.kind);
+      li.setAttribute("data-board-id", h.boardId || "");
+      var k = document.createElement("span"); k.className = "kind"; k.textContent = h.kind;
+      var l = document.createElement("span"); l.className = "label"; l.textContent = h.label;
+      var s = document.createElement("span"); s.className = "sub"; s.textContent = h.sublabel || "";
+      li.appendChild(k); li.appendChild(l); li.appendChild(s);
+      li.addEventListener("click", function () { sel = i; renderHits(); });
+      li.addEventListener("dblclick", function () { openSelected(); });
+      results.appendChild(li);
+    });
+    updateVerbs();
+    var selEl = results.querySelector("li.sel");
+    if (selEl) selEl.scrollIntoView({ block: "nearest" });
+  }
+
+  function current() { return hits[sel]; }
+
+  function updateVerbs() {
+    var h = current();
+    var isBoard = h && h.kind === "board";
+    document.getElementById("v-present").disabled = !isBoard;
+    document.getElementById("v-reveal").disabled = !(h && h.relPath);
+    document.getElementById("v-export").disabled = !isBoard;
+    document.getElementById("v-copy").disabled = !(h && h.deepLink);
+    document.getElementById("v-open").disabled = !h;
+  }
+
+  function search() {
+    var query = q.value.trim();
+    fetch("/__api/vault/palette?q=" + encodeURIComponent(query) + "&limit=40")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        hits = (data.hits || []).map(function (x) { return x; });
+        sel = 0;
+        renderHits();
+      })
+      .catch(function () { setNote("index warming up…"); setTimeout(search, 1200); });
+  }
+
+  function openSelected() {
+    var h = current();
+    if (h) window.location.assign(h.deepLink);
+  }
+
+  function runVerb(verb) {
+    var h = current();
+    switch (verb) {
+      case "open": openSelected(); break;
+      case "present": if (h && h.kind === "board") window.location.assign(presentLink(h)); break;
+      case "reveal":
+        if (h && h.relPath) {
+          fetch("/__api/vault/reveal?path=" + encodeURIComponent(h.relPath));
+          setNote("Revealing " + h.relPath + " in Finder…");
+        }
+        break;
+      case "export":
+        if (h && h.relPath) {
+          // Open the board's .exports render (N2 packaged pipeline).
+          var exp = "/__api/vault/thumb?rel=" + encodeURIComponent(h.relPath) +
+            "&board=" + encodeURIComponent(h.boardId) + "&fmt=png";
+          window.open(exp, "_blank");
+          setNote("Opening the rendered board (from .exports)…");
+        }
+        break;
+      case "copy":
+        if (h && h.deepLink) {
+          var url = window.location.origin + h.deepLink;
+          if (navigator.clipboard) navigator.clipboard.writeText(url);
+          // team-id in the link is boot-fresh: copy it before the next vault
+          // wipe/switch, or it may go stale (documented caveat).
+          setNote("Copied board link. Note: the team-id is per-boot — copy again after a vault switch.");
+        }
+        break;
+      case "checkpoint":
+        setNote("Checkpointing the vault…");
+        fetch("/__api/vault/checkpoint", { method: "POST" })
+          .then(function (r) { return r.json(); })
+          .then(function (j) { setNote(j.message || (j.ok ? "Checkpointed." : "Refused.")); })
+          .catch(function () { setNote("Checkpoint failed."); });
+        break;
+      case "template":
+        // Stub that DEFERS cleanly (PLAN2: templates arrive in N6). Nothing
+        // destructive — just a message; a real surface lands in N6.
+        setNote("New-from-template arrives in N6 (the package ecosystem). Nothing was created.");
+        break;
+      case "switch":
+        setNote("Switching vaults arrives in N5. Nothing was changed.");
+        break;
+    }
+  }
+
+  q.addEventListener("input", function () {
+    clearTimeout(timer);
+    timer = setTimeout(search, 90);
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowDown") { e.preventDefault(); if (hits.length) { sel = Math.min(hits.length - 1, sel + 1); renderHits(); } }
+    else if (e.key === "ArrowUp") { e.preventDefault(); if (hits.length) { sel = Math.max(0, sel - 1); renderHits(); } }
+    else if (e.key === "Enter") { e.preventDefault(); openSelected(); }
+    else if (e.key === "Escape") { e.preventDefault(); setNote("(Esc closes the palette window)"); }
+  });
+
+  verbs.addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-verb]");
+    if (b && !b.disabled) runVerb(b.getAttribute("data-verb"));
+  });
+
+  search();
+})();
+</script>
+</body>
+</html>
