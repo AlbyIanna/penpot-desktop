@@ -15,10 +15,18 @@
 //!
 //! Bundle layout contract (`penpot-runtime/`): `backend/` (penpot.jar, …),
 //! `frontend/` (static SPA), `jre/bin/java` (jlink output), `bin/`
-//! (valkey-server, identify, penpot-watchdog, optionally node), `postgres/`
-//! (a ready postgresql_embedded-compatible installation — either
-//! `postgres/bin/initdb` or `postgres/<version>/bin/initdb`), `VERSION`,
-//! `MANIFEST.json`.
+//! (valkey-server, identify, penpot-watchdog, and — since N2 — `node` for
+//! the exporter), `postgres/` (a ready postgresql_embedded-compatible
+//! installation — either `postgres/bin/initdb` or
+//! `postgres/<version>/bin/initdb`), `exporter/` (the extracted
+//! penpot-exporter app: `app.js` + `node_modules/`), `exporter-browsers/`
+//! (a playwright-managed chromium **headless shell**, keyed by
+//! `PLAYWRIGHT_BROWSERS_PATH`), `VERSION`, `MANIFEST.json`.
+//!
+//! The exporter components are resolved by
+//! [`crate::resolve_exporter_layout`] with the same env > bundle > dev
+//! precedence; a bundle without them simply degrades to dev-mode
+//! requirements when `PENPOT_LOCAL_EXPORTS=1`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

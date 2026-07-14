@@ -35,6 +35,33 @@ m3:
 m5:
     bash scripts/m5-features.sh
 
+# N1 vault index: torture fixture (100 files / 1000 boards), FTS search
+# correctness + latency, delete-index-db rebuild (invariant 1), rename
+# staleness, hash-gated no-reindex.
+n1:
+    bash scripts/n1-index.sh
+
+# N2 packaged render path: exporter (node + chromium headless-shell) resolves
+# from the runtime bundle, offline renders every board, hash-gated no-op, plus
+# live regressions for the two dev-mode exporter bugs (stale-adoption,
+# shutdown-hang). Requires the bundle first (`bash scripts/build-runtime-bundle.sh`).
+n2:
+    bash scripts/n2-thumbs.sh
+
+# THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
+# suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
+# so never run them in parallel. Chains every landed n-gate (N1, N2).
+# n2-thumbs needs the runtime bundle (`bash scripts/build-runtime-bundle.sh`);
+# m4-artifact-test.sh stays separate: it needs a dmg build
+# (`bash scripts/build-dmg.sh` first).
+e2e:
+    bash scripts/m1-smoke.sh
+    bash scripts/m2-invariant.sh
+    bash scripts/m3-sync.sh
+    bash scripts/m5-features.sh
+    bash scripts/n1-index.sh
+    bash scripts/n2-thumbs.sh
+
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).
 git-init designs_dir:

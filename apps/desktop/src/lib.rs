@@ -80,30 +80,39 @@ pub struct AppConfig {
     /// `identify`/`node`, or `PENPOT_LOCAL_IDENTIFY`/`PENPOT_LOCAL_NODE` dirs).
     pub child_path_prepend: Vec<PathBuf>,
     /// M5 per-board auto-export: exporter child + board-export service.
-    /// `None` unless `PENPOT_LOCAL_EXPORTS=1` (default OFF in M5; dev-mode
-    /// only — the exporter is NOT packaged).
+    /// `None` unless `PENPOT_LOCAL_EXPORTS=1` (default OFF). Packaged since
+    /// N2: the runtime bundle ships node + exporter app + headless chromium,
+    /// so this works on a clean machine with no host node.
     pub exporter: Option<ExporterLayout>,
     /// The full layout with per-component provenance (logged at boot).
     pub layout: layout::RuntimeLayout,
 }
 
-/// Resolved pieces of the optional exporter service (M5). Dev-mode only:
-/// requires a host `node` (upstream pins v24.16.0, v25 verified working),
-/// the extracted exporter app (`scripts/fetch-penpot.sh`) and a
-/// playwright-managed chromium (`scripts/fetch-penpot.sh --with-browsers`).
+/// Resolved pieces of the optional exporter service (M5 dev-mode; N2 makes
+/// it a packaged-mode capability). Resolution per component is env override >
+/// bundle payload > dev default — the same precedence as
+/// [`layout::resolve_layout`]:
+/// - exporter app: `PENPOT_LOCAL_EXPORTER_DIR` → `<runtime>/exporter` (in
+///   packaged mode the runtime dir IS the bundle, which ships `exporter/`);
+/// - node: `PENPOT_LOCAL_NODE` → bundle `bin/node` (v24.16.0, the upstream
+///   pin) → host `/opt/homebrew/bin/node` (dev; v25 verified working);
+/// - browsers: `PENPOT_LOCAL_EXPORTER_BROWSERS` → `<runtime>/
+///   exporter-browsers` (the bundle ships the chromium headless shell).
 #[derive(Debug, Clone)]
 pub struct ExporterLayout {
     /// Directory with `app.js` + `node_modules`
     /// (`PENPOT_LOCAL_EXPORTER_DIR`, default `<runtime>/exporter`).
     pub exporter_dir: PathBuf,
-    /// Host node binary (`PENPOT_LOCAL_NODE`, default
-    /// `/opt/homebrew/bin/node`).
+    /// Node binary (`PENPOT_LOCAL_NODE` → bundle `bin/node` → homebrew).
     pub node_path: PathBuf,
     /// `PLAYWRIGHT_BROWSERS_PATH` (`PENPOT_LOCAL_EXPORTER_BROWSERS`, default
     /// `<runtime>/exporter-browsers`).
     pub browsers_dir: PathBuf,
     /// Exporter HTTP port (`PENPOT_LOCAL_EXPORTER_PORT`, default 6363).
     pub port: u16,
+    /// One `component=… source=… path=…` line per component for the boot
+    /// log, same shape as [`layout::RuntimeLayout::describe`].
+    pub provenance: Vec<String>,
 }
 
 /// Truthy values accepted for `PENPOT_LOCAL_EXPORTS`.
@@ -137,41 +146,85 @@ impl ExporterEnvOverrides {
     }
 }
 
-/// Pre-flight the exporter layout: every host requirement is checked here so
-/// a missing piece fails the boot with a message that says exactly what to
+/// Pre-flight the exporter layout: every requirement is checked here so a
+/// missing piece fails the boot with a message that says exactly what to
 /// run, instead of a crash-looping child.
+///
+/// Precedence per component (N2): env override > bundle payload > dev
+/// default. `bundle` is the discovered `penpot-runtime/` dir, if any — in
+/// packaged mode it usually equals `runtime_dir`, but an explicit
+/// `PENPOT_LOCAL_RUNTIME_DIR` env override may split the two, so the bundle
+/// is consulted independently for `bin/node`.
 pub fn resolve_exporter_layout(
     env: &ExporterEnvOverrides,
     runtime_dir: &Path,
     port: u16,
+    bundle: Option<&Path>,
 ) -> anyhow::Result<ExporterLayout> {
-    let exporter_dir = env
-        .exporter_dir
-        .clone()
-        .unwrap_or_else(|| runtime_dir.join("exporter"));
+    let mut provenance = Vec::new();
+    let mut record = |component: &str, source: layout::Source, path: &Path| {
+        provenance.push(format!(
+            "component={component} source={source} path={}",
+            path.display()
+        ));
+    };
+
+    let (exporter_dir, exporter_src) = match &env.exporter_dir {
+        Some(dir) => (dir.clone(), layout::Source::Env),
+        None => {
+            let in_runtime = runtime_dir.join("exporter");
+            match bundle {
+                Some(b) if b != runtime_dir && b.join("exporter/app.js").is_file()
+                    && !in_runtime.join("app.js").is_file() =>
+                {
+                    (b.join("exporter"), layout::Source::Bundle)
+                }
+                Some(b) if b == runtime_dir && in_runtime.join("app.js").is_file() => {
+                    (in_runtime, layout::Source::Bundle)
+                }
+                _ => (in_runtime, layout::Source::Dev),
+            }
+        }
+    };
+    record("exporter", exporter_src, &exporter_dir);
     if !exporter_dir.join("app.js").is_file() {
         bail!(
             "PENPOT_LOCAL_EXPORTS is enabled but the exporter app is missing under {} — \
-             run scripts/fetch-penpot.sh (or set PENPOT_LOCAL_EXPORTER_DIR)",
+             run scripts/fetch-penpot.sh (dev), rebuild the runtime bundle with the \
+             exporter payload (packaged), or set PENPOT_LOCAL_EXPORTER_DIR",
             exporter_dir.display()
         );
     }
-    let node_path = env
-        .node
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/opt/homebrew/bin/node"));
+
+    let (node_path, node_src) = match &env.node {
+        Some(p) => (p.clone(), layout::Source::Env),
+        None => match bundle.map(|b| b.join("bin/node")).filter(|p| p.is_file()) {
+            Some(p) => (p, layout::Source::Bundle),
+            None => (PathBuf::from("/opt/homebrew/bin/node"), layout::Source::Dev),
+        },
+    };
+    record("exporter-node", node_src, &node_path);
     if !node_path.is_file() {
         bail!(
             "PENPOT_LOCAL_EXPORTS is enabled but node was not found at {} — \
-             install node (the exporter is dev-mode only and runs on the host node; \
-             upstream pins v24, v25 is verified working) or set PENPOT_LOCAL_NODE",
+             install node (dev; upstream pins v24, v25 is verified working), rebuild \
+             the runtime bundle with bin/node (packaged), or set PENPOT_LOCAL_NODE",
             node_path.display()
         );
     }
-    let browsers_dir = env
-        .browsers_dir
-        .clone()
-        .unwrap_or_else(|| runtime_dir.join("exporter-browsers"));
+
+    let (browsers_dir, browsers_src) = match &env.browsers_dir {
+        Some(dir) => (dir.clone(), layout::Source::Env),
+        None => {
+            let in_runtime = runtime_dir.join("exporter-browsers");
+            let src = match bundle {
+                Some(b) if b == runtime_dir => layout::Source::Bundle,
+                _ => layout::Source::Dev,
+            };
+            (in_runtime, src)
+        }
+    };
+    record("exporter-browsers", browsers_src, &browsers_dir);
     let has_chromium = std::fs::read_dir(&browsers_dir)
         .map(|entries| {
             entries
@@ -182,11 +235,13 @@ pub fn resolve_exporter_layout(
     if !has_chromium {
         bail!(
             "PENPOT_LOCAL_EXPORTS is enabled but no playwright chromium under {} — \
-             run scripts/fetch-penpot.sh --with-browsers (or set PENPOT_LOCAL_EXPORTER_BROWSERS)",
+             run scripts/fetch-penpot.sh --with-browsers (dev), rebuild the runtime \
+             bundle with exporter-browsers/ (packaged), or set \
+             PENPOT_LOCAL_EXPORTER_BROWSERS",
             browsers_dir.display()
         );
     }
-    Ok(ExporterLayout { exporter_dir, node_path, browsers_dir, port })
+    Ok(ExporterLayout { exporter_dir, node_path, browsers_dir, port, provenance })
 }
 
 fn env_port(name: &str, default: u16) -> anyhow::Result<u16> {
@@ -234,13 +289,14 @@ impl AppConfig {
             Some(dir) => PathBuf::from(dir),
             None => data_dir.join("designs"),
         };
-        // --- M5 exporter (default OFF; dev-mode only) ---------------------
+        // --- M5/N2 exporter (default OFF; packaged-mode capable) ----------
         let exporter = if env_flag("PENPOT_LOCAL_EXPORTS") {
             let port = env_port("PENPOT_LOCAL_EXPORTER_PORT", 6363)?;
             Some(resolve_exporter_layout(
                 &ExporterEnvOverrides::from_env(),
                 &runtime_dir,
                 port,
+                bundle.as_deref(),
             )?)
         } else {
             None
@@ -488,6 +544,7 @@ pub struct RunningApp {
     proxy_task: Option<JoinHandle<anyhow::Result<()>>>,
     sync_daemon: Option<sync_daemon::SyncDaemonHandle>,
     board_export: Option<board_export::BoardExportHandle>,
+    vault_index: Option<vault_index::VaultIndexHandle>,
 }
 
 impl RunningApp {
@@ -522,6 +579,10 @@ impl RunningApp {
     /// supervised children (exporter → backend → valkey → postgres).
     /// Idempotent via consuming `self`.
     pub async fn shutdown(mut self) {
+        // The vault index only reads disk; stop it first (cheap, instant).
+        if let Some(index) = self.vault_index.take() {
+            index.stop().await;
+        }
         if let Some(exports) = self.board_export.take() {
             exports.stop().await;
         }
@@ -597,6 +658,11 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     for line in config.layout.describe() {
         tracing::info!("runtime layout: {line}");
     }
+    if let Some(exporter) = &config.exporter {
+        for line in &exporter.provenance {
+            tracing::info!("runtime layout: {line}");
+        }
+    }
 
     let secret_key = load_or_generate_secret(&config.data_dir)?;
     let public_uri = config.public_uri();
@@ -622,7 +688,19 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         used: AtomicBool::new(false),
     });
     let config_js = render_config_js(supervisor::DEFAULT_PENPOT_FLAGS, &public_uri);
-    let extra = extra_router(bootstrap_state, config_js);
+
+    // --- vault index (N1: offline full-content search) --------------------
+    // Reads only the designs tree + manifest (never the DB); its SQLite db
+    // lives in the data dir OUTSIDE the vault and is disposable (delete it →
+    // rebuilt from disk alone). Routes are same-origin via the proxy.
+    let vault_index = vault_index::spawn(vault_index::IndexConfig::new(
+        &config.designs_dir,
+        config.data_dir.join("vault-index").join("index.sqlite3"),
+    ));
+    let team_id = profile.default_team_id.clone().unwrap_or_default();
+    let vault_routes = vault_index::router(&vault_index, team_id);
+
+    let extra = extra_router(bootstrap_state, config_js).merge(vault_routes);
 
     let mut proxy_config = proxy::ProxyConfig::new(
         config.runtime_dir.join("frontend"),
@@ -712,6 +790,7 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         proxy_task: Some(proxy_task),
         sync_daemon,
         board_export,
+        vault_index: Some(vault_index),
     })
 }
 
@@ -758,7 +837,7 @@ mod tests {
     fn exporter_layout_resolves_when_everything_is_present() {
         let tmp = tempfile::tempdir().unwrap();
         let (runtime, env) = fake_exporter_runtime(tmp.path());
-        let layout = resolve_exporter_layout(&env, &runtime, 6363).unwrap();
+        let layout = resolve_exporter_layout(&env, &runtime, 6363, None).unwrap();
         assert_eq!(layout.exporter_dir, runtime.join("exporter"));
         assert_eq!(layout.browsers_dir, runtime.join("exporter-browsers"));
         assert_eq!(layout.node_path, tmp.path().join("bin/node"));
@@ -773,7 +852,7 @@ mod tests {
         // Missing exporter app.
         let bare = tmp.path().join("bare-runtime");
         std::fs::create_dir_all(&bare).unwrap();
-        let err = resolve_exporter_layout(&env, &bare, 6363).unwrap_err();
+        let err = resolve_exporter_layout(&env, &bare, 6363, None).unwrap_err();
         assert!(err.to_string().contains("fetch-penpot.sh"), "{err}");
 
         // Missing node.
@@ -781,7 +860,7 @@ mod tests {
             node: Some(tmp.path().join("nope/node")),
             ..Default::default()
         };
-        let err = resolve_exporter_layout(&no_node, &runtime, 6363).unwrap_err();
+        let err = resolve_exporter_layout(&no_node, &runtime, 6363, None).unwrap_err();
         assert!(err.to_string().contains("PENPOT_LOCAL_NODE"), "{err}");
 
         // Missing browsers.
@@ -789,7 +868,7 @@ mod tests {
             browsers_dir: Some(tmp.path().join("empty-browsers")),
             ..env.clone()
         };
-        let err = resolve_exporter_layout(&no_browsers, &runtime, 6363).unwrap_err();
+        let err = resolve_exporter_layout(&no_browsers, &runtime, 6363, None).unwrap_err();
         assert!(err.to_string().contains("--with-browsers"), "{err}");
     }
 
@@ -803,17 +882,91 @@ mod tests {
         touch(&alt.join("browsers/chromium-x/marker"));
         env.exporter_dir = Some(alt.join("exporter"));
         env.browsers_dir = Some(alt.join("browsers"));
-        let layout = resolve_exporter_layout(&env, &runtime, 7000).unwrap();
+        let layout = resolve_exporter_layout(&env, &runtime, 7000, None).unwrap();
         assert_eq!(layout.exporter_dir, alt.join("exporter"));
         assert_eq!(layout.browsers_dir, alt.join("browsers"));
         assert_eq!(layout.port, 7000);
+    }
+
+    /// N2: a full bundle provides exporter app, browsers AND node — all three
+    /// resolve source=bundle with zero host requirements.
+    #[test]
+    fn exporter_layout_resolves_from_the_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("penpot-runtime");
+        touch(&bundle.join("backend/penpot.jar"));
+        touch(&bundle.join("exporter/app.js"));
+        touch(&bundle.join("exporter-browsers/chromium_headless_shell-1228/marker"));
+        touch(&bundle.join("bin/node"));
+        // Packaged mode: the runtime dir IS the bundle.
+        let layout = resolve_exporter_layout(
+            &ExporterEnvOverrides::default(),
+            &bundle,
+            6363,
+            Some(&bundle),
+        )
+        .unwrap();
+        assert_eq!(layout.exporter_dir, bundle.join("exporter"));
+        assert_eq!(layout.node_path, bundle.join("bin/node"), "bundle node beats homebrew");
+        assert_eq!(layout.browsers_dir, bundle.join("exporter-browsers"));
+        assert_eq!(layout.provenance.len(), 3);
+        assert!(
+            layout.provenance.iter().all(|l| l.contains("source=bundle")),
+            "{:?}",
+            layout.provenance
+        );
+    }
+
+    /// N2: env overrides still beat the bundle for every exporter component.
+    #[test]
+    fn exporter_env_overrides_beat_the_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("penpot-runtime");
+        touch(&bundle.join("exporter/app.js"));
+        touch(&bundle.join("exporter-browsers/chromium_headless_shell-1228/marker"));
+        touch(&bundle.join("bin/node"));
+        let alt = tmp.path().join("alt");
+        touch(&alt.join("exporter/app.js"));
+        touch(&alt.join("browsers/chromium-x/marker"));
+        touch(&alt.join("node"));
+        let env = ExporterEnvOverrides {
+            exporter_dir: Some(alt.join("exporter")),
+            browsers_dir: Some(alt.join("browsers")),
+            node: Some(alt.join("node")),
+        };
+        let layout = resolve_exporter_layout(&env, &bundle, 6363, Some(&bundle)).unwrap();
+        assert_eq!(layout.exporter_dir, alt.join("exporter"));
+        assert_eq!(layout.node_path, alt.join("node"));
+        assert_eq!(layout.browsers_dir, alt.join("browsers"));
+        assert!(
+            layout.provenance.iter().all(|l| l.contains("source=env")),
+            "{:?}",
+            layout.provenance
+        );
+    }
+
+    /// N2: a bundle without the exporter payload degrades to the dev error
+    /// (clear message, no silent fallback to a half-working setup).
+    #[test]
+    fn bundle_without_exporter_payload_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("penpot-runtime");
+        touch(&bundle.join("backend/penpot.jar"));
+        let err = resolve_exporter_layout(
+            &ExporterEnvOverrides::default(),
+            &bundle,
+            6363,
+            Some(&bundle),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exporter app is missing"), "{err}");
     }
 
     #[test]
     fn supervisor_config_maps_the_exporter_spec() {
         let tmp = tempfile::tempdir().unwrap();
         let (runtime, env) = fake_exporter_runtime(tmp.path());
-        let exporter = resolve_exporter_layout(&env, &runtime, 6467).unwrap();
+        let exporter = resolve_exporter_layout(&env, &runtime, 6467, None).unwrap();
         let config = AppConfig {
             data_dir: tmp.path().join("data"),
             runtime_dir: runtime.clone(),

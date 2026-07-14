@@ -339,6 +339,26 @@ struct Service {
     status_tx: watch::Sender<ExportStatusSnapshot>,
 }
 
+/// Why one file's render batch did not complete. Cancellation is separated
+/// from real failures so shutdown neither logs an error nor arms a retry
+/// cooldown (N2 bug-B fix).
+#[derive(Debug)]
+enum RenderFileError {
+    /// The shutdown flag flipped mid-render.
+    Cancelled,
+    /// A real failure (retried inline first; the caller cools down).
+    Other(anyhow::Error),
+}
+
+impl RenderFileError {
+    fn from_retry<E: std::fmt::Display>(what: &str, e: retry::RetryError<E>) -> Self {
+        match e {
+            retry::RetryError::Cancelled => RenderFileError::Cancelled,
+            retry::RetryError::Op(e) => RenderFileError::Other(anyhow::anyhow!("{what}: {e}")),
+        }
+    }
+}
+
 async fn run(
     rpc: PenpotClient,
     cfg: ExportConfig,
@@ -363,16 +383,23 @@ async fn run(
         "board-export service started"
     );
     loop {
+        // `biased` with the shutdown branch first (N2 bug-B fix): a pending
+        // shutdown must never lose the race against a ready interval tick.
         tokio::select! {
-            _ = interval.tick() => {}
+            biased;
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     tracing::info!("board-export service stopping");
                     return;
                 }
             }
+            _ = interval.tick() => {}
         }
-        service.poll_once(&mut queue).await;
+        service.poll_once(&mut queue, &mut shutdown).await;
+        if *shutdown.borrow() {
+            tracing::info!("board-export service stopping");
+            return;
+        }
     }
 }
 
@@ -388,8 +415,10 @@ impl Service {
     }
 
     /// One poll cycle: diff manifest hashes against exports state, arm/clear
-    /// the debounce queue, render whatever is due.
-    async fn poll_once(&mut self, queue: &mut RenderQueue) {
+    /// the debounce queue, render whatever is due. `shutdown` is threaded
+    /// into every render's retry ladder (N2 bug-B fix) and checked between
+    /// due files, so a stop request aborts a failing batch immediately.
+    async fn poll_once(&mut self, queue: &mut RenderQueue, shutdown: &mut watch::Receiver<bool>) {
         let manifest = match Manifest::load(&self.cfg.sync_root) {
             Ok(Some(m)) => m,
             Ok(None) => return, // fresh root, nothing synced yet
@@ -435,8 +464,13 @@ impl Service {
             s.files_pending = pending_count;
         });
         for (file_id, pending) in queue.take_due(Instant::now()) {
+            if *shutdown.borrow() {
+                // Shutting down mid-batch: leave the remaining due entries
+                // un-rendered (the next boot's manifest diff re-arms them).
+                return;
+            }
             self.publish_status(|s| s.rendering = Some(pending.rel_path.clone()));
-            match self.render_file(&file_id, &pending).await {
+            match self.render_file(&file_id, &pending, shutdown).await {
                 Ok(n_boards) => {
                     tracing::info!(
                         file = %pending.rel_path,
@@ -450,7 +484,16 @@ impl Service {
                         s.last_error = None;
                     });
                 }
-                Err(e) => {
+                Err(RenderFileError::Cancelled) => {
+                    // Shutdown raced the render: not an error, just stop.
+                    tracing::info!(
+                        file = %pending.rel_path,
+                        "render cancelled by shutdown"
+                    );
+                    self.publish_status(|s| s.rendering = None);
+                    return;
+                }
+                Err(RenderFileError::Other(e)) => {
                     tracing::error!(
                         file = %pending.rel_path,
                         error = format!("{e:#}"),
@@ -476,31 +519,45 @@ impl Service {
     }
 
     /// Mint (or reuse) the exporter session cookie.
-    async fn ensure_session(&mut self) -> anyhow::Result<String> {
+    async fn ensure_session(
+        &mut self,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<String, RenderFileError> {
         if let Some(s) = &self.session {
             return Ok(s.clone());
         }
         let login_client = PenpotClient::new(&self.cfg.backend_base);
         let email = self.cfg.email.clone();
         let password = self.cfg.password.clone();
-        let outcome = retry::with_retry("login-with-password", retry::rpc_is_transient, || {
-            login_client.login_with_password(&email, &password)
-        })
-        .await?;
+        let outcome = retry::with_retry(
+            "login-with-password",
+            retry::rpc_is_transient,
+            shutdown,
+            || login_client.login_with_password(&email, &password),
+        )
+        .await
+        .map_err(|e| RenderFileError::from_retry("login-with-password", e))?;
         self.session = Some(outcome.auth_token.clone());
         Ok(outcome.auth_token)
     }
 
     /// Render every board of one file (all formats) into a staging dir and
-    /// atomically swap it into `<name>.exports/`.
-    async fn render_file(&mut self, file_id: &str, pending: &PendingRender) -> anyhow::Result<usize> {
+    /// atomically swap it into `<name>.exports/`. Aborts early (without
+    /// touching disk) when `shutdown` flips mid-render.
+    async fn render_file(
+        &mut self,
+        file_id: &str,
+        pending: &PendingRender,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<usize, RenderFileError> {
         let started = std::time::Instant::now();
-        let cookie = self.ensure_session().await?;
+        let cookie = self.ensure_session(shutdown).await?;
         let rpc = self.rpc.clone();
-        let file = retry::with_retry("get-file", retry::rpc_is_transient, || {
+        let file = retry::with_retry("get-file", retry::rpc_is_transient, shutdown, || {
             rpc.get_file(file_id)
         })
-        .await?;
+        .await
+        .map_err(|e| RenderFileError::from_retry("get-file", e))?;
         let boards = list_boards(&file);
         let stems = unique_stems(&boards.iter().map(|b| b.name.clone()).collect::<Vec<_>>());
 
@@ -519,10 +576,18 @@ impl Service {
                 let bytes = retry::with_retry(
                     "render-board",
                     RenderError::is_transient,
+                    shutdown,
                     || self.exporter.render(&cookie, &payload),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("board {:?} ({}): {e}", board.name, format.extension()))?;
+                .map_err(|e| match e {
+                    retry::RetryError::Cancelled => RenderFileError::Cancelled,
+                    retry::RetryError::Op(e) => RenderFileError::Other(anyhow::anyhow!(
+                        "board {:?} ({}): {e}",
+                        board.name,
+                        format.extension()
+                    )),
+                })?;
                 tracing::debug!(
                     board = %board.name,
                     format = format.extension(),
@@ -554,11 +619,11 @@ impl Service {
         let staging = stage_path_for(&exports_dir);
         if let Err(e) = write_staging(&staging, &files, &state) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(anyhow::anyhow!("writing exports staging: {e}"));
+            return Err(RenderFileError::Other(anyhow::anyhow!("writing exports staging: {e}")));
         }
         if let Err(e) = commit_dir_swap(&staging, &exports_dir) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(anyhow::anyhow!("swapping exports dir: {e}"));
+            return Err(RenderFileError::Other(anyhow::anyhow!("swapping exports dir: {e}")));
         }
         tracing::info!(
             file = %pending.rel_path,
@@ -733,6 +798,11 @@ mod tests {
         manifest.save(root).unwrap();
     }
 
+    /// A shutdown receiver that never fires (its sender is kept alive).
+    fn no_shutdown() -> (watch::Sender<bool>, watch::Receiver<bool>) {
+        watch::channel(false)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn status_reflects_pending_and_up_to_date_counts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -740,11 +810,12 @@ mod tests {
         let (tx, rx) = watch::channel(ExportStatusSnapshot::default());
         let mut service = offline_service(root, tx);
         let mut queue = RenderQueue::default();
+        let (_sd_tx, mut sd_rx) = no_shutdown();
 
         // A manifest entry with no exports state: pending (debounce armed,
         // not yet due — poll_once must not try to render offline).
         manifest_with_entry(root, "f1", "proj/home.penpot", "h1");
-        service.poll_once(&mut queue).await;
+        service.poll_once(&mut queue, &mut sd_rx).await;
         let snap = rx.borrow().clone();
         assert_eq!((snap.files_pending, snap.files_up_to_date), (1, 0));
         assert_eq!(snap.rendering, None);
@@ -764,7 +835,7 @@ mod tests {
             .to_bytes(),
         )
         .unwrap();
-        service.poll_once(&mut queue).await;
+        service.poll_once(&mut queue, &mut sd_rx).await;
         let snap = rx.borrow().clone();
         assert_eq!((snap.files_pending, snap.files_up_to_date), (0, 1));
         assert_eq!(snap.last_error, None);
@@ -779,13 +850,14 @@ mod tests {
         // Fast retries so the offline render fails quickly under paused time.
         service.cfg.debounce = Duration::from_millis(1);
         let mut queue = RenderQueue::default();
+        let (_sd_tx, mut sd_rx) = no_shutdown();
         manifest_with_entry(root, "f1", "proj/home.penpot", "h1");
 
         // Arm, then let the debounce elapse: the render runs and fails
         // (nothing listens on 127.0.0.1:9), which must surface in the status.
-        service.poll_once(&mut queue).await;
+        service.poll_once(&mut queue, &mut sd_rx).await;
         tokio::time::advance(Duration::from_millis(2)).await;
-        service.poll_once(&mut queue).await;
+        service.poll_once(&mut queue, &mut sd_rx).await;
         let snap = rx.borrow_and_update().clone();
         assert!(snap.last_error.is_some(), "offline render failure must be recorded");
         assert!(snap.last_error.as_deref().unwrap().contains("proj/home.penpot"));
@@ -793,8 +865,40 @@ mod tests {
 
         // Idle cycle with an unchanged world: no new notification.
         // (The file sits in its retry cooldown → counts do not change.)
-        service.poll_once(&mut queue).await;
+        service.poll_once(&mut queue, &mut sd_rx).await;
         assert!(!rx.has_changed().unwrap(), "idle poll must not publish");
+    }
+
+    /// N2 bug-B regression at the service level: `stop()` during a failing
+    /// render batch must resolve within seconds of virtual time — the old
+    /// ladder rode out ~90 s of backoff per board first (observed 5–7 min
+    /// wall-clock exits in M5).
+    #[tokio::test(start_paused = true)]
+    async fn stop_during_a_failing_render_batch_is_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        manifest_with_entry(root, "f1", "proj/home.penpot", "h1");
+        let cfg = {
+            let mut c = ExportConfig::new(
+                root,
+                "http://127.0.0.1:9", // nothing listens: every render fails
+                "http://127.0.0.1:9",
+                "x@local",
+                "pw",
+                "profile",
+            );
+            c.poll_interval = Duration::from_millis(20);
+            c.debounce = Duration::from_millis(1);
+            c
+        };
+        let handle = spawn(PenpotClient::new("http://127.0.0.1:9"), cfg);
+        // Let the service arm + start the failing render (login retry ladder).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Shutdown must win against the in-flight ladder well inside 20 s of
+        // virtual time (the SIGTERM budget the artifact test enforces).
+        tokio::time::timeout(Duration::from_secs(20), handle.stop())
+            .await
+            .expect("stop() must not ride out the retry ladder");
     }
 
     // ---------------- orphan sweep ----------------

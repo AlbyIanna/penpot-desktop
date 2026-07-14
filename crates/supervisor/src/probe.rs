@@ -75,3 +75,31 @@ pub async fn tcp_open(port: u16) -> Result<(), String> {
         .map(|_| ())
         .map_err(|e| format!("connect: {e}"))
 }
+
+/// Is something already LISTENing on `port` (loopback-reachable)? A connect
+/// probe is used instead of a bind test because BSD `SO_REUSEADDR` semantics
+/// let a specific-address bind succeed while a stale process still holds the
+/// wildcard `0.0.0.0:<port>` — exactly the stale-exporter case this guards
+/// (post-M5 debt #1).
+pub async fn port_has_listener(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Pids of the processes LISTENing on `port` (best-effort, via `lsof`; empty
+/// when `lsof` is unavailable or reports nothing). Blocking — call from a
+/// blocking context or accept the short stall (lsof on one port is fast).
+pub fn listener_pids(port: u16) -> Vec<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|t| t.parse::<u32>().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
