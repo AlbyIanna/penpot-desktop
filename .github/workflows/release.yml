@@ -1,0 +1,349 @@
+# GitHub Releases distribution pipeline for Penpot Local.
+#
+# Produces the two user-installable artifacts and attaches them to a GitHub
+# Release for the tag:
+#   * macOS arm64  ->  Penpot-Local_<version>_macos-arm64.dmg
+#   * Linux x86_64 ->  Penpot-Local_<version>_linux-x86_64.AppImage
+#
+# The build recipes are lifted verbatim from the proven package.yml jobs
+# (macos-dmg, linux-appimage): same SHA-pinned third-party actions, same
+# runtime-bundle + slim-tauri + post-linuxdeploy inject flow. This workflow
+# adds only: (1) version derivation from the git tag, (2) canonical asset
+# naming, (3) a publish job that cuts the Release.
+#
+# Triggers:
+#   * push tag v*         -> a real release for that tag (prerelease=false)
+#   * workflow_dispatch   -> a validation run: builds, then cuts a DELETABLE
+#                            prerelease under a throwaway tag. Used by the
+#                            ReleaseCI phase so validation needs no permanent tag.
+#
+# Version derivation: taken from the tag (v0.2.0 -> 0.2.0), never hardcoded.
+# The workspace Cargo.toml version is patched IN THE RUNNER (ephemeral, never
+# committed) so tauri names the bundle with the released version. Bumping the
+# committed workspace version (e.g. 0.1.0 -> 0.2.0) is a separate product-owner
+# decision; this workflow does not depend on it. See docs/RELEASES.md.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, no leading v (e.g. 0.2.0-rc1). Used for dispatch validation runs."
+        required: true
+        default: "0.0.0-dev"
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        type: boolean
+        default: true
+
+# gh release create/edit/upload need write access to Contents (also creates the
+# tag ref on a workflow_dispatch validation run).
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve version/tag/prerelease once, share via outputs.
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - id: v
+        env:
+          # Pass untrusted context through env (never interpolate github.* into
+          # the shell body — command-injection surface).
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            TAG="v${VERSION}"
+            PRERELEASE="$INPUT_PRERELEASE"
+          else
+            TAG="$REF_NAME"
+            VERSION="${TAG#v}"
+            PRERELEASE="false"
+          fi
+          # Reject anything that is not a sane semver-ish token: injection guard
+          # AND a fail-fast for a malformed tag.
+          case "$VERSION" in
+            *[!A-Za-z0-9.+-]*|"") echo "invalid version: '$VERSION'" >&2; exit 1 ;;
+          esac
+          if [ -z "$VERSION" ]; then echo "empty version" >&2; exit 1; fi
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >>"$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >>"$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION tag=$TAG prerelease=$PRERELEASE"
+
+  # ---------------------------------------------------------------------------
+  # macOS arm64 dmg: crane path (no docker on macOS runners) + build-dmg.sh.
+  # Recipe mirrors package.yml:macos-dmg.
+  # ---------------------------------------------------------------------------
+  macos-dmg:
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin bundle version from the release tag (ephemeral, not committed)
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+          v = os.environ["RELEASE_VERSION"]
+          p = pathlib.Path("Cargo.toml")
+          s = p.read_text()
+          s, n = re.subn(r'(?m)^version = "[^"]*"', f'version = "{v}"', s, count=1)
+          assert n == 1, "workspace version line not found in Cargo.toml"
+          p.write_text(s)
+          print(f"workspace version -> {v}")
+          PY
+
+      - name: Install homebrew deps (JDK 26, valkey, ImageMagick)
+        run: |
+          brew install --quiet openjdk valkey imagemagick
+          /opt/homebrew/opt/openjdk/bin/java --version
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: macos-dmg
+
+      - name: Cache runtime-bundle components (dist/)
+        uses: actions/cache@v4
+        with:
+          path: dist
+          key: macos-runtime-bundle-${{ hashFiles('scripts/build-runtime-bundle.sh') }}
+
+      - name: Install tauri-cli
+        uses: cargo-bins/cargo-binstall@802977a265b5f8825ebef2176db5f5f3edc82280 # main 2026-07
+      - run: cargo binstall -y --force tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked --force
+
+      - name: Build the macOS penpot-runtime bundle (crane path + proofs)
+        run: bash scripts/build-runtime-bundle.sh --no-docker
+
+      - name: Build the dmg
+        run: bash scripts/build-dmg.sh --skip-bundle
+
+      - name: Stage dmg under a canonical asset name
+        id: stage
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euxo pipefail
+          SRC="$(ls -t target/release/bundle/dmg/*.dmg | head -1)"
+          test -n "$SRC"
+          mkdir -p staging
+          DEST="staging/Penpot-Local_${VERSION}_macos-arm64.dmg"
+          cp "$SRC" "$DEST"
+          ls -la staging/
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: penpot-local-dmg
+          path: staging/*.dmg
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux x86_64 AppImage: runtime bundle (linux builder) + slim tauri appimage
+  # + post-linuxdeploy inject + appimagetool repack.
+  # Recipe mirrors package.yml:linux-appimage (build + inject legs only; the
+  # headless-smoke / xvfb gates belong to the serialized Gates phase, not the
+  # release build).
+  # ---------------------------------------------------------------------------
+  linux-appimage:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # M5 path hygiene: keep builder paths out of release binaries (see package.yml).
+      RUSTFLAGS: --remap-path-prefix=/home/runner=/build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin bundle version from the release tag (ephemeral, not committed)
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+          v = os.environ["RELEASE_VERSION"]
+          p = pathlib.Path("Cargo.toml")
+          s = p.read_text()
+          s, n = re.subn(r'(?m)^version = "[^"]*"', f'version = "{v}"', s, count=1)
+          assert n == 1, "workspace version line not found in Cargo.toml"
+          p.write_text(s)
+          print(f"workspace version -> {v}")
+          PY
+
+      - name: Install Tauri v2 + bundle-builder system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev librsvg2-common libxdo-dev libssl-dev build-essential \
+            curl wget file gettext desktop-file-utils libglib2.0-bin \
+            patchelf squashfs-tools xvfb libfuse2t64 libossp-uuid16
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: linux-appimage
+
+      - name: Cache runtime-bundle components (dist/)
+        uses: actions/cache@v4
+        with:
+          path: dist
+          key: linux-runtime-bundle-${{ hashFiles('scripts/build-runtime-bundle-linux.sh') }}
+
+      - name: Install tauri-cli
+        uses: cargo-bins/cargo-binstall@802977a265b5f8825ebef2176db5f5f3edc82280 # main 2026-07
+      - run: cargo binstall -y --force tauri-cli@2.11.4 || cargo install tauri-cli --version 2.11.4 --locked --force
+
+      - name: Build the Linux penpot-runtime bundle (docker path + proofs)
+        run: bash scripts/build-runtime-bundle-linux.sh
+
+      - name: Build the AppImage (slim — WITHOUT the runtime resources)
+        run: |
+          # No tauri.bundle.conf.json overlay: linuxdeploy dependency-scans every
+          # ELF in the AppDir and hard-fails on the jlink'd JRE / rewrites the
+          # relocated valkey+postgres rpaths. The runtime bundle is injected
+          # AFTER linuxdeploy, below. (Verbatim from package.yml.)
+          rm -rf target/release/penpot-runtime
+          cd apps/desktop
+          CI=true NO_STRIP=true cargo tauri build --verbose --bundles appimage
+          ls -la ../../target/release/bundle/appimage/
+
+      - name: Inject penpot-runtime into the AppImage and repack
+        run: |
+          set -euxo pipefail
+          cd target/release/bundle/appimage
+          APPIMAGE="$(ls *.AppImage | head -1)"
+          ./"$APPIMAGE" --appimage-extract >/dev/null
+          # layout.rs discovery path: <exe_dir>/../lib/penpot-desktop/penpot-runtime
+          mkdir -p squashfs-root/usr/lib/penpot-desktop
+          cp -a "$GITHUB_WORKSPACE/dist/penpot-runtime" squashfs-root/usr/lib/penpot-desktop/penpot-runtime
+          rm -rf squashfs-root/usr/lib/penpot-desktop/penpot-runtime/.cache
+          # appimagetool = mksquashfs + embedded runtime, NO dependency analysis
+          # — the injected bundle stays byte-exact. Pinned 1.9.1.
+          curl -fsSL --retry 3 -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+          rm -f "$APPIMAGE"
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
+          rm -rf squashfs-root appimagetool
+          ls -la
+
+      - name: Stage AppImage under a canonical asset name
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euxo pipefail
+          SRC="$(ls -t target/release/bundle/appimage/*.AppImage | head -1)"
+          test -n "$SRC"
+          mkdir -p staging
+          cp "$SRC" "staging/Penpot-Local_${VERSION}_linux-x86_64.AppImage"
+          ls -la staging/
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: penpot-local-appimage
+          path: staging/*.AppImage
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish: gather both artifacts and create/update the GitHub Release.
+  # Uses the preinstalled gh CLI (no third-party action to SHA-pin) — creates
+  # the tag ref on a workflow_dispatch validation run so it is fully deletable.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [prepare, macos-dmg, linux-appimage]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          DMG="$(ls artifacts/*/Penpot-Local_*_macos-arm64.dmg | head -1)"
+          APPIMAGE="$(ls artifacts/*/Penpot-Local_*_linux-x86_64.AppImage | head -1)"
+          test -f "$DMG"
+          test -f "$APPIMAGE"
+
+          BODY_FILE="$(mktemp)"
+          cat >"$BODY_FILE" <<EOF
+          Penpot Local ${VERSION} — offline, local-first Penpot desktop.
+
+          ## Downloads
+
+          | Platform | Asset |
+          |---|---|
+          | macOS (Apple Silicon) | \`$(basename "$DMG")\` |
+          | Linux (x86_64) | \`$(basename "$APPIMAGE")\` |
+
+          ## macOS (Apple Silicon / arm64)
+
+          - Requires **macOS 15.4 or newer** on an **Apple Silicon** Mac. Intel Macs are not supported.
+          - The app is **ad-hoc signed** (no Developer ID, not notarized). On first launch Gatekeeper blocks a double-click. **Right-click the app → Open**, then confirm — or run \`xattr -d com.apple.quarantine "/Applications/Penpot Local.app"\`. Subsequent launches open normally.
+
+          ## Linux (x86_64)
+
+          - **x86_64 only** (no arm64 AppImage).
+          - Requires **FUSE** to run the AppImage (\`sudo apt install libfuse2\` on Debian/Ubuntu, or run with \`--appimage-extract-and-run\`).
+          - The bundled runtime relies on a small set of host system libraries per the AppImage excludelist convention (fontconfig / X11 / glib for ImageMagick, krb5 / libxml2 for postgres). Present on normal desktop distros; absent in minimal containers.
+
+          Everything runs offline — the embedded Postgres, Valkey, backend JVM, proxy, and packaged exporter ship inside the artifact. No account, no network.
+          EOF
+
+          FLAGS=()
+          if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating notes/flags."
+            gh release edit "$TAG" --notes-file "$BODY_FILE" "${FLAGS[@]}"
+          else
+            echo "Creating release $TAG (target $GITHUB_SHA)."
+            gh release create "$TAG" \
+              --title "Penpot Local ${VERSION}" \
+              --notes-file "$BODY_FILE" \
+              --target "$GITHUB_SHA" \
+              "${FLAGS[@]}"
+          fi
+
+          gh release upload "$TAG" "$DMG" "$APPIMAGE" --clobber
+          echo "Attached:"
+          echo "  $(basename "$DMG")"
+          echo "  $(basename "$APPIMAGE")"

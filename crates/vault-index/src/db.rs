@@ -177,6 +177,21 @@ impl IndexDb {
     }
 }
 
+/// One board row of the index, the raw material of the lighttable grid
+/// (N3). Serialized camelCase for the HTTP API's board listing.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardRow {
+    /// Manifest key (== the file uuid); joins to the manifest for project +
+    /// recency and to the exports dir for the thumbnail.
+    pub owner_id: String,
+    pub file_id: String,
+    pub page_id: String,
+    pub board_id: String,
+    pub name: String,
+    pub rel_path: String,
+}
+
 // ---------------------------------------------------------------------------
 // Search (read side — separate connections, safe under WAL while the
 // service writes)
@@ -273,6 +288,49 @@ impl SearchHandle {
         }
         Ok(out)
     }
+
+    /// Every board (`kind = 'board'`) in the index, deterministically ordered
+    /// (rel_path, board_id) so a rebuilt index lists boards identically. This
+    /// is a full scan of an UNINDEXED column — cheap at vault scale (hundreds
+    /// of files) and never on the search hot path. Powers the `/__api/vault/
+    /// boards` lighttable listing (N3).
+    pub fn all_boards(&self) -> Result<Vec<BoardRow>, SearchError> {
+        let conn = Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| SearchError::NotReady)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| SearchError::Other(e.into()))?;
+        let sql = "
+            SELECT owner_id, file_id, page_id, board_id, name, rel_path
+            FROM docs
+            WHERE kind = 'board'
+            ORDER BY rel_path, board_id";
+        let mut stmt = conn.prepare(sql).map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(_, Some(ref m)) if m.contains("no such table") => {
+                SearchError::NotReady
+            }
+            e => SearchError::Other(e.into()),
+        })?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(BoardRow {
+                    owner_id: r.get(0)?,
+                    file_id: r.get(1)?,
+                    page_id: r.get(2)?,
+                    board_id: r.get(3)?,
+                    name: r.get(4)?,
+                    rel_path: r.get(5)?,
+                })
+            })
+            .map_err(|e| SearchError::Other(e.into()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| SearchError::Other(e.into()))?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -331,6 +389,64 @@ mod tests {
         db.remove_file("f1").unwrap();
         assert_eq!(db.docs_total().unwrap(), 0);
         assert!(db.indexed_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_boards_lists_only_boards_deterministically() {
+        // A board doc: object_id == board_id (per extract::shape_doc).
+        fn board(id: &str, name: &str) -> DocRow {
+            DocRow {
+                kind: DocKind::Board,
+                name: name.into(),
+                body: name.into(),
+                file_id: "f".into(),
+                page_id: "p".into(),
+                object_id: id.into(),
+                board_id: id.into(),
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("idx.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        // Two files, boards + non-board docs interleaved.
+        db.replace_file(
+            "f2",
+            "z/last.penpot",
+            "h",
+            &[board("bZ", "Cover"), doc(DocKind::Text, "some copy", "tZ")],
+        )
+        .unwrap();
+        db.replace_file(
+            "f1",
+            "a/first.penpot",
+            "h",
+            &[
+                board("bB", "Hero"),
+                board("bA", "Footer"),
+                doc(DocKind::Color, "Teal", "cA"),
+            ],
+        )
+        .unwrap();
+        let boards = SearchHandle::new(&path).all_boards().unwrap();
+        // Only kind=board rows, ordered by (rel_path, board_id).
+        assert_eq!(
+            boards
+                .iter()
+                .map(|b| (b.rel_path.as_str(), b.board_id.as_str(), b.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a/first.penpot", "bA", "Footer"),
+                ("a/first.penpot", "bB", "Hero"),
+                ("z/last.penpot", "bZ", "Cover"),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_boards_on_missing_db_is_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let search = SearchHandle::new(tmp.path().join("nope.sqlite3"));
+        assert!(matches!(search.all_boards(), Err(SearchError::NotReady)));
     }
 
     #[test]
