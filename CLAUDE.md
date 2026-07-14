@@ -1,7 +1,9 @@
 # Penpot Local
 
 A local-first desktop app wrapping Penpot's open-source stack. Read [PLAN.md](PLAN.md) first;
-milestone status and architecture decisions live there. M0 evidence is in `docs/m0/`.
+milestone status and architecture decisions live there. M0 evidence is in `docs/m0/`. The
+project's durable values are in [docs/ecosystem-concept.md](docs/ecosystem-concept.md) — the
+"why"; specific designs may change, those principles don't.
 
 ## Core invariant (P0 if it ever fails)
 
