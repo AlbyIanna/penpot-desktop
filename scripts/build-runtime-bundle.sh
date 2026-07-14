@@ -608,8 +608,18 @@ WRAPEOF
     fi
     log "exporting ${EXPORTER_IMAGE} via crane (no docker daemon) ..."
     mkdir -p "$STAGING/.exporter-rootfs"
+    # Exclude node_modules from the extraction: the image ships a pnpm layout
+    # whose files are HARD-LINKS into opt/penpot/.local/share/pnpm/store (a path
+    # OUTSIDE the `opt/penpot/exporter` filter), so `tar` would abort with
+    # "Hard-link target ... does not exist" on the macOS runner's bsdtar. We
+    # don't need it anyway — the node_modules tree is deleted immediately below
+    # and re-materialized HOISTED from the pinned pnpm-lock.yaml. We only need
+    # the app files (app.js, package.json, pnpm-lock.yaml) from the image.
     "$CRANE" export "$EXPORTER_IMAGE" - --platform linux/arm64 \
-      | tar -xf - -C "$STAGING/.exporter-rootfs" opt/penpot/exporter \
+      | tar -xf - -C "$STAGING/.exporter-rootfs" \
+          --exclude 'opt/penpot/exporter/node_modules/*' \
+          --exclude 'opt/penpot/exporter/node_modules' \
+          opt/penpot/exporter \
       || die "crane export of $EXPORTER_IMAGE failed"
     EXPORTER_SRC="$STAGING/.exporter-rootfs/opt/penpot/exporter"
   fi
