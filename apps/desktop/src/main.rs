@@ -9,12 +9,15 @@
 
 use std::sync::Arc;
 
+use penpot_desktop::control::{self, VaultRunner};
 use penpot_desktop::overlay::{self, ProxyUrlSlot};
-use penpot_desktop::{boot, AppConfig, RunningApp};
+use penpot_desktop::AppConfig;
 use tauri::{Manager, RunEvent};
 use tokio::sync::Mutex;
 
-type SharedApp = Arc<Mutex<Option<RunningApp>>>;
+/// The live vault runner (owns the stack; swaps it on `File > Open Vault`).
+/// `None` until boot completes.
+type SharedRunner = Arc<Mutex<Option<Arc<VaultRunner>>>>;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -24,7 +27,7 @@ fn main() {
         )
         .init();
 
-    let running: SharedApp = Arc::new(Mutex::new(None));
+    let running: SharedRunner = Arc::new(Mutex::new(None));
     let running_setup = running.clone();
 
     // N4: the palette overlay's proxy origin, filled once boot completes.
@@ -94,6 +97,69 @@ fn main() {
                 .unwrap_or(false);
             let export_bridge = penpot_desktop::status::ExportStatusBridge::new();
             let exports_rx = exports_enabled.then(|| export_bridge.subscribe());
+
+            // N5: the tray "Open Vault…" action drives the vault switch through
+            // the runner. macOS-only native folder picker (manual-QA surface —
+            // the mechanism itself is gated headlessly, PLAN2 design item 4).
+            let on_open_vault: Option<penpot_desktop::tray::OpenVaultCb> = if demo {
+                None
+            } else {
+                let holder = running_setup.clone();
+                let handle_cb = app.handle().clone();
+                let bridge_cb = bridge.clone();
+                let export_bridge_cb = export_bridge.clone();
+                Some(Arc::new(move || {
+                    let holder = holder.clone();
+                    let handle_cb = handle_cb.clone();
+                    let bridge_cb = bridge_cb.clone();
+                    let export_bridge_cb = export_bridge_cb.clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Pick a folder off the UI thread (osascript blocks).
+                        let picked = tauri::async_runtime::spawn_blocking(|| {
+                            penpot_desktop::dialog::choose_folder("Choose your design vault")
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        let Some(path) = picked else { return };
+                        let runner = { holder.lock().await.clone() };
+                        let Some(runner) = runner else {
+                            tracing::warn!("open vault: still booting; ignoring switch request");
+                            return;
+                        };
+                        match runner.switch_to(&path).await {
+                            Ok(vref) => {
+                                tracing::info!(vault = %vref.path, "open vault: switch complete");
+                                // Re-bind the tray to the new stack.
+                                if let (Some(status), Some(sc)) =
+                                    (runner.sync_status().await, runner.sync_control().await)
+                                {
+                                    bridge_cb.attach(status, sc);
+                                }
+                                if let Some(ex) = runner.export_status().await {
+                                    export_bridge_cb.attach(ex);
+                                }
+                                // Reload the window onto the new vault's home.
+                                if let Some(window) = handle_cb.get_webview_window("main") {
+                                    if let Ok(url) = format!("{}/__bootstrap", runner.proxy_url())
+                                        .parse::<tauri::Url>()
+                                    {
+                                        let _ = window.navigate(url);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("open vault failed: {e:#}");
+                                penpot_desktop::dialog::native_error_dialog(
+                                    "Penpot Local — Open Vault failed",
+                                    &format!("{e:#}"),
+                                );
+                            }
+                        }
+                    });
+                }) as penpot_desktop::tray::OpenVaultCb)
+            };
+
             let tray_result = if demo {
                 let mock = Arc::new(penpot_desktop::status::MockStatusSource::new(
                     Default::default(),
@@ -105,6 +171,7 @@ fn main() {
                     designs_dir,
                     None,
                     proxy_slot_setup.clone(),
+                    None,
                 );
                 tauri::async_runtime::spawn(async move {
                     mock.play_demo(std::time::Duration::from_secs(4)).await;
@@ -118,6 +185,7 @@ fn main() {
                     designs_dir,
                     exports_rx,
                     proxy_slot_setup.clone(),
+                    on_open_vault,
                 )
             };
             if let Err(e) = tray_result {
@@ -126,25 +194,27 @@ fn main() {
             // The window already shows placeholder-dist ("booting…"); bring
             // the stack up asynchronously and swap the URL when ready.
             tauri::async_runtime::spawn(async move {
+                // N5: resolve the active vault (registry + interrupted-switch
+                // recovery), then boot it; the runner owns the stack and swaps
+                // it on `File > Open Vault`.
                 let booted = match config {
-                    Ok(config) => boot(config).await,
+                    Ok(config) => control::boot_active_vault(config).await,
                     Err(e) => Err(e),
                 };
                 match booted {
-                    Ok(running_app) => {
+                    Ok(runner) => {
                         // N4: publish the proxy origin so the palette overlay
                         // (global shortcut + tray) can reach /__palette.
                         if let Ok(mut slot) = proxy_slot_boot.lock() {
-                            *slot = Some(running_app.proxy_url.clone());
+                            *slot = Some(runner.proxy_url());
                         }
-                        let url: tauri::Url = running_app
-                            .bootstrap_url()
+                        let url: tauri::Url = format!("{}/__bootstrap", runner.proxy_url())
                             .parse()
                             .expect("bootstrap url is valid");
                         // Bind the tray to the real sync daemon (no-op in
                         // demo mode, where the tray watches the mock).
                         if !demo {
-                            match (running_app.sync_status(), running_app.sync_control()) {
+                            match (runner.sync_status().await, runner.sync_control().await) {
                                 (Some(status), Some(control)) => {
                                     bridge.attach(status, control);
                                     tracing::info!("tray bound to the sync daemon");
@@ -154,12 +224,12 @@ fn main() {
                                 ),
                             }
                             // M5: bind the "Exports:" row to board-export.
-                            if let Some(status) = running_app.export_status() {
+                            if let Some(status) = runner.export_status().await {
                                 export_bridge.attach(status);
                                 tracing::info!("tray bound to the board-export service");
                             }
                         }
-                        *running.lock().await = Some(running_app);
+                        *running.lock().await = Some(runner);
                         if let Some(window) = handle.get_webview_window("main") {
                             if let Err(e) = window.navigate(url) {
                                 tracing::error!("failed to navigate to penpot: {e}");
@@ -224,8 +294,8 @@ fn main() {
             // child processes outlive the app.
             let running = running.clone();
             tauri::async_runtime::block_on(async move {
-                if let Some(app) = running.lock().await.take() {
-                    app.shutdown().await;
+                if let Some(runner) = running.lock().await.take() {
+                    runner.shutdown().await;
                 }
             });
         }

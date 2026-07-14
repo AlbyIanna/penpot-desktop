@@ -198,7 +198,7 @@ creates exactly one commit containing manifest + `.penpot` dirs, on a pre-existi
 adds exactly one commit rewriting no history, and with no edits since the last checkpoint
 is a clean no-op — all asserted via `git log`/`git status`.
 
-### N5 — Vaults, plural (adversarial zero-spill; needs N3; scope decision in risk 3)
+### N5 — Vaults, plural (adversarial zero-spill; needs N3; scope decision in risk 3) — ✅ DONE 2026-07-14 (registry + `.penpot-vault/` id marker + switch-in-progress marker; `File > Open Vault` = M2 DB-wipe→reconcile pointed at a new tree, headless-driven via a localhost control endpoint `POST /open {path}`; `scripts/n5-vaults.sh` all-green: A→B→A zero cross-vault spill (DB/boards/index) after every switch, original file ids preserved on BOTH vaults, trees byte-identical, mid-switch SIGKILL→reboot recovers FORWARD to a single consistent vault; switch ≈10 s; GUI picker manual-QA)
 Goal: first-run vault picker; File > Open Vault switching via DB reset + reconcile;
 vault-identity marker + settings in a vault dotfolder.
 **Exit criteria:** `scripts/n5-vaults.sh` creates vaults A and B with overlapping project

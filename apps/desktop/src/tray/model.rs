@@ -20,6 +20,8 @@ pub const GIT_INIT_ID: &str = "designs-git-init";
 pub const QUICK_OPEN_ID: &str = "quick-open-palette";
 /// Menu item id of "Checkpoint now" (N4b manual git checkpoint verb).
 pub const CHECKPOINT_ID: &str = "vault-checkpoint-now";
+/// Menu item id of "Open Vault…" (N5 — switch to a different design vault).
+pub const OPEN_VAULT_ID: &str = "vault-open";
 /// Per-file rows have id `sync-file:<relative path>`; the wiring layer strips
 /// this prefix to get the path to reveal.
 pub const FILE_ROW_PREFIX: &str = "sync-file:";
@@ -56,6 +58,8 @@ pub enum MenuEntry {
     QuickOpen { label: String },
     /// "Checkpoint now" — the N4b manual git checkpoint. Id [`CHECKPOINT_ID`].
     Checkpoint { label: String },
+    /// "Open Vault…" — the N5 switch-vault action. Id [`OPEN_VAULT_ID`].
+    OpenVault { label: String },
     /// The pause/resume toggle (enabled). Always has id [`PAUSE_TOGGLE_ID`].
     PauseToggle { label: String },
     Separator,
@@ -259,6 +263,9 @@ pub fn build_menu_model(
         });
         entries.push(MenuEntry::OpenDesigns {
             label: "Open Designs Folder".to_string(),
+        });
+        entries.push(MenuEntry::OpenVault {
+            label: "Open Vault…".to_string(),
         });
         entries.push(MenuEntry::GitInit {
             label: "Enable git versioning".to_string(),
@@ -587,6 +594,13 @@ mod tests {
             .filter(|e| matches!(e, MenuEntry::GitInit { label } if label == "Enable git versioning"))
             .count();
         assert_eq!((opens, gits), (1, 1));
+        // N5: exactly one "Open Vault…" switch action.
+        let open_vaults = model
+            .entries
+            .iter()
+            .filter(|e| matches!(e, MenuEntry::OpenVault { label } if label == "Open Vault…"))
+            .count();
+        assert_eq!(open_vaults, 1);
     }
 
     #[test]
