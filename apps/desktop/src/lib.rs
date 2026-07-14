@@ -7,6 +7,7 @@
 //! local proxy with the `/__bootstrap` auto-login route → expose readiness.
 
 pub mod checkpoint;
+pub mod control;
 pub mod dialog;
 pub mod gitinit;
 pub mod home;
@@ -16,6 +17,7 @@ pub mod preflight;
 pub mod reveal;
 pub mod status;
 pub mod tray;
+pub mod vault;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

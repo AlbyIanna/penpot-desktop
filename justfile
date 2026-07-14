@@ -64,6 +64,16 @@ n3:
 n4:
     bash scripts/n4-palette.sh
 
+# N5 vaults, plural (adversarial zero-spill): two vaults A/B with overlapping
+# project names, switch A→B→A headlessly via the localhost control endpoint
+# (POST /open {path}); after EVERY switch assert ZERO cross-vault spill
+# (DB/get-project-files, /__api/vault/boards, /__api/vault/search), original
+# file ids preserved, both .penpot trees byte-identical (user disk untouched),
+# per-vault M2 wipe→rebuild on both; a mid-switch SIGKILL + reboot recovers to
+# a consistent single vault (the target) with no cross-contamination/orphans.
+n5:
+    bash scripts/n5-vaults.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -86,6 +96,7 @@ e2e:
     bash scripts/n2-thumbs.sh
     bash scripts/n3-home.sh
     bash scripts/n4-palette.sh
+    bash scripts/n5-vaults.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

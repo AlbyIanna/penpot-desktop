@@ -26,11 +26,16 @@ use crate::overlay::{self, ProxyUrlSlot};
 use crate::status::{ExportStatusSnapshot, SyncControl, SyncStatusSnapshot};
 use model::{
     build_menu_model, icon_pixels, AggregateState, MenuEntry, MenuModel, CHECKPOINT_ID,
-    FILE_ROW_PREFIX, GIT_INIT_ID, ICON_SIZE, OPEN_DESIGNS_ID, PAUSE_TOGGLE_ID, QUICK_OPEN_ID,
-    QUIT_ID,
+    FILE_ROW_PREFIX, GIT_INIT_ID, ICON_SIZE, OPEN_DESIGNS_ID, OPEN_VAULT_ID, PAUSE_TOGGLE_ID,
+    QUICK_OPEN_ID, QUIT_ID,
 };
 
 const TRAY_ID: &str = "penpot-sync-status";
+
+/// N5: callback the "Open Vault…" tray entry fires (the GUI's `File > Open
+/// Vault`). It picks a folder and drives the vault switch through the
+/// [`crate::control::VaultRunner`]; `None` in demo mode / before boot.
+pub type OpenVaultCb = Arc<dyn Fn() + Send + Sync>;
 
 fn icon(state: AggregateState) -> Image<'static> {
     Image::new_owned(icon_pixels(state), ICON_SIZE, ICON_SIZE)
@@ -73,6 +78,9 @@ fn build_tauri_menu<R: Runtime>(
             }
             MenuEntry::Checkpoint { label } => {
                 menu.append(&MenuItem::with_id(app, CHECKPOINT_ID, label, true, None::<&str>)?)?;
+            }
+            MenuEntry::OpenVault { label } => {
+                menu.append(&MenuItem::with_id(app, OPEN_VAULT_ID, label, true, None::<&str>)?)?;
             }
             MenuEntry::PauseToggle { label } => {
                 menu.append(&MenuItem::with_id(
@@ -119,6 +127,7 @@ pub fn spawn_tray<R: Runtime>(
     designs_dir: Option<PathBuf>,
     exports_rx: Option<watch::Receiver<ExportStatusSnapshot>>,
     proxy_slot: ProxyUrlSlot,
+    on_open_vault: Option<OpenVaultCb>,
 ) -> tauri::Result<()> {
     let designs_available = designs_dir.is_some();
     let exports_snapshot = exports_rx.as_ref().map(|r| r.borrow().clone());
@@ -163,6 +172,12 @@ pub fn spawn_tray<R: Runtime>(
             QUICK_OPEN_ID => {
                 tracing::info!("tray: quick open (palette)");
                 overlay::toggle_palette(app, &proxy_slot_for_events);
+            }
+            OPEN_VAULT_ID => {
+                tracing::info!("tray: open vault (switch) requested");
+                if let Some(cb) = &on_open_vault {
+                    cb();
+                }
             }
             CHECKPOINT_ID => {
                 if let Some(designs) = designs_for_checkpoint.clone() {
