@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vault search</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; font-weight: 600; }
+  form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  input[type=search] { flex: 1; font: inherit; padding: .45rem .6rem;
+    border: 1px solid #8884; border-radius: 6px; background: transparent; color: inherit; }
+  button { font: inherit; padding: .45rem .9rem; border: 1px solid #8884;
+    border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+  #meta { color: #888; font-size: .85rem; margin: .5rem 0; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { padding: .5rem .25rem; border-bottom: 1px solid #8882; }
+  li a { text-decoration: none; color: inherit; display: block; }
+  li a:hover .name { text-decoration: underline; }
+  .kind { display: inline-block; font-size: .7rem; text-transform: uppercase;
+    letter-spacing: .05em; color: #888; border: 1px solid #8884; border-radius: 4px;
+    padding: 0 .35rem; margin-right: .5rem; vertical-align: middle; }
+  .name { font-weight: 600; }
+  .snippet { color: #999; }
+  .snippet b { color: inherit; font-weight: 700; }
+  .path { font-size: .78rem; color: #777; }
+</style>
+</head>
+<body>
+<h1>Vault search</h1>
+<form id="f" action="/__search" method="get">
+  <input id="q" name="q" type="search" placeholder="Search text layers, boards, components, colors, typographies…" autofocus>
+  <button type="submit">Search</button>
+</form>
+<div id="meta"></div>
+<ul id="results"></ul>
+<script>
+(function () {
+  var form = document.getElementById('f');
+  var input = document.getElementById('q');
+  var meta = document.getElementById('meta');
+  var list = document.getElementById('results');
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
+    });
+  }
+  // The API marks matches with « »; convert to <b> AFTER escaping.
+  function snippetHtml(s) {
+    return esc(s).replace(/«/g, '<b>').replace(/»/g, '</b>');
+  }
+
+  function render(data) {
+    meta.textContent = data.count + ' hit' + (data.count === 1 ? '' : 's') +
+      ' · ' + data.tookMs.toFixed(1) + ' ms';
+    list.innerHTML = data.hits.map(function (h) {
+      return '<li><a href="' + esc(h.deepLink) + '">' +
+        '<span class="kind">' + esc(h.kind) + '</span>' +
+        '<span class="name">' + esc(h.name || '(unnamed)') + '</span> ' +
+        '<span class="snippet">' + snippetHtml(h.snippet) + '</span>' +
+        '<div class="path">' + esc(h.relPath) + '</div>' +
+        '</a></li>';
+    }).join('');
+  }
+
+  function run(q) {
+    if (!q) { meta.textContent = ''; list.innerHTML = ''; return; }
+    fetch('/__api/vault/search?q=' + encodeURIComponent(q))
+      .then(function (r) {
+        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+        return r.json();
+      })
+      .then(render)
+      .catch(function (e) { meta.textContent = 'Search failed: ' + e.message; });
+  }
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var q = input.value.trim();
+    var url = new URL(window.location.href);
+    if (q) { url.searchParams.set('q', q); } else { url.searchParams.delete('q'); }
+    history.replaceState(null, '', url);
+    run(q);
+  });
+
+  var initial = new URLSearchParams(window.location.search).get('q') || '';
+  if (initial) { input.value = initial; run(initial); }
+})();
+</script>
+</body>
+</html>

@@ -19,8 +19,13 @@
 #     postgres/$POSTGRES_VERSION/   theseus postgresql_embedded pre-seed
 #     licenses/  MANIFEST.json  VERSION  .fingerprint
 #
-# node is deliberately NOT bundled (same rationale + live proof as macOS:
-# penpot 2.16.2 never execs it — see build-runtime-bundle.sh header).
+# N2: the bundle now ALSO ships the render stack (same contract as macOS —
+# see build-runtime-bundle.sh):
+#     bin/node            official node v24.16.0 linux-x64 (sha256-pinned) —
+#                         the exporter's runtime (the backend still never execs
+#                         node; that M4 proof is unchanged)
+#     exporter/           penpotapp/exporter:$PENPOT_VERSION app tree (pure JS)
+#     exporter-browsers/  playwright chromium HEADLESS SHELL only
 #
 # Sources: docker create/cp (default) or --no-docker via pinned static crane.
 # JDK: $JLINK_HOME if set (CI: actions/setup-java temurin 26), else a pinned
@@ -42,6 +47,13 @@ set -euo pipefail
 PENPOT_VERSION="${PENPOT_VERSION:-2.16.2}"
 BACKEND_IMAGE="penpotapp/backend:${PENPOT_VERSION}"
 FRONTEND_IMAGE="penpotapp/frontend:${PENPOT_VERSION}"
+EXPORTER_IMAGE="penpotapp/exporter:${PENPOT_VERSION}"
+
+# node for the exporter child (N2): upstream exporter image pins v24.16.0;
+# official nodejs.org build, sha256 from SHASUMS256.txt (verified 2026-07-14).
+NODE_VERSION="24.16.0"
+NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz"
+NODE_SHA256="2faf6a387e9b62b888e21c54f01249fb27537ffecf1842f29f4c919d0a59a0ff"
 
 POSTGRES_VERSION="15.18.0" # MUST match crates/supervisor DEFAULT_POSTGRES_VERSION
 PG_ARCHIVE_URL="https://github.com/theseus-rs/postgresql-binaries/releases/download/${POSTGRES_VERSION}/postgresql-${POSTGRES_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
@@ -123,7 +135,13 @@ JAVA_VERSION="$("$JLINK_HOME/bin/java" --version 2>/dev/null | head -1 | awk '{p
   || die "JDK at $JLINK_HOME is $JAVA_VERSION; need major $EXPECTED_JDK_MAJOR exactly (--enable-preview)"
 [[ -x "$JLINK_HOME/bin/jlink" ]] || die "no jlink at $JLINK_HOME/bin/jlink"
 
-FINGERPRINT="layout=1 platform=linux-x86_64 penpot=${PENPOT_VERSION} jdk=${JAVA_VERSION} valkey=${VALKEY_VERSION} imagemagick=${IM_VERSION} postgres=${POSTGRES_VERSION} node=absent"
+FINGERPRINT="layout=2 platform=linux-x86_64 penpot=${PENPOT_VERSION} jdk=${JAVA_VERSION} valkey=${VALKEY_VERSION} imagemagick=${IM_VERSION} postgres=${POSTGRES_VERSION} node=${NODE_VERSION} exporter=${PENPOT_VERSION}-hoisted browsers=headless-shell-only"
+
+# The headless-shell payload binary (chromium_headless_shell-<rev>/…), if present.
+bundle_headless_shell() { # bundle_headless_shell <bundle-root>
+  compgen -G "$1/exporter-browsers/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell" >/dev/null 2>&1 \
+    || compgen -G "$1/exporter-browsers/chromium_headless_shell-*/*/headless_shell" >/dev/null 2>&1
+}
 
 bundle_is_current() {
   [[ -f "$DEST/.fingerprint" ]] \
@@ -134,7 +152,12 @@ bundle_is_current() {
     && [[ -x "$DEST/bin/valkey-server" ]] \
     && [[ -x "$DEST/bin/identify" ]] \
     && [[ -x "$DEST/bin/penpot-watchdog" ]] \
+    && [[ -x "$DEST/bin/node" ]] \
     && [[ -x "$DEST/postgres/$POSTGRES_VERSION/bin/initdb" ]] \
+    && [[ -s "$DEST/exporter/app.js" ]] \
+    && [[ -d "$DEST/exporter/node_modules" ]] \
+    && [[ -d "$DEST/exporter/node_modules/date-fns" ]] \
+    && bundle_headless_shell "$DEST" \
     && [[ -f "$DEST/MANIFEST.json" ]] \
     && [[ -f "$DEST/VERSION" ]]
 }
@@ -391,6 +414,91 @@ WRAPEOF
     patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
   done < <(find "$STAGING/postgres/$POSTGRES_VERSION/lib" -name '*.so*' -type f -print0)
 
+  # ----- 4b. bin/node + exporter/ + exporter-browsers/ (N2) --------------------
+  log "bin/node (official v$NODE_VERSION linux-x64, sha256-pinned) ..."
+  fetch_verified "$NODE_URL" "$NODE_SHA256" "$CACHE_DIR/node-v$NODE_VERSION-linux-x64.tar.gz"
+  NODE_EXTRACT="$STAGING/.node-extract"
+  mkdir -p "$NODE_EXTRACT"
+  tar -xzf "$CACHE_DIR/node-v$NODE_VERSION-linux-x64.tar.gz" -C "$NODE_EXTRACT" \
+    "node-v$NODE_VERSION-linux-x64/bin/node" \
+    "node-v$NODE_VERSION-linux-x64/LICENSE"
+  cp "$NODE_EXTRACT/node-v$NODE_VERSION-linux-x64/bin/node" "$STAGING/bin/node"
+  cp "$NODE_EXTRACT/node-v$NODE_VERSION-linux-x64/LICENSE" "$STAGING/licenses/node-LICENSE.txt"
+  rm -rf "$NODE_EXTRACT"
+  chmod +x "$STAGING/bin/node"
+  NODE_REPORTED="$("$STAGING/bin/node" --version)"
+  [[ "$NODE_REPORTED" == "v$NODE_VERSION" ]] \
+    || die "bundled node reports $NODE_REPORTED, expected v$NODE_VERSION"
+
+  # exporter/: app tree from the pinned image; node_modules rebuilt HOISTED
+  # and symlink-free from the upstream lockfile — same rationale + recipe as
+  # the macOS script (bundlers drop directory symlinks; naive dereferencing
+  # breaks pnpm sibling resolution).
+  PNPM_VERSION="11.5.3" # = the exporter package.json packageManager pin
+  command -v npx >/dev/null \
+    || die "npx (any host node install) is required to materialize the exporter node_modules"
+  if [[ "$NO_DOCKER" -eq 0 ]]; then
+    log "extracting exporter from ${EXPORTER_IMAGE} (docker create/cp) ..."
+    CID="$(docker create --platform linux/amd64 "$EXPORTER_IMAGE")"; CIDS+=("$CID")
+    docker cp -q "$CID:/opt/penpot/exporter" "$STAGING/.exporter-raw"
+    docker rm "$CID" >/dev/null; CIDS=()
+    EXPORTER_SRC="$STAGING/.exporter-raw"
+  else
+    log "exporting ${EXPORTER_IMAGE} via crane (no docker daemon) ..."
+    CRANE="$CACHE_DIR/crane-$CRANE_VERSION"
+    if [[ ! -x "$CRANE" ]]; then
+      fetch_verified "$CRANE_URL" "$CRANE_SHA256" "$CACHE_DIR/crane.tar.gz"
+      tar -xzf "$CACHE_DIR/crane.tar.gz" -C "$CACHE_DIR" crane
+      mv "$CACHE_DIR/crane" "$CRANE"
+      rm -f "$CACHE_DIR/crane.tar.gz"
+    fi
+    mkdir -p "$STAGING/.exporter-rootfs"
+    "$CRANE" export "$EXPORTER_IMAGE" - --platform linux/amd64 \
+      | tar -xf - -C "$STAGING/.exporter-rootfs" opt/penpot/exporter \
+      || die "crane export of $EXPORTER_IMAGE failed"
+    EXPORTER_SRC="$STAGING/.exporter-rootfs/opt/penpot/exporter"
+  fi
+  cp -R "$EXPORTER_SRC" "$STAGING/exporter" || die "copying the exporter app files failed"
+  rm -rf "$STAGING/exporter/node_modules"
+  [[ -f "$STAGING/exporter/pnpm-lock.yaml" ]] || die "exporter tree has no pnpm-lock.yaml"
+  log "exporter/node_modules (pnpm@$PNPM_VERSION hoisted install from the pinned lockfile) ..."
+  (cd "$STAGING/exporter" && npx -y "pnpm@$PNPM_VERSION" install --prod --frozen-lockfile \
+      --ignore-scripts --config.node-linker=hoisted >/dev/null) \
+    || die "pnpm hoisted install of the exporter node_modules failed"
+  rm -rf "$STAGING/exporter/node_modules/.bin"
+  # Prune fsevents (optional, macOS-only native dep) for parity with the macOS
+  # bundle script; on Linux it is normally absent, so this is a no-op guard.
+  rm -rf "$STAGING/exporter/node_modules/fsevents"
+  rm -rf "$STAGING/.exporter-raw" "$STAGING/.exporter-rootfs"
+  printf '%s\n' "$PENPOT_VERSION" > "$STAGING/exporter/VERSION"
+  LEFT_LINKS="$(find "$STAGING/exporter" -type l | head -1)"
+  [[ -z "$LEFT_LINKS" ]] \
+    || die "exporter tree still contains symlinks (e.g. $LEFT_LINKS)"
+  [[ -s "$STAGING/exporter/app.js" && -d "$STAGING/exporter/node_modules" ]] \
+    || die "exporter payload incomplete (app.js/node_modules missing)"
+  for pkg in date-fns playwright playwright-core; do
+    [[ -d "$STAGING/exporter/node_modules/$pkg" ]] \
+      || die "hoisted exporter node_modules is missing $pkg as a real dir"
+  done
+  [[ -f "$STAGING/exporter/LICENSE" ]] \
+    && cp "$STAGING/exporter/LICENSE" "$STAGING/licenses/penpot-exporter-MPL-2.0.txt"
+
+  log "exporter-browsers/ (playwright install chromium --only-shell via bundled node) ..."
+  PLAYWRIGHT_BROWSERS_PATH="$STAGING/.browsers-dl" "$STAGING/bin/node" \
+    "$STAGING/exporter/node_modules/playwright/cli.js" install chromium --only-shell \
+    || die "playwright install chromium --only-shell failed"
+  mkdir -p "$STAGING/exporter-browsers"
+  DL_SHELL="$(compgen -G "$STAGING/.browsers-dl/chromium_headless_shell-*" | head -1 || true)"
+  [[ -n "$DL_SHELL" ]] || die "playwright install produced no chromium_headless_shell dir"
+  mv "$DL_SHELL" "$STAGING/exporter-browsers/$(basename "$DL_SHELL")"
+  rm -rf "$STAGING/.browsers-dl"
+  bundle_headless_shell "$STAGING" || die "no headless shell binary in the staged bundle"
+  SHELL_DIR="$(compgen -G "$STAGING/exporter-browsers/chromium_headless_shell-*" | head -1)"
+  HEADLESS_SHELL_REV="$(basename "$SHELL_DIR" | sed 's/^chromium_headless_shell-//')"
+  touch "$SHELL_DIR/INSTALLATION_COMPLETE" 2>/dev/null || true
+  find "$SHELL_DIR" -name 'LICENSE.headless_shell' -exec cp {} "$STAGING/licenses/chromium-headless-shell-LICENSE.txt" \; 2>/dev/null || true
+  log "OK exporter stack: node v$NODE_VERSION + exporter/ + headless shell rev $HEADLESS_SHELL_REV"
+
   # ----- 5. licenses/ + MANIFEST.json + VERSION -------------------------------
   log "licenses/ ..."
   if [[ ! -f "$CACHE_DIR/penpot-LICENSE-${PENPOT_VERSION}" ]]; then
@@ -459,8 +567,24 @@ manifest = {
             "paths": ["bin/penpot-watchdog"],
         },
         "node": {
-            "bundled": False,
-            "reason": "penpot 2.16.2 backend never execs node (see build-runtime-bundle.sh)",
+            "version": "$NODE_VERSION",
+            "license": "MIT (plus bundled-deps licenses in the LICENSE file)",
+            "source": "official nodejs.org linux-x64 tarball, sha256-pinned",
+            "paths": ["bin/node"],
+            "note": "exporter runtime ONLY (N2); the backend never execs node",
+        },
+        "penpot-exporter": {
+            "version": "$PENPOT_VERSION",
+            "license": "MPL-2.0",
+            "source": "docker.io/penpotapp/exporter:$PENPOT_VERSION (pure-JS app tree)",
+            "paths": ["exporter/"],
+        },
+        "chromium-headless-shell": {
+            "version": "playwright build $HEADLESS_SHELL_REV",
+            "license": "BSD-3-Clause (see licenses/chromium-headless-shell-LICENSE.txt)",
+            "source": "playwright-managed chromium headless shell",
+            "paths": ["exporter-browsers/"],
+            "note": "headless shell ONLY; relies on host X11-adjacent system libs like any chromium",
         },
     },
     "licenses": ["licenses/" + f for f in licenses],
@@ -488,6 +612,7 @@ PROOF_FAILURES=0
 proof_cleanup() {
   [[ -n "${PROOF_VALKEY_PID:-}" ]] && kill -9 "$PROOF_VALKEY_PID" 2>/dev/null || true
   [[ -n "${PROOF_JAVA_PID:-}" ]] && kill -9 "$PROOF_JAVA_PID" 2>/dev/null || true
+  [[ -n "${PROOF_EXPORTER_PID:-}" ]] && kill -9 "$PROOF_EXPORTER_PID" 2>/dev/null || true
   [[ -d "$PROOF_TMP/pgdata" ]] && env -i PATH=/usr/bin:/bin \
       "$BUNDLE/postgres/$POSTGRES_VERSION/bin/pg_ctl" -D "$PROOF_TMP/pgdata" -m immediate stop >/dev/null 2>&1 || true
   rm -rf "$PROOF_TMP"
@@ -637,6 +762,81 @@ else
   bad P6 "ELF relocation audit"
 fi
 
+# P8: bundled node runs from a scratch dir with env -i and reports the pin
+P8_VER="$(cd "$PROOF_TMP" && env -i PATH=/usr/bin:/bin "$BUNDLE/bin/node" --version 2>&1 || true)"
+if [[ "$P8_VER" == "v$NODE_VERSION" ]]; then
+  ok P8 "bin/node reports v$NODE_VERSION from scratch dir (env -i)"
+else
+  bad P8 "bin/node reported [$P8_VER], expected v$NODE_VERSION"
+fi
+
+# P9: exporter app boots on the BUNDLED node (own valkey, env -i, poisoned
+# proxies) and answers /readyz 200
+TEST_EXPORTER_PORT="${BUNDLE_TEST_EXPORTER_PORT:-6473}"
+(cd "$PROOF_TMP" && exec env -i PATH=/usr/bin:/bin \
+    "$BUNDLE/bin/valkey-server" --port "$TEST_VALKEY_PORT" --bind 127.0.0.1 \
+    --save '' --appendonly no --dir "$PROOF_TMP" > "$PROOF_TMP/valkey-p9.log" 2>&1) &
+PROOF_VALKEY_PID=$!
+mkdir -p "$PROOF_TMP/exporter-tmp"
+(cd "$BUNDLE/exporter" && exec env -i PATH=/usr/bin:/bin HOME="$PROOF_TMP" \
+    http_proxy="http://127.0.0.1:1" https_proxy="http://127.0.0.1:1" \
+    PENPOT_SECRET_KEY=bundle-proof \
+    PENPOT_PUBLIC_URI="http://127.0.0.1:1" \
+    PENPOT_REDIS_URI="redis://127.0.0.1:${TEST_VALKEY_PORT}/0" \
+    PENPOT_HTTP_SERVER_PORT="$TEST_EXPORTER_PORT" \
+    PENPOT_TEMPDIR="$PROOF_TMP/exporter-tmp" \
+    PLAYWRIGHT_BROWSERS_PATH="$BUNDLE/exporter-browsers" \
+    "$BUNDLE/bin/node" app.js > "$PROOF_TMP/exporter.log" 2>&1) &
+PROOF_EXPORTER_PID=$!
+P9_CODE=""
+for _ in $(seq 1 30); do
+  P9_CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+      "http://127.0.0.1:${TEST_EXPORTER_PORT}/readyz" 2>/dev/null || true)"
+  [[ "$P9_CODE" == "200" ]] && break
+  kill -0 "$PROOF_EXPORTER_PID" 2>/dev/null || break
+  sleep 1
+done
+if [[ "$P9_CODE" == "200" ]]; then
+  ok P9 "exporter answers /readyz 200 on the bundled node (env -i, poisoned proxies)"
+else
+  tail -10 "$PROOF_TMP/exporter.log" >&2 || true
+  bad P9 "exporter /readyz never returned 200 (last code: ${P9_CODE:-none})"
+fi
+kill -9 "$PROOF_EXPORTER_PID" 2>/dev/null || true
+wait "$PROOF_EXPORTER_PID" 2>/dev/null || true
+PROOF_EXPORTER_PID=""
+kill -9 "$PROOF_VALKEY_PID" 2>/dev/null || true
+wait "$PROOF_VALKEY_PID" 2>/dev/null || true
+PROOF_VALKEY_PID=""
+
+# P10: bundled playwright launches the bundled headless shell. Chromium needs
+# the usual host system libs (nss, atk, …) — present on GitHub runners and
+# desktop distros; a missing-lib failure prints loudly here.
+cat > "$PROOF_TMP/p10.cjs" <<'P10EOF'
+const path = process.argv[2];
+const { chromium } = require(path);
+(async () => {
+  const browser = await chromium.launch({ args: ["--allow-insecure-localhost", "--no-sandbox"] });
+  const page = await browser.newPage();
+  await page.setContent("<h1>n2</h1>");
+  const sum = await page.evaluate("40 + 2");
+  const version = browser.version();
+  await browser.close();
+  if (sum !== 42) throw new Error("evaluate returned " + sum);
+  console.log("HEADLESS_OK " + version);
+})().catch((e) => { console.error(e); process.exit(1); });
+P10EOF
+P10_OUT="$(cd "$PROOF_TMP" && env -i PATH=/usr/bin:/bin HOME="$PROOF_TMP" TMPDIR="$PROOF_TMP" \
+    http_proxy="http://127.0.0.1:1" https_proxy="http://127.0.0.1:1" \
+    PLAYWRIGHT_BROWSERS_PATH="$BUNDLE/exporter-browsers" \
+    "$BUNDLE/bin/node" "$PROOF_TMP/p10.cjs" "$BUNDLE/exporter/node_modules/playwright" 2>&1 || true)"
+if grep -q "^HEADLESS_OK " <<< "$P10_OUT"; then
+  ok P10 "playwright launched the bundled headless shell and evaluated JS ($P10_OUT)"
+else
+  bad P10 "headless-shell launch failed: $(echo "$P10_OUT" | head -3)"
+fi
+PROOF_EXPORTER_PID=""
+
 [[ "$PROOF_FAILURES" -eq 0 ]] || die "$PROOF_FAILURES verification step(s) failed — bundle NOT installed"
 
 # ---------------------------------------------------------------------------
@@ -651,7 +851,7 @@ fi
 
 log "bundle ready at $DEST"
 log "component sizes:"
-for c in backend frontend jre bin postgres licenses; do
+for c in backend frontend jre bin postgres exporter exporter-browsers licenses; do
   if [[ -e "$DEST/$c" ]]; then
     KB="$(du -sk "$DEST/$c" | cut -f1)"
     printf '  %-10s %8.1f MB\n' "$c" "$(python3 -c "print($KB/1024)")"

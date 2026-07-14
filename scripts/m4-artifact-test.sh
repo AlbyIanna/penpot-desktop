@@ -6,11 +6,16 @@
 # system-only PATH, poisoned http proxies) — approximating a machine that has
 # no Homebrew, no repo checkout, no dev toolchain, and no network.
 #
+# N2: the whole test now runs with RENDERS ON (PENPOT_LOCAL_EXPORTS=1) — the
+# packaged artifact must carry its own node + exporter app + chromium headless
+# shell, offline.
+#
 # Asserts:
 #   (a) full boot: SPA through the proxy, /__bootstrap sets the auth cookie,
 #       authenticated get-profile works, PNG media round-trips through
 #       /assets/** (exercises the bundled relocated ImageMagick identify);
-#   (b) OFFLINE first boot: all runtime-layout components resolve source=bundle,
+#   (b) OFFLINE first boot: all runtime-layout components (incl. the N2
+#       exporter/exporter-node/exporter-browsers trio) resolve source=bundle,
 #       no <data>/postgres/install download dir appears, zero download log
 #       lines, boot-time bound — with http_proxy/https_proxy/ALL_PROXY poisoned
 #       to a dead port so anything that needed the network would fail loudly;
@@ -18,12 +23,17 @@
 #       /opt/homebrew and 0 under the repo checkout; the watchdog is armed from
 #       the bundle inside the installed .app;
 #   (d) the sync-status tray is created (GUI run — a window appears);
+#   (f) RENDERS ON: a seeded board renders to <name>.exports/*.{svg,png}
+#       through the BUNDLED node + headless chromium — no host node on PATH,
+#       poisoned proxies (N2 exit criterion);
 #   (e) SIGTERM -> clean exit, no orphans; then a SIGKILL run -> the watchdog
-#       reaps every child.
+#       reaps every child (incl. the exporter node child — the M5 orphan gap).
 #
-# Ports (test-port ledger): proxy 8906, backend 6381, postgres 5455, valkey 6398.
+# Ports (test-port ledger): proxy 8906, backend 6381, postgres 5455, valkey
+# 6398, exporter 6468.
 # Usage: scripts/m4-artifact-test.sh [path-to-dmg]   (default: newest in
 #        target/release/bundle/dmg/)
+# NOT concurrency-safe (system-wide lsof/pgrep scans): run solo.
 
 set -u
 
@@ -33,6 +43,7 @@ PROXY_PORT="${M4_PROXY_PORT:-8906}"
 BACKEND_PORT="${M4_BACKEND_PORT:-6381}"
 POSTGRES_PORT="${M4_POSTGRES_PORT:-5455}"
 VALKEY_PORT="${M4_VALKEY_PORT:-6398}"
+EXPORTER_PORT="${M4_EXPORTER_PORT:-6468}"
 FIRST_BOOT_TIMEOUT="${M4_FIRST_BOOT_TIMEOUT:-420}"   # offline: no download allowed
 SECOND_BOOT_TIMEOUT=240
 BASE="http://localhost:${PROXY_PORT}"
@@ -96,6 +107,8 @@ start_app() { # sanitized environment: the fresh-machine approximation
             PENPOT_LOCAL_BACKEND_PORT="$BACKEND_PORT" \
             PENPOT_LOCAL_POSTGRES_PORT="$POSTGRES_PORT" \
             PENPOT_LOCAL_VALKEY_PORT="$VALKEY_PORT" \
+            PENPOT_LOCAL_EXPORTS=1 \
+            PENPOT_LOCAL_EXPORTER_PORT="$EXPORTER_PORT" \
             "$APP_BIN"
     ) >>"$LOG" 2>&1 &
     APP_PID=$!
@@ -138,13 +151,13 @@ if [ -z "$DMG" ] || [ ! -f "$DMG" ]; then
     exit 1
 fi
 pass "dmg exists ($(du -sh "$DMG" | cut -f1))"
-for port in "$PROXY_PORT" "$BACKEND_PORT" "$POSTGRES_PORT" "$VALKEY_PORT"; do
+for port in "$PROXY_PORT" "$BACKEND_PORT" "$POSTGRES_PORT" "$VALKEY_PORT" "$EXPORTER_PORT"; do
     if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
         fail "port $port is free"
         exit 1
     fi
 done
-pass "test ports free ($PROXY_PORT/$BACKEND_PORT/$POSTGRES_PORT/$VALKEY_PORT)"
+pass "test ports free ($PROXY_PORT/$BACKEND_PORT/$POSTGRES_PORT/$VALKEY_PORT/$EXPORTER_PORT)"
 
 # --- mount + install ------------------------------------------------------------
 if hdiutil attach -nobrowse -readonly -mountpoint "$MNT" "$DMG" >/dev/null; then
@@ -245,14 +258,19 @@ else
 fi
 
 # (b) offline-first-boot evidence -------------------------------------------------
+# N2: renders ON adds three exporter components (exporter, exporter-node,
+# exporter-browsers) to the M4 six.
 LAYOUT_LINES="$(grep "runtime layout: component=" "$LOG" || true)"
 LAYOUT_COUNT="$(echo "$LAYOUT_LINES" | grep -c "component=" || true)"
 DEV_SOURCED="$(echo "$LAYOUT_LINES" | grep -c "source=dev" || true)"
-if [ "$LAYOUT_COUNT" -eq 6 ] && [ "$DEV_SOURCED" -eq 0 ] &&
-    echo "$LAYOUT_LINES" | grep -q "component=penpot-watchdog source=bundle"; then
-    pass "(b1) all 6 runtime-layout components resolved from the bundle (0 source=dev)"
+if [ "$LAYOUT_COUNT" -eq 9 ] && [ "$DEV_SOURCED" -eq 0 ] &&
+    echo "$LAYOUT_LINES" | grep -q "component=penpot-watchdog source=bundle" &&
+    echo "$LAYOUT_LINES" | grep "component=exporter " | grep -q "source=bundle" &&
+    echo "$LAYOUT_LINES" | grep "component=exporter-node" | grep -q "source=bundle" &&
+    echo "$LAYOUT_LINES" | grep "component=exporter-browsers" | grep -q "source=bundle"; then
+    pass "(b1) all 9 runtime-layout components resolved from the bundle (incl. exporter trio, 0 source=dev)"
 else
-    fail "(b1) all 6 runtime-layout components resolved from the bundle"
+    fail "(b1) all 9 runtime-layout components resolved from the bundle"
     echo "$LAYOUT_LINES" >&2
 fi
 if [ ! -e "$DATA_DIR/postgres/install" ]; then
@@ -303,6 +321,51 @@ if grep -q "sync-status tray icon created" "$LOG"; then
     pass "(d) sync-status tray icon created (GUI run)"
 else
     fail "(d) sync-status tray icon created (GUI run)"
+fi
+
+# (f) RENDERS ON: seeded board -> svg+png via the bundled node + headless shell -----
+# Reuses the m5 RPC helper (seed alpha/beta with boards; exports_check waits
+# for state hash == manifest hash). Designs root = the packaged default
+# (<data>/designs — PENPOT_LOCAL_DESIGNS_DIR is unset in this test).
+export M5_DESIGNS_DIR="$DATA_DIR/designs"
+export PENPOT_BACKEND="$BASE"
+export PENPOT_FRONTEND="$BASE"
+export PENPOT_TOKEN="$TOKEN"
+HELPER="$ROOT/scripts/m5_features_helper.py"
+if python3 "$HELPER" seed "$WORK" >/dev/null 2>"$WORK/seed.err"; then
+    pass "(f1) seeded boards via RPC (alpha: Cover+Detail, beta: Solo)"
+else
+    fail "(f1) RPC seed failed"
+    cat "$WORK/seed.err" >&2
+fi
+EXPORTS_REL=""
+F_DEADLINE=$(($(date +%s) + 240))
+while [ "$(date +%s)" -lt "$F_DEADLINE" ]; do
+    OUT="$(python3 "$HELPER" exports_check "$WORK" alpha 2>/dev/null || true)"
+    case "$OUT" in
+        OK\ *) EXPORTS_REL="${OUT#OK }"; break ;;
+    esac
+    sleep 3
+done
+if [ -n "$EXPORTS_REL" ]; then
+    pass "(f2) packaged render path works: $EXPORTS_REL rendered (svg+png per board, hash-gated state)"
+else
+    fail "(f2) exports did not appear within 240s (renders on the packaged artifact broken)"
+fi
+F_SVG="$DATA_DIR/designs/$EXPORTS_REL/Cover.svg"
+F_PNG="$DATA_DIR/designs/$EXPORTS_REL/Cover.png"
+if grep -q "<svg" "$F_SVG" 2>/dev/null &&
+    [ "$(head -c 8 "$F_PNG" 2>/dev/null | xxd -p)" = "89504e470d0a1a0a" ]; then
+    pass "(f3) Cover.svg is SVG and Cover.png has PNG magic (bundled chromium output)"
+else
+    fail "(f3) render artifacts malformed"
+fi
+# the render must NOT have used a host node: the exporter child is bundle node
+EXPORTER_NODE_CMD="$(ps -o args= -p "$(lsof -nP -tiTCP:"$EXPORTER_PORT" -sTCP:LISTEN 2>/dev/null | head -1)" 2>/dev/null || true)"
+if echo "$EXPORTER_NODE_CMD" | grep -qF "Resources/penpot-runtime/bin/node"; then
+    pass "(f4) exporter child runs on the BUNDLED node inside the .app"
+else
+    fail "(f4) exporter child not on the bundled node: $EXPORTER_NODE_CMD"
 fi
 
 # (e) SIGTERM: clean exit, no orphans ---------------------------------------------------

@@ -199,23 +199,30 @@ impl JvmSpec {
 }
 
 /// How to run the optional `penpot-exporter` node service (M5 per-board
-/// SVG/PNG rendering; **dev-mode only** — packaging it is out of scope).
+/// SVG/PNG rendering; **packaged since N2** — the runtime bundle ships
+/// `bin/node` v24.16.0, `exporter/`, and the chromium headless shell under
+/// `exporter-browsers/`).
 ///
-/// Host requirements (documented, not bundled):
-/// - a host `node` binary (upstream image pins v24.16.0; v25.8.1 verified
-///   working end-to-end on macOS arm64 — the extracted app is pure JS with
-///   zero native `.node` bindings);
-/// - the extracted exporter app (`scripts/fetch-penpot.sh` →
-///   `runtime/exporter/`, entry `app.js`);
-/// - a playwright-managed chromium under `browsers_path`
-///   (`scripts/fetch-penpot.sh --with-browsers`) — the exporter calls
-///   playwright's `chromium.launch()` with no `executablePath`, so the
+/// Requirements (bundle payload in packaged mode, host installs in dev):
+/// - a `node` binary (upstream image pins v24.16.0 — the bundle's pin;
+///   host v25.8.1 verified working in dev — the extracted app is pure JS
+///   with zero native `.node` bindings);
+/// - the extracted exporter app (dev: `scripts/fetch-penpot.sh` →
+///   `runtime/exporter/`; packaged: bundle `exporter/`; entry `app.js`);
+/// - a playwright-managed chromium under `browsers_path` (dev:
+///   `fetch-penpot.sh --with-browsers`; packaged: the headless shell only —
+///   playwright ≥1.49 serves default headless launches from it) — the
+///   exporter calls `chromium.launch()` with no `executablePath`, so the
 ///   system Chrome is never used.
 ///
 /// Known upstream limitation (verified on 2.16.2): the exporter's HTTP
 /// server binds **0.0.0.0** — the listen host is not configurable in the
-/// compiled bundle. Dev-mode accepts the LAN exposure; the packaging phase
-/// must firewall or patch it.
+/// compiled bundle. The LAN exposure of the render endpoint remains a
+/// documented debt (cookie-authenticated; see docs/milestones/n2.md).
+///
+/// N2 stale-adoption guard: `Supervisor::start` hard-refuses a busy
+/// exporter port (naming the pid) and the supervise loop re-checks per
+/// respawn + verifies the `/readyz`-answering pid is its own child.
 #[derive(Debug, Clone)]
 pub struct ExporterSpec {
     /// Host `node` binary.
@@ -571,6 +578,16 @@ pub fn valkey_command(config: &SupervisorConfig) -> (PathBuf, Vec<String>) {
     (config.valkey_path.clone(), args)
 }
 
+/// A single live pid slot the watchdog feeder polls. `None` until the child is
+/// spawned, then carries its pid so a SIGKILL during the readiness window can't
+/// orphan it.
+#[cfg(unix)]
+type WatchdogSlot = Arc<std::sync::Mutex<Option<u32>>>;
+
+/// The growable, shared set of [`WatchdogSlot`]s the feeder task reads.
+#[cfg(unix)]
+type WatchdogSlots = Arc<std::sync::Mutex<Vec<WatchdogSlot>>>;
+
 /// The supervisor. Owns the three services; kills them on [`shutdown`] and
 /// (best-effort) on drop — no orphans.
 ///
@@ -589,6 +606,12 @@ pub struct Supervisor {
     /// Task re-feeding the current child pid set to the orphan watchdog.
     #[cfg(unix)]
     watchdog_feeder: Option<tokio::task::JoinHandle<()>>,
+    /// Live pid slots the feeder polls. Shared + growable so the feeder can
+    /// start BEFORE the children exist and pick each one up the moment it is
+    /// spawned — a SIGKILL during a child's readiness window must not orphan
+    /// it (post-M5 debt #1: the exporter was orphaned exactly this way).
+    #[cfg(unix)]
+    watchdog_slots: WatchdogSlots,
     shutdown_done: bool,
 }
 
@@ -607,6 +630,8 @@ impl Supervisor {
             orphan_watchdog: None,
             #[cfg(unix)]
             watchdog_feeder: None,
+            #[cfg(unix)]
+            watchdog_slots: Arc::new(std::sync::Mutex::new(Vec::new())),
             shutdown_done: false,
         }
     }
@@ -622,7 +647,13 @@ impl Supervisor {
 
         // --- 0. SIGKILL orphan watchdog (armed before any child spawns) --
         #[cfg(unix)]
-        self.spawn_orphan_watchdog();
+        {
+            self.spawn_orphan_watchdog();
+            // The pid feeder starts NOW (empty slot list, grows per spawn):
+            // children are watchdog-covered from their first second, not
+            // only once the whole boot succeeded (post-M5 debt #1).
+            self.spawn_watchdog_feeder();
+        }
 
         // --- 1. Postgres (embedded) -------------------------------------
         self.notifier.emit(SupervisorEvent::Starting { service: Service::Postgres });
@@ -653,6 +684,7 @@ impl Supervisor {
             cwd: Some(self.config.valkey_dir()),
             probe: Probe::ValkeyPing { port: self.config.ports.valkey },
             ready_timeout: self.config.valkey_ready_timeout,
+            listener_port: None,
         };
         let valkey = ServiceHandle::spawn(
             valkey_spec,
@@ -660,6 +692,8 @@ impl Supervisor {
             self.config.shutdown_grace,
             self.notifier.clone(),
         );
+        #[cfg(unix)]
+        self.register_watchdog_slot(&valkey);
         valkey.wait_ready().await.map_err(|reason| SupervisorError::ServiceFailed {
             service: Service::Valkey,
             reason,
@@ -678,6 +712,7 @@ impl Supervisor {
             cwd: Some(self.config.backend_dir.clone()),
             probe: Probe::HttpOk { port: self.config.ports.backend, path: "/readyz".into() },
             ready_timeout: self.config.backend_ready_timeout,
+            listener_port: None,
         };
         let backend = ServiceHandle::spawn(
             backend_spec,
@@ -685,6 +720,8 @@ impl Supervisor {
             self.config.shutdown_grace,
             self.notifier.clone(),
         );
+        #[cfg(unix)]
+        self.register_watchdog_slot(&backend);
         backend.wait_ready().await.map_err(|reason| SupervisorError::ServiceFailed {
             service: Service::Backend,
             reason,
@@ -693,8 +730,35 @@ impl Supervisor {
         #[cfg(unix)]
         self.push_watchdog_pids();
 
-        // --- 4. Exporter (optional, M5) -----------------------------------
+        // --- 4. Exporter (optional, M5; N2 stale-adoption fix) -------------
         if let Some(spec) = self.config.exporter.clone() {
+            // Post-M5 debt #1: a port that is already busy BEFORE we spawn is
+            // a hard boot error naming the pid — never adopt the /readyz
+            // answers of a process we do not own (a SIGKILL-orphaned exporter
+            // passes the probe while our own child dies with EADDRINUSE and
+            // every render then fails with a secret-key mismatch).
+            if probe::port_has_listener(spec.port).await {
+                let pids = tokio::task::spawn_blocking(move || probe::listener_pids(spec.port))
+                    .await
+                    .unwrap_or_default();
+                let pid_desc = if pids.is_empty() {
+                    "unknown pid (lsof unavailable)".to_string()
+                } else {
+                    format!(
+                        "pid(s) {}",
+                        pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                    )
+                };
+                return Err(SupervisorError::ServiceFailed {
+                    service: Service::Exporter,
+                    reason: format!(
+                        "exporter port {} is already in use by {pid_desc} — refusing to adopt \
+                         a stale exporter. Kill that process or set \
+                         PENPOT_LOCAL_EXPORTER_PORT to a free port.",
+                        spec.port
+                    ),
+                });
+            }
             self.notifier.emit(SupervisorEvent::Starting { service: Service::Exporter });
             let (program, args, envs) = exporter_command(&self.config, &spec);
             // PENPOT_TEMPDIR must exist (the exporter writes render tempfiles
@@ -710,6 +774,7 @@ impl Supervisor {
                 cwd: Some(spec.exporter_dir.clone()),
                 probe: Probe::HttpOk { port: spec.port, path: "/readyz".into() },
                 ready_timeout: spec.ready_timeout,
+                listener_port: Some(spec.port),
             };
             let exporter = ServiceHandle::spawn(
                 exporter_spec,
@@ -717,6 +782,8 @@ impl Supervisor {
                 self.config.shutdown_grace,
                 self.notifier.clone(),
             );
+            #[cfg(unix)]
+            self.register_watchdog_slot(&exporter);
             exporter.wait_ready().await.map_err(|reason| SupervisorError::ServiceFailed {
                 service: Service::Exporter,
                 reason,
@@ -725,9 +792,6 @@ impl Supervisor {
             #[cfg(unix)]
             self.push_watchdog_pids();
         }
-
-        #[cfg(unix)]
-        self.spawn_watchdog_feeder();
 
         Ok(Readiness {
             postgres_uri,
@@ -828,26 +892,31 @@ impl Supervisor {
         }
     }
 
+    /// Register a freshly spawned service's live pid slot with the watchdog
+    /// feeder — called right after `ServiceHandle::spawn`, BEFORE waiting for
+    /// readiness, so a SIGKILL during the readiness window cannot orphan the
+    /// child. Also pushes the current set immediately (best-effort; the
+    /// feeder re-sends within a second once the pid lands in the slot).
+    #[cfg(unix)]
+    fn register_watchdog_slot(&self, handle: &ServiceHandle) {
+        self.watchdog_slots
+            .lock()
+            .expect("watchdog slots mutex")
+            .push(handle.pid_slot());
+        self.push_watchdog_pids();
+    }
+
     /// Current child pid set: postmaster (from `postmaster.pid`, since
-    /// pg_ctl detaches it) + valkey + backend supervised pids.
+    /// pg_ctl detaches it) + every registered supervised pid slot (valkey,
+    /// backend, exporter — filled as each service spawns).
     #[cfg(unix)]
     fn collect_child_pids(&self) -> Vec<u32> {
         let mut pids = Vec::new();
         if let Some(pid) = watchdog::read_postmaster_pid(&self.config.postgres_data_dir()) {
             pids.push(pid);
         }
-        if let Some(handle) = &self.valkey {
-            if let Some(pid) = handle.current_pid() {
-                pids.push(pid);
-            }
-        }
-        if let Some(handle) = &self.backend {
-            if let Some(pid) = handle.current_pid() {
-                pids.push(pid);
-            }
-        }
-        if let Some(handle) = &self.exporter {
-            if let Some(pid) = handle.current_pid() {
+        for slot in self.watchdog_slots.lock().expect("watchdog slots mutex").iter() {
+            if let Some(pid) = *slot.lock().expect("pid mutex") {
                 pids.push(pid);
             }
         }
@@ -872,22 +941,15 @@ impl Supervisor {
 
     /// Background task re-sending the pid set whenever it changes (crash
     /// respawns give children new pids; the watchdog must track the CURRENT
-    /// set, not the boot-time one).
+    /// set, not the boot-time one). Started at the very top of `start()` —
+    /// it reads the shared, growable slot list, so children spawned later in
+    /// the boot are covered from their first second (post-M5 debt #1).
     #[cfg(unix)]
     fn spawn_watchdog_feeder(&mut self) {
         let Some(watchdog) = &self.orphan_watchdog else { return };
         let watchdog = Arc::clone(watchdog);
         let pgdata = self.config.postgres_data_dir();
-        let mut slots = Vec::new();
-        if let Some(handle) = &self.valkey {
-            slots.push(handle.pid_slot());
-        }
-        if let Some(handle) = &self.backend {
-            slots.push(handle.pid_slot());
-        }
-        if let Some(handle) = &self.exporter {
-            slots.push(handle.pid_slot());
-        }
+        let slots = Arc::clone(&self.watchdog_slots);
         let mut last = self.collect_child_pids();
         self.watchdog_feeder = Some(tokio::spawn(async move {
             loop {
@@ -896,9 +958,12 @@ impl Supervisor {
                 if let Some(pid) = watchdog::read_postmaster_pid(&pgdata) {
                     pids.push(pid);
                 }
-                for slot in &slots {
-                    if let Some(pid) = *slot.lock().expect("pid mutex") {
-                        pids.push(pid);
+                {
+                    let slots = slots.lock().expect("watchdog slots mutex");
+                    for slot in slots.iter() {
+                        if let Some(pid) = *slot.lock().expect("pid mutex") {
+                            pids.push(pid);
+                        }
                     }
                 }
                 pids.sort_unstable();

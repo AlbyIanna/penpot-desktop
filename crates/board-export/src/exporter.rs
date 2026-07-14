@@ -120,9 +120,12 @@ impl ExporterClient {
         ExporterClient {
             // Loopback-only traffic: keep env proxies out (same rationale as
             // PenpotClient — a configured corporate proxy must not hijack
-            // localhost requests).
+            // localhost requests). The per-request timeout bounds a wedged
+            // exporter (e.g. SIGSTOPped child) so no render can hang the
+            // batch forever — renders normally take single-digit seconds.
             http: reqwest::Client::builder()
                 .no_proxy()
+                .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("building a loopback-only reqwest client cannot fail"),
             base,

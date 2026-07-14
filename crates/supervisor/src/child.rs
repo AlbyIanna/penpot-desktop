@@ -42,6 +42,13 @@ pub(crate) struct ChildSpec {
     pub cwd: Option<PathBuf>,
     pub probe: Probe,
     pub ready_timeout: Duration,
+    /// The TCP port this child is expected to LISTEN on, when the service
+    /// must never be *adopted* from a stale process (post-M5 debt #1: a
+    /// SIGKILL-orphaned exporter answers `/readyz` while our own child dies
+    /// with EADDRINUSE). When set, every (re)spawn first refuses a port that
+    /// already has a listener, and readiness additionally verifies (via
+    /// `lsof`, best-effort) that the listening pid IS our child.
+    pub listener_port: Option<u16>,
 }
 
 /// Readiness as observed by `Supervisor::start`.
@@ -246,6 +253,29 @@ async fn supervise(
             return;
         }
 
+        // ---- stale-listener guard (pre-spawn) -----------------------------
+        // A port that already has a listener means our child would die with
+        // EADDRINUSE while the readiness probe happily adopts the imposter.
+        // Refuse instead (goes through the normal crash/backoff path, so a
+        // TIME_WAIT-ish transient clears on the next attempt).
+        let pre_spawn_conflict: Option<String> = match spec.listener_port {
+            Some(port) if crate::probe::port_has_listener(port).await => {
+                let pids =
+                    tokio::task::spawn_blocking(move || crate::probe::listener_pids(port))
+                        .await
+                        .unwrap_or_default();
+                Some(format!(
+                    "port {port} already has a listener (pid(s) {pids:?}) — refusing to \
+                     spawn over / adopt a stale process"
+                ))
+            }
+            _ => None,
+        };
+
+        let failure_reason: String;
+        if let Some(reason) = pre_spawn_conflict {
+            failure_reason = reason;
+        } else {
         // ---- spawn -------------------------------------------------------
         let mut command = Command::new(&spec.program);
         command
@@ -259,7 +289,6 @@ async fn supervise(
             command.current_dir(cwd);
         }
 
-        let failure_reason: String;
         match command.spawn() {
             Ok(mut child) => {
                 *pid_slot.lock().expect("pid mutex") = child.id();
@@ -270,6 +299,35 @@ async fn supervise(
                     .await
                 {
                     ReadyOutcome::Ready => {
+                        // ---- listener-identity check ----------------------
+                        // The probe answered — but was it OUR child? (A stale
+                        // process that bound the port between the pre-spawn
+                        // check and our child's bind would answer too, while
+                        // our child dies of EADDRINUSE.) Best-effort: when
+                        // lsof yields nothing, accept.
+                        let imposter: Option<String> = match (spec.listener_port, child.id()) {
+                            (Some(port), Some(child_pid)) => {
+                                let pids = tokio::task::spawn_blocking(move || {
+                                    crate::probe::listener_pids(port)
+                                })
+                                .await
+                                .unwrap_or_default();
+                                if !pids.is_empty() && !pids.contains(&child_pid) {
+                                    Some(format!(
+                                        "readiness probe on port {port} is answered by pid(s) \
+                                         {pids:?}, NOT our child {child_pid} — refusing to adopt \
+                                         a stale listener"
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(reason) = imposter {
+                            terminate(&mut child, grace).await;
+                            failure_reason = reason;
+                        } else {
                         let ready_at = Instant::now();
                         if ever_ready {
                             notifier.emit(SupervisorEvent::Restarted { service });
@@ -297,6 +355,7 @@ async fn supervise(
                                 failure_reason = format!("exited unexpectedly: {status}");
                             }
                         }
+                        }
                     }
                     ReadyOutcome::ShuttingDown => {
                         terminate(&mut child, grace).await;
@@ -317,6 +376,7 @@ async fn supervise(
             Err(error) => {
                 failure_reason = format!("failed to spawn {}: {error}", spec.program.display());
             }
+        }
         }
 
         // ---- crash path -------------------------------------------------
@@ -398,6 +458,7 @@ mod tests {
             cwd: Some(dir.to_path_buf()),
             probe: Probe::ValkeyPing { port },
             ready_timeout: Duration::from_secs(10),
+            listener_port: None,
         }
     }
 
@@ -551,6 +612,7 @@ mod tests {
             cwd: None,
             probe: Probe::ValkeyPing { port: free_port() }, // nothing listens
             ready_timeout: Duration::from_secs(2),
+            listener_port: None,
         };
         let handle =
             ServiceHandle::spawn(spec, policy, Duration::from_secs(1), notifier);
@@ -584,9 +646,61 @@ mod tests {
             cwd: None,
             probe: Probe::HttpOk { port: free_port(), path: "/readyz".into() },
             ready_timeout: Duration::from_secs(1),
+            listener_port: None,
         };
         let handle = ServiceHandle::spawn(spec, policy, Duration::from_secs(1), notifier);
         let reason = handle.wait_ready().await.expect_err("must fail");
         assert!(reason.contains("failed to spawn"), "reason: {reason}");
+    }
+
+    /// N2 bug-A regression: a stale process already LISTENing on the
+    /// service's port (and even answering the readiness probe with 200) must
+    /// NEVER be adopted — the supervision loop refuses pre-spawn and the
+    /// readiness future resolves to an error naming the conflict.
+    #[tokio::test]
+    async fn stale_listener_is_refused_not_adopted() {
+        // A fake "stale exporter": answers every request with HTTP 200.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fake = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let mut buf = [0u8; 512];
+                    use tokio::io::AsyncReadExt;
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let (notifier, _events) = recording_notifier();
+        let policy = RestartPolicy {
+            max_retries: 1,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(10),
+            stable_after: Duration::from_secs(30),
+        };
+        let spec = ChildSpec {
+            service: Service::Exporter,
+            program: PathBuf::from("/bin/sleep"), // alive but never listens
+            args: vec!["30".into()],
+            envs: Vec::new(),
+            cwd: None,
+            probe: Probe::HttpOk { port, path: "/readyz".into() },
+            ready_timeout: Duration::from_secs(5),
+            listener_port: Some(port),
+        };
+        let handle = ServiceHandle::spawn(spec, policy, Duration::from_secs(1), notifier);
+        let reason = handle.wait_ready().await.expect_err("must refuse the stale listener");
+        assert!(
+            reason.contains("already has a listener") || reason.contains("NOT our child"),
+            "reason: {reason}"
+        );
+        handle.shutdown().await;
+        fake.abort();
     }
 }
