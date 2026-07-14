@@ -52,6 +52,26 @@ Tag `vX.Y.Z` → released version `X.Y.Z` → assets named `..._X.Y.Z_...`.
 3. The Release appears at
    `https://github.com/AlbyIanna/penpot-desktop/releases/tag/v0.2.0`.
 
+### Rolling "latest" builds from `main` (automatic)
+
+Every push to `main` (i.e. every merge) automatically republishes a single
+**rolling prerelease** so there are always-current downloadables without minting
+a permanent version:
+
+- Trigger: `push: branches: ["main"]`.
+- Version: the committed workspace version + short commit sha, e.g.
+  `0.3.0-dev.84148b6` (derived in the `prepare` job from `Cargo.toml`).
+- Tag: `latest` — the `publish` job **deletes and recreates** it each run so the
+  tag tracks the newest `main` commit (a plain `gh release edit` cannot move a tag).
+- Marked as a **prerelease**, with a "Rolling build" note in the body.
+- Stable URL: `https://github.com/AlbyIanna/penpot-desktop/releases/tag/latest`.
+
+Scope: the rolling build only **builds + publishes** the artifacts — the code was
+already gated before it reached `main` (local `just e2e`); it does **not** re-run
+the milestone suites (they need Docker + ~2 h). Each run is ~20 min of macOS +
+Linux runner time. For a **pinned, stable** release, push a `v*` tag (above) —
+that path is unchanged and takes precedence over the rolling one.
+
 ### Validation / prerelease runs without a permanent tag
 
 `release.yml` is also `workflow_dispatch`-able, with inputs:

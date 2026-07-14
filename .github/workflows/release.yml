@@ -27,7 +27,8 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
+    branches: ["main"]   # -> roll the single "latest" prerelease with fresh downloadables
+    tags: ["v*"]         # -> an official versioned release
   workflow_dispatch:
     inputs:
       version:
@@ -58,7 +59,9 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       prerelease: ${{ steps.v.outputs.prerelease }}
+      rolling: ${{ steps.v.outputs.rolling }}
     steps:
+      - uses: actions/checkout@v4   # needed to read the committed workspace version
       - id: v
         env:
           # Pass untrusted context through env (never interpolate github.* into
@@ -66,28 +69,42 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
           INPUT_PRERELEASE: ${{ github.event.inputs.prerelease }}
+          REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          ROLLING="false"
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # Manual validation run: a deletable prerelease under the given version.
             VERSION="${INPUT_VERSION#v}"
             TAG="v${VERSION}"
             PRERELEASE="$INPUT_PRERELEASE"
-          else
+          elif [ "${REF#refs/tags/}" != "$REF" ]; then
+            # A v* tag -> the official, pinned versioned release.
             TAG="$REF_NAME"
             VERSION="${TAG#v}"
             PRERELEASE="false"
+          else
+            # A push to main -> roll the single "latest" prerelease with fresh
+            # downloadables. Version = committed workspace version + short sha.
+            BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+            SHORT="${SHA:0:7}"
+            VERSION="${BASE}-dev.${SHORT}"
+            TAG="latest"
+            PRERELEASE="true"
+            ROLLING="true"
           fi
           # Reject anything that is not a sane semver-ish token: injection guard
-          # AND a fail-fast for a malformed tag.
+          # AND a fail-fast for a malformed tag/version.
           case "$VERSION" in
             *[!A-Za-z0-9.+-]*|"") echo "invalid version: '$VERSION'" >&2; exit 1 ;;
           esac
-          if [ -z "$VERSION" ]; then echo "empty version" >&2; exit 1; fi
-          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
-          echo "tag=$TAG"         >>"$GITHUB_OUTPUT"
+          echo "version=$VERSION"       >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG"               >>"$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >>"$GITHUB_OUTPUT"
-          echo "Resolved version=$VERSION tag=$TAG prerelease=$PRERELEASE"
+          echo "rolling=$ROLLING"       >>"$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION tag=$TAG prerelease=$PRERELEASE rolling=$ROLLING"
 
   # ---------------------------------------------------------------------------
   # macOS arm64 dmg: crane path (no docker on macOS runners) + build-dmg.sh.
@@ -295,6 +312,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          ROLLING: ${{ needs.prepare.outputs.rolling }}
         run: |
           set -euo pipefail
 
@@ -303,9 +321,16 @@ jobs:
           test -f "$DMG"
           test -f "$APPIMAGE"
 
+          ROLLING_NOTE=""
+          if [ "$ROLLING" = "true" ]; then
+            ROLLING_NOTE=$'> **Rolling build** — automatically republished from the latest commit on `main`. It moves with `main`; for a pinned, stable release use a versioned `v*` release.\n'
+          fi
+
           BODY_FILE="$(mktemp)"
           cat >"$BODY_FILE" <<EOF
           Penpot Local ${VERSION} — offline, local-first Penpot desktop.
+
+          ${ROLLING_NOTE}
 
           ## Downloads
 
@@ -330,6 +355,13 @@ jobs:
 
           FLAGS=()
           if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+
+          # Rolling "latest": delete the previous release + tag so the recreated
+          # tag tracks the current main commit (gh release edit cannot move a tag).
+          if [ "$ROLLING" = "true" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Rolling latest: removing the previous $TAG release + tag."
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG exists — updating notes/flags."
