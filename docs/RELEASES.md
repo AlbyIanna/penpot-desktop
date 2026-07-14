@@ -144,3 +144,29 @@ this `release.yml` (dispatch reads the workflow file from `--ref`); the actor
 has `contents: write` on the repo; and the macOS 15 + Ubuntu 24.04 runners are
 available (same as `package.yml`). Expect ~9 min per platform build (warm caches)
 before `publish` runs.
+
+> **Platform caveat — `workflow_dispatch` needs the workflow on the default
+> branch.** GitHub only registers a workflow's `workflow_dispatch` trigger once
+> the workflow file exists on the repository's **default branch** (`main`).
+> Before `release.yml` is merged to `main`, `gh workflow run release.yml --ref
+> ci/n3-release` returns `HTTP 404: workflow release.yml not found on the default
+> branch`, even though the file is present on the branch. This is a platform
+> constraint, not a workflow bug. Two consequences:
+>
+> - **Pre-merge validation** (what the ReleaseCI phase does from `ci/n3-release`)
+>   is driven by the **push-tag path** instead, which reads the workflow from the
+>   pushed tag's own tree and needs no default-branch registration:
+>
+>   ```sh
+>   git tag v0.2.0-rc1 ci/n3-release && git push origin v0.2.0-rc1
+>   # ... watch the run, prove downloads, then tear down:
+>   gh release delete v0.2.0-rc1 --repo AlbyIanna/penpot-desktop --yes --cleanup-tag
+>   git push origin :refs/tags/v0.2.0-rc1   # delete the tag ref if it lingers
+>   ```
+>
+>   The push-tag path resolves `prerelease=false` (a real, but still deletable,
+>   Release). That is fine for validation — the whole thing is torn down after.
+> - **After `release.yml` is merged to `main`**, the `gh workflow run ... -f
+>   version=... -f prerelease=true` dispatch commands above work exactly as
+>   written. Real releases are always cut by pushing a `vX.Y.Z` tag, which never
+>   depended on dispatch registration.
