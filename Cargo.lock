@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "board-export"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "penpot-rpc",
@@ -3066,7 +3066,7 @@ dependencies = [
 
 [[package]]
 name = "penpot-desktop"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "penpot-rpc"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4483,7 +4483,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supervisor"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -4530,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "sync-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ryu",
  "serde",
@@ -4543,7 +4543,7 @@ dependencies = [
 
 [[package]]
 name = "sync-daemon"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "notify",
@@ -5609,7 +5609,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vault-index"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
