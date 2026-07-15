@@ -83,6 +83,18 @@ n5:
 n6:
     bash scripts/n6-templates.sh
 
+# E1 contract extractor + version classifier (PLAN3 milestone E1). A FAST,
+# PURE, STACK-FREE static gate: authors a combined fixture (first-class +
+# legacy variant models + applied tokens + tokens.json — no shipped template
+# has all three), extracts its contract, proves extract(A)==extract(A') under
+# uuid churn (keyed by name/path, never the remapped variantId), classifies
+# the curated delta matrix (impl->patch, added->minor, removed/renamed->major)
+# matching the python spike oracle exactly, special-cases the legacy->first-class
+# migration so it is not a spurious minor, and shows the contract is a pure
+# function of disk (invariant 1). No Penpot stack, no ports.
+contract:
+    bash scripts/e1-contract.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -92,7 +104,8 @@ routes-gate:
 
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
-# so never run them in parallel. Chains every landed n-gate (N1–N6).
+# so never run them in parallel. Chains every landed gate (N1–N6, E1+).
+# e1-contract is a fast static gate (no stack) safe to chain at the tail.
 # n2-thumbs needs the runtime bundle (`bash scripts/build-runtime-bundle.sh`);
 # m4-artifact-test.sh stays separate: it needs a dmg build
 # (`bash scripts/build-dmg.sh` first).
@@ -107,6 +120,7 @@ e2e:
     bash scripts/n4-palette.sh
     bash scripts/n5-vaults.sh
     bash scripts/n6-templates.sh
+    bash scripts/e1-contract.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).
