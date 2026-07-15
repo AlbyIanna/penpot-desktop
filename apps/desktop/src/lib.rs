@@ -740,13 +740,14 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     // is an explicit verb that imports a package's `.penpot` tree as an ordinary
     // vault file (generalized N6 installer) and pins it in `lock.json` at the
     // vault root. Same-origin routes through the proxy, like `/__templates`.
-    let packages_routes = packages::router(Arc::new(packages::PackagesState {
+    let packages_state = Arc::new(packages::PackagesState {
         packages_dir: config.designs_dir.join(sync_core::PACKAGES_DIR_NAME),
         vault_root: config.designs_dir.clone(),
         backend_base: readiness.backend_base_url.clone(),
         token: credentials.access_token.clone(),
         team_id: team_id.clone(),
-    }));
+    });
+    let packages_routes = packages::router(packages_state.clone());
 
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
@@ -791,7 +792,13 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
                 team = %team_id,
                 "starting sync daemon"
             );
-            Some(sync_daemon::spawn(rpc, sync_config))
+            let handle = sync_daemon::spawn(rpc, sync_config);
+            // E3 boot re-link reconcile: the daemon resurrects vault files by id
+            // (M2), but each lock link's DB-side file_library_rel does NOT ride
+            // the binfile — re-derive it once its endpoints are live. Idempotent;
+            // a vault with no links exits after one cheap pass.
+            packages::spawn_relink_reconcile(packages_state.clone());
+            Some(handle)
         }
         _ => {
             tracing::warn!(
