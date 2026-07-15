@@ -16,6 +16,7 @@ pub mod overlay;
 pub mod preflight;
 pub mod reveal;
 pub mod status;
+pub mod templates;
 pub mod tray;
 pub mod vault;
 
@@ -720,10 +721,23 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     // --- N4b "Checkpoint now" (manual, git-native vault checkpoint) --------
     let checkpoint_routes = checkpoint::router(config.designs_dir.clone());
 
+    // --- N6 offline template gallery + New-from-template (pillar 7) --------
+    // Enumerates the builtin-template binfiles shipped in the runtime bundle
+    // (`<runtime>/backend/builtin-templates`) and imports-as-new into the
+    // active vault's default project on demand — the sync daemon then
+    // materializes the `.penpot` tree on disk (folder = source of truth).
+    let templates_routes = templates::router(Arc::new(templates::TemplatesState {
+        builtin_dir: config.runtime_dir.join(templates::BUILTIN_TEMPLATES_REL),
+        backend_base: readiness.backend_base_url.clone(),
+        token: credentials.access_token.clone(),
+        team_id: team_id.clone(),
+    }));
+
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
         .merge(home_routes)
-        .merge(checkpoint_routes);
+        .merge(checkpoint_routes)
+        .merge(templates_routes);
 
     let mut proxy_config = proxy::ProxyConfig::new(
         config.runtime_dir.join("frontend"),

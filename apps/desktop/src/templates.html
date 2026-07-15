@@ -1,0 +1,191 @@
+<!--
+  N6 offline template gallery (pillar 7). Plain HTML + vanilla JS, served
+  same-origin at /__templates. Lists the shippable builtin templates from
+  /__api/templates and, on "New file", POSTs /__api/templates/new to import
+  the template as a REAL new .penpot file in the active vault's default
+  project, then deep-links into the workspace. Fully OFFLINE — no network,
+  no external assets (the "Arduino Examples menu" move).
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>New from template</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e3e6ea; --text: #14181d;
+    --muted: #6b7580; --accent: #4b5fd6; --accent-text: #ffffff; --sel: #eef1fd;
+    --chip: #eef1f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14181d; --panel: #1c2127; --border: #2b3138; --text: #e7ebef;
+      --muted: #9aa4af; --accent: #7d8ff5; --accent-text: #0d1013; --sel: #23304f;
+      --chip: #262c33;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text); background: var(--bg); min-height: 100vh;
+  }
+  header {
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--border);
+    background: var(--panel); position: sticky; top: 0; z-index: 2;
+  }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  header .home { float: right; font-size: 13px; color: var(--accent); text-decoration: none; }
+  #grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 16px; padding: 20px 24px 40px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .card .preview {
+    height: 120px; display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, var(--chip), var(--panel));
+    color: var(--muted); font-size: 34px; font-weight: 700; letter-spacing: .5px;
+    border-bottom: 1px solid var(--border); user-select: none;
+  }
+  .card .body { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .card .name { font-weight: 600; }
+  .card .meta { color: var(--muted); font-size: 12px; display: flex; gap: 8px; align-items: center; }
+  .badge {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .4px;
+    border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px;
+  }
+  .card button {
+    margin-top: auto; font: inherit; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--accent); color: var(--accent-text); background: var(--accent);
+    border-radius: 8px; padding: 7px 10px;
+  }
+  .card button:disabled { opacity: .55; cursor: default; }
+  #status { padding: 0 24px; min-height: 20px; color: var(--muted); font-size: 13px; }
+  .empty { padding: 40px 24px; color: var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <a class="home" href="/__home">← Lighttable</a>
+    <h1>New from template</h1>
+    <p id="sub">Offline template gallery — creates a real file in your vault.</p>
+  </header>
+  <div id="status"></div>
+  <div id="grid"></div>
+
+<script>
+(function () {
+  "use strict";
+  var grid = document.getElementById("grid");
+  var statusEl = document.getElementById("status");
+  var sub = document.getElementById("sub");
+  var busy = false;
+
+  function setStatus(msg) { statusEl.textContent = msg || ""; }
+
+  function initials(name) {
+    var parts = name.split(/\s+/).filter(Boolean);
+    var s = (parts[0] || "?").charAt(0) + (parts.length > 1 ? parts[parts.length - 1].charAt(0) : "");
+    return s.toUpperCase();
+  }
+
+  function fmtSize(bytes) {
+    if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + " MB";
+    if (bytes >= 1024) return Math.round(bytes / 1024) + " KB";
+    return bytes + " B";
+  }
+
+  function render(templates) {
+    grid.innerHTML = "";
+    if (!templates.length) {
+      grid.innerHTML = '<div class="empty">No templates available.</div>';
+      return;
+    }
+    templates.forEach(function (t) {
+      var card = document.createElement("div");
+      card.className = "card";
+
+      var prev = document.createElement("div");
+      prev.className = "preview";
+      prev.textContent = initials(t.name);
+
+      var body = document.createElement("div");
+      body.className = "body";
+
+      var name = document.createElement("div");
+      name.className = "name";
+      name.textContent = t.name;
+
+      var meta = document.createElement("div");
+      meta.className = "meta";
+      var badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = t.format;
+      var size = document.createElement("span");
+      size.textContent = fmtSize(t.sizeBytes);
+      meta.appendChild(badge);
+      meta.appendChild(size);
+
+      var btn = document.createElement("button");
+      btn.textContent = "New file";
+      btn.addEventListener("click", function () { create(t, btn); });
+
+      body.appendChild(name);
+      body.appendChild(meta);
+      body.appendChild(btn);
+      card.appendChild(prev);
+      card.appendChild(body);
+      grid.appendChild(card);
+    });
+  }
+
+  function create(t, btn) {
+    if (busy) return;
+    busy = true;
+    btn.disabled = true;
+    setStatus('Creating "' + t.name + '" in your vault…');
+    fetch("/__api/templates/new", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ templateId: t.id })
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (res.ok && res.j.deepLink) {
+          setStatus('Created "' + res.j.name + '". Opening…');
+          window.location.assign(res.j.deepLink);
+        } else {
+          setStatus("Could not create the file: " + (res.j.error || "unknown error"));
+          busy = false;
+          btn.disabled = false;
+        }
+      })
+      .catch(function (e) {
+        setStatus("Request failed: " + e);
+        busy = false;
+        btn.disabled = false;
+      });
+  }
+
+  function load() {
+    fetch("/__api/templates")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        sub.textContent = data.count + " templates — offline, creates a real file in your vault.";
+        render(data.templates || []);
+      })
+      .catch(function () {
+        grid.innerHTML = '<div class="empty">Template catalog unavailable.</div>';
+      });
+  }
+
+  load();
+})();
+</script>
+</body>
+</html>

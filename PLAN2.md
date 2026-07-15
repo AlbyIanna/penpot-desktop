@@ -207,7 +207,7 @@ lighttable, or index (asserted after every switch); every file keeps its origina
 id; both trees byte-identical before/after (recursive hash); `m2-invariant.sh` green on
 both vaults; a mid-switch SIGKILL + reboot recovers to a consistent single-vault state.
 
-### N6 — New-from-template + packaged vault experience (needs all previous)
+### N6 — New-from-template + packaged vault experience (needs all previous) — ✅ DONE 2026-07-15 (offline `/__templates` gallery + `/__api/templates` seeded from all 15 builtin binfiles — spike settled importability: 4 v3-zip direct + 11 legacy-v1 via `version=1` + one settle cycle, 0 dropped; `POST /__api/templates/new` imports-as-new into the active vault's Drafts, sync daemon materializes a real `.penpot` on disk, page/board count + text match the template and the new tree round-trips A=B; N4 palette "New from template…" stub now opens the gallery; `crates/penpot-rpc` gained `import_binfile_versioned` + transit-`~#set` end-event decode; `scripts/n6-templates.sh` (`just n6`) ALL PASS + chained into `just e2e`; `cargo test --workspace` green; new-from-template ≈ 6–10 s to on-disk materialization)
 Goal: offline template gallery from the bundled binfiles (spike first: legacy-format
 import per pillar 7 — ship however many of the 15 clear it, 4 minimum); the dmg ships the
 whole chapter.

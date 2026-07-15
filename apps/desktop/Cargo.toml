@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 supervisor = { path = "../../crates/supervisor" }
 proxy = { path = "../../crates/proxy" }
 penpot-rpc = { path = "../../crates/penpot-rpc" }
+sync-core = { path = "../../crates/sync-core" }
 sync-daemon = { path = "../../crates/sync-daemon" }
 board-export = { path = "../../crates/board-export" }
 vault-index = { path = "../../crates/vault-index" }
@@ -40,6 +41,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 http = "1"
 directories = "5"
 rand = "0.8"
+tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

@@ -81,14 +81,27 @@ pub fn decode_export_end(data: &str) -> Result<String> {
         })
 }
 
-/// Decode the `end` payload of `import-binfile`: a transit array of created
-/// file ids, e.g. `["~u3a4be581-6d37-8010-8008-51eecd7dc111"]`.
+/// Decode the `end` payload of `import-binfile`: the created file id(s),
+/// transit-encoded. Penpot 2.16.2 answers in **two shapes** depending on the
+/// source binfile format (both verified live in the N6 template spike):
+/// - **array** form, from v3-zip imports:
+///   `["~u3a4be581-6d37-8010-8008-51eecd7dc111"]`;
+/// - **transit-set** form, from legacy binfile-v1 imports:
+///   `{"~#set":["~u3a4be581-…"]}` — the ids live under the `~#set` key.
+///
+/// Both are accepted; each entry's `~u` transit-uuid prefix is stripped.
 pub fn decode_import_end(data: &str) -> Result<Vec<String>> {
     let value: serde_json::Value = serde_json::from_str(data)
         .map_err(|e| Error::Protocol(format!("import `end` event is not JSON: {e}; data={data}")))?;
-    let arr = value.as_array().ok_or_else(|| {
-        Error::Protocol(format!("import `end` event is not an array: {data}"))
-    })?;
+    // Accept the bare array, or the transit-set object `{"~#set":[…]}`.
+    let arr = value
+        .as_array()
+        .or_else(|| value.get("~#set").and_then(|v| v.as_array()))
+        .ok_or_else(|| {
+            Error::Protocol(format!(
+                "import `end` event is neither an array nor a `~#set` object: {data}"
+            ))
+        })?;
     arr.iter()
         .map(|v| {
             let s = v.as_str().ok_or_else(|| {
@@ -145,6 +158,22 @@ mod tests {
         let ids =
             decode_import_end("[\"~u3a4be581-6d37-8010-8008-51eecd7dc111\"]").unwrap();
         assert_eq!(ids, vec!["3a4be581-6d37-8010-8008-51eecd7dc111".to_string()]);
+    }
+
+    #[test]
+    fn decode_import_end_accepts_transit_set_form() {
+        // Legacy binfile-v1 imports answer with the transit-SET shape
+        // `{"~#set":["~u<id>"]}` (N6 spike). It must decode to the same ids.
+        let ids =
+            decode_import_end("{\"~#set\":[\"~u3a4be581-6d37-8010-8008-51eecd7dc111\"]}").unwrap();
+        assert_eq!(ids, vec!["3a4be581-6d37-8010-8008-51eecd7dc111".to_string()]);
+    }
+
+    #[test]
+    fn decode_import_end_rejects_unexpected_shape() {
+        // A bare object with no `~#set` key is neither shape → protocol error.
+        let err = decode_import_end("{\"oops\":1}").unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)));
     }
 
     #[test]
