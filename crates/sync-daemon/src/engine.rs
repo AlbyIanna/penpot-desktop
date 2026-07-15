@@ -1875,6 +1875,14 @@ fn walk_penpot_dirs(root: &Path) -> anyhow::Result<Vec<String>> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            // The in-vault package home is blind to sync (PLAN3 E2 invariant 1):
+            // the reconcile walk never descends into it, so a package `.penpot`
+            // tree is never hashed, imported, or conflict-copied. Dot-prefixed,
+            // so the next arm already skips it; explicit + named as
+            // defense-in-depth against any future relaxation of the dot rule.
+            if name == sync_core::PACKAGES_DIR_NAME {
+                continue;
+            }
             if name.starts_with('.') {
                 continue;
             }
@@ -1923,6 +1931,23 @@ mod tests {
                 "rootfile.penpot".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn walk_is_blind_to_the_penpot_packages_home() {
+        // PLAN3 E2 invariant 1: the full reconcile walk never descends into
+        // `.penpot-packages/`, so a package `.penpot` tree (even a valid one) is
+        // never enumerated, hashed, or imported by the daemon.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("Client/home.penpot/files")).unwrap();
+        std::fs::create_dir_all(
+            root.join(".penpot-packages/buttons/button-library.penpot/files"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".penpot-packages/icons/icons.penpot")).unwrap();
+        let got = walk_penpot_dirs(root).unwrap();
+        assert_eq!(got, vec!["Client/home.penpot".to_string()]);
     }
 
     #[test]

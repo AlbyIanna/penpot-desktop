@@ -19,6 +19,7 @@
 //! indent, non-ASCII preserved, LF, trailing newline.
 
 pub mod hash;
+pub mod lock;
 pub mod manifest;
 pub mod normalize;
 pub mod swap;
@@ -28,10 +29,23 @@ pub mod ziputil;
 pub use hash::{
     read_tree, semantic_tree_hash, semantic_view, sha256_hex, strip_volatile, tree_hash,
 };
+pub use lock::{
+    plan_reapply, LockEntry, Lockfile, ReapplyAction, LOCK_FILE_NAME, LOCK_SCHEMA_VERSION,
+};
 pub use manifest::{Manifest, ManifestEntry, MANIFEST_FILE_NAME, MANIFEST_SCHEMA_VERSION};
 pub use normalize::{dumps, normalize_json_bytes, normalize_tree, VOLATILE_KEYS};
 pub use swap::{cleanup_orphans, commit_dir_swap, stage_path_for, CleanupReport};
 pub use ziputil::{unzip_to, zip_dir};
+
+/// The in-vault package home (PLAN3 chapter 3 / E2): one git repo per package
+/// lives under `<vault>/.penpot-packages/<id>/`. Because the name is
+/// dot-prefixed it is invisible to BOTH sync directions — the daemon's event
+/// watcher and its full reconcile walk skip `.`-prefixed dirs (the same
+/// guarantee `.penpot-vault`/`.penpot-sync.json` rely on). Packages are
+/// therefore never auto-imported, hashed, or conflict-swept; install is an
+/// explicit verb. Named here so the blindness is a documented, tested
+/// invariant rather than an incidental consequence of the dot-prefix rule.
+pub const PACKAGES_DIR_NAME: &str = ".penpot-packages";
 
 use std::path::PathBuf;
 
@@ -57,6 +71,8 @@ pub enum Error {
     UnsafeZipPath(String),
     #[error("manifest schema version {found} is not supported (expected {expected})")]
     ManifestSchema { found: u32, expected: u32 },
+    #[error("lock.json schema version {found} is not supported (expected {expected})")]
+    LockSchema { found: u32, expected: u32 },
     #[error("{0}")]
     Swap(String),
 }
