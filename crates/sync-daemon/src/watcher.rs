@@ -38,6 +38,14 @@ pub(crate) fn map_event_path(sync_root: &Path, event_path: &Path) -> Option<Stri
     let mut acc = String::new();
     for comp in rel.components() {
         let name = comp.as_os_str().to_string_lossy();
+        // The in-vault package home is blind to sync (PLAN3 E2 invariant 1):
+        // never enumerate/import/conflict-copy anything under it. Dot-prefixed,
+        // so the next arm already catches it; kept explicit and named as
+        // defense-in-depth so the blindness survives any future relaxation of
+        // the blanket dot-dir rule (e.g. to peek at `.penpot-vault`).
+        if name == sync_core::PACKAGES_DIR_NAME {
+            return None;
+        }
         if name.starts_with('.') {
             return None; // dot dirs, the manifest, manifest tmp files
         }
@@ -71,6 +79,12 @@ pub(crate) fn is_structural_event(sync_root: &Path, event_path: &Path) -> bool {
     let mut any = false;
     for comp in rel.components() {
         let name = comp.as_os_str().to_string_lossy();
+        // Package home is blind to sync (PLAN3 E2): a structural sweep must
+        // never treat a package dir/file as a moved project folder. Dot-prefix
+        // already covers it; explicit + named as defense-in-depth.
+        if name == sync_core::PACKAGES_DIR_NAME {
+            return false;
+        }
         if name.starts_with('.')
             || name.contains(".penpot.tmp-")
             || name.contains(".penpot.old-")
@@ -200,6 +214,33 @@ mod tests {
         );
         assert_eq!(map(r, "/designs/.git/objects/ab/cdef"), None);
         assert_eq!(map(r, "/designs/.hidden/x.penpot/f.json"), None);
+    }
+
+    #[test]
+    fn penpot_packages_home_is_blind_to_the_watcher() {
+        // PLAN3 E2 invariant 1: a package `.penpot` dropped under
+        // `.penpot-packages/`, and edits to files inside it, never map to an
+        // owning file dir — so the daemon never enumerates/imports/conflicts it.
+        let r = "/designs";
+        assert_eq!(map(r, "/designs/.penpot-packages"), None);
+        assert_eq!(map(r, "/designs/.penpot-packages/buttons"), None);
+        assert_eq!(
+            map(r, "/designs/.penpot-packages/buttons/button-library.penpot"),
+            None
+        );
+        assert_eq!(
+            map(
+                r,
+                "/designs/.penpot-packages/buttons/button-library.penpot/files/f/pages/p/s.json"
+            ),
+            None
+        );
+        // lock.json at the vault root is a plain file, not a `.penpot` dir.
+        assert_eq!(map(r, "/designs/lock.json"), None);
+        // A structural sweep must not treat a package path as a moved project.
+        let s = |p: &str| is_structural_event(Path::new(r), Path::new(p));
+        assert!(!s("/designs/.penpot-packages"));
+        assert!(!s("/designs/.penpot-packages/buttons/button-library.penpot"));
     }
 
     #[test]

@@ -129,7 +129,15 @@ pub fn cleanup_orphans(root: &Path) -> Result<CleanupReport> {
                 Some((base, "old")) if is_dir => olds.push((path, dir.join(base))),
                 Some((_, "tmp")) => tmps.push(path),
                 _ => {
-                    if is_dir && !name.ends_with(PENPOT_DIR_SUFFIX) {
+                    // Never descend into the package home: packages are git
+                    // repos the sync layer must not touch (E2 daemon-blindness
+                    // invariant — mirrors the watcher/walker guards). Without
+                    // this, the sweep would recurse in and restore/delete any
+                    // entry matching the swap-orphan grammar inside a package.
+                    if is_dir
+                        && !name.ends_with(PENPOT_DIR_SUFFIX)
+                        && name != crate::PACKAGES_DIR_NAME
+                    {
                         subdirs.push(path);
                     }
                 }

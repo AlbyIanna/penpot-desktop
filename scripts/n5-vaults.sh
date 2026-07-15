@@ -297,6 +297,14 @@ else
 fi
 n5helper wait_synced "$WORK_DIR" B "$VAULT_B" "$SYNC_TIMEOUT" >/dev/null 2>"$WORK_DIR/syncB.err" ||
     { fail "(a) vault B did not sync"; cat "$WORK_DIR/syncB.err" >&2; exit 1; }
+# The vault index is a downstream reader of the sync manifest (poll-driven diff),
+# so it lands one cycle AFTER wait_synced proves the disk↔DB contract. The strict
+# assert_state below reads /boards + /search, so wait for that eventual-consistency
+# barrier too — exactly what the B→A and A→B-again switches already do via
+# wait_present. Without it, assert_state can read the index one poll early and
+# flake on "B absent from /boards / needle not searchable" (index-lag, not spill).
+n5helper wait_present "$WORK_DIR" B "$SYNC_TIMEOUT" >/dev/null 2>"$WORK_DIR/indexB.err" ||
+    { fail "(a) vault B index did not catch up"; cat "$WORK_DIR/indexB.err" >&2; exit 1; }
 HASH_B="$(n5helper tree_hash "$VAULT_B")"
 echo "     vault B .penpot tree hash: ${HASH_B:0:16}…"
 

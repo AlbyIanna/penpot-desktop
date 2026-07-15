@@ -11,8 +11,10 @@ pub mod control;
 pub mod dialog;
 pub mod gitinit;
 pub mod home;
+pub mod installer;
 pub mod layout;
 pub mod overlay;
+pub mod packages;
 pub mod preflight;
 pub mod reveal;
 pub mod status;
@@ -733,11 +735,25 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         team_id: team_id.clone(),
     }));
 
+    // --- E2 package home + lockfile + installer (PLAN3 chapter 3) ----------
+    // Packages live under `<vault>/.penpot-packages/` (blind to sync); install
+    // is an explicit verb that imports a package's `.penpot` tree as an ordinary
+    // vault file (generalized N6 installer) and pins it in `lock.json` at the
+    // vault root. Same-origin routes through the proxy, like `/__templates`.
+    let packages_routes = packages::router(Arc::new(packages::PackagesState {
+        packages_dir: config.designs_dir.join(sync_core::PACKAGES_DIR_NAME),
+        vault_root: config.designs_dir.clone(),
+        backend_base: readiness.backend_base_url.clone(),
+        token: credentials.access_token.clone(),
+        team_id: team_id.clone(),
+    }));
+
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
         .merge(home_routes)
         .merge(checkpoint_routes)
-        .merge(templates_routes);
+        .merge(templates_routes)
+        .merge(packages_routes);
 
     let mut proxy_config = proxy::ProxyConfig::new(
         config.runtime_dir.join("frontend"),

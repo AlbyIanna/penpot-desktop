@@ -105,6 +105,34 @@ fn cleanup_restores_old_when_target_is_missing() {
     assert_eq!(read_marker(&target), "last-known-good");
 }
 
+/// The startup sweep must never descend into `.penpot-packages/` — packages are
+/// git repos the sync layer must not touch (E2 daemon-blindness invariant). An
+/// entry inside a package that happens to match the swap-orphan grammar is left
+/// completely alone, while the same entry at the vault root IS handled.
+#[test]
+fn cleanup_never_touches_the_package_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join(".penpot-packages").join("some-pkg");
+    let in_pkg_old = pkg.join("widget.penpot.old-0123456789ab");
+    let in_pkg_tmp = pkg.join("gadget.penpot.tmp-fedcba987654");
+    write_tree(&in_pkg_old, &[("marker.txt", "package-internal")]);
+    write_tree(&in_pkg_tmp, &[("marker.txt", "package-internal")]);
+    // A genuine root-level orphan (control): this one MUST be swept.
+    let root_tmp = tmp.path().join("homepage.penpot.tmp-0011223344ff");
+    write_tree(&root_tmp, &[("marker.txt", "partial")]);
+
+    let report = cleanup_orphans(tmp.path()).unwrap();
+
+    // Everything inside .penpot-packages/ is untouched.
+    assert!(in_pkg_old.exists(), "package orphan-named dir must not be restored/deleted");
+    assert!(in_pkg_tmp.exists(), "package orphan-named dir must not be deleted");
+    assert!(report.restored.is_empty());
+    assert!(report.removed_old.is_empty());
+    // The root-level orphan was swept as usual.
+    assert_eq!(report.removed_tmp, vec![root_tmp.clone()]);
+    assert!(!root_tmp.exists());
+}
+
 /// Crash state 3: tmp already renamed to target, crash before old deletion.
 /// Target intact → old is deleted.
 #[test]

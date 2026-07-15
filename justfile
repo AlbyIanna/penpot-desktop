@@ -95,6 +95,18 @@ n6:
 contract:
     bash scripts/e1-contract.sh
 
+# E2 package home + lockfile + generalized installer (PLAN3 milestone E2). A
+# LIVE gate: drops a template + a component-library `.penpot` under
+# `.penpot-packages/` and proves the sync daemon is BLIND to them (edit inside →
+# no manifest entry, no `.conflict`, no import); an explicit install imports +
+# settles to a fixpoint (two equal semantic hashes) + writes a `lock.json` entry;
+# `git clone` a local bare repo lands a package that installs OFFLINE; delete-DB
+# + reboot re-applies every locked package deterministically (M2 resurrect-by-id)
+# with no user-disk write outside `.penpot-packages/`; run-twice is a no-op.
+# Dedicated ports 8962/6423/5497/6440; needs the runtime bundle + a live stack.
+e2:
+    bash scripts/e2-packages.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -104,8 +116,9 @@ routes-gate:
 
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
-# so never run them in parallel. Chains every landed gate (N1–N6, E1+).
-# e1-contract is a fast static gate (no stack) safe to chain at the tail.
+# so never run them in parallel. Chains every landed gate (N1–N6, E1, E2).
+# e1-contract is a fast static gate (no stack); e2-packages boots its own live
+# stack (dedicated ports) like the m/n suites, safe to chain at the tail.
 # n2-thumbs needs the runtime bundle (`bash scripts/build-runtime-bundle.sh`);
 # m4-artifact-test.sh stays separate: it needs a dmg build
 # (`bash scripts/build-dmg.sh` first).
@@ -121,6 +134,7 @@ e2e:
     bash scripts/n5-vaults.sh
     bash scripts/n6-templates.sh
     bash scripts/e1-contract.sh
+    bash scripts/e2-packages.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).
