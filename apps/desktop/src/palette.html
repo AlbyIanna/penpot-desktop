@@ -190,9 +190,11 @@
           .catch(function () { setNote("Checkpoint failed."); });
         break;
       case "template":
-        // Stub that DEFERS cleanly (PLAN2: templates arrive in N6). Nothing
-        // destructive — just a message; a real surface lands in N6.
-        setNote("New-from-template arrives in N6 (the package ecosystem). Nothing was created.");
+        // N6: open the offline template gallery (the "Arduino Examples menu").
+        // Nothing is created here — the gallery is where the user picks a
+        // template and explicitly creates a new file ("surface, don't apply").
+        setNote("Opening the template gallery…");
+        window.location.assign("/__templates");
         break;
       case "switch":
         setNote("Switching vaults arrives in N5. Nothing was changed.");

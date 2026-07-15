@@ -74,6 +74,15 @@ n4:
 n5:
     bash scripts/n5-vaults.sh
 
+# N6 template gallery + New-from-template (pillar 7): GET /__api/templates
+# lists the shippable builtin set; /__templates serves offline; for a
+# representative template of each format (v3-zip + legacy, incl. the settle
+# path) "New file from template" imports-as-new → a real .penpot dir appears
+# in the vault, its page/board count + text match the template, and the
+# materialized tree round-trips A=B (roundtrip.py semantics). Renders OFF.
+n6:
+    bash scripts/n6-templates.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -83,7 +92,7 @@ routes-gate:
 
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
-# so never run them in parallel. Chains every landed n-gate (N1, N2).
+# so never run them in parallel. Chains every landed n-gate (N1–N6).
 # n2-thumbs needs the runtime bundle (`bash scripts/build-runtime-bundle.sh`);
 # m4-artifact-test.sh stays separate: it needs a dmg build
 # (`bash scripts/build-dmg.sh` first).
@@ -97,6 +106,7 @@ e2e:
     bash scripts/n3-home.sh
     bash scripts/n4-palette.sh
     bash scripts/n5-vaults.sh
+    bash scripts/n6-templates.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

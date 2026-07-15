@@ -444,6 +444,11 @@ impl PenpotClient {
     /// Returns the created/updated file id(s) from the SSE `end` event.
     /// In-place import replaces content wholesale and resets `revn` to the
     /// value stored in the binfile — `revn` can move backwards.
+    ///
+    /// Auto-detects the binfile format (works for v3 zips). To import a
+    /// **legacy** binfile-v1 (e.g. the older builtin templates, magic
+    /// `0x010B1A86`) pass an explicit `version` via
+    /// [`Self::import_binfile_versioned`] — omitting it fails with HTTP 500.
     pub async fn import_binfile(
         &self,
         name: &str,
@@ -451,11 +456,39 @@ impl PenpotClient {
         file_id: Option<&str>,
         penpot_zip: Vec<u8>,
     ) -> Result<Vec<String>> {
+        self.import_binfile_versioned(name, project_id, file_id, penpot_zip, None)
+            .await
+    }
+
+    /// `import-binfile` with an explicit binfile-format `version` multipart
+    /// text field. Verified in the N6 template spike against Penpot 2.16.2:
+    /// - `version = None` — auto-detect; correct for v3-zip binfiles
+    ///   (magic `PK\x03\x04`).
+    /// - `version = Some(1)` — **required** for legacy binfile-v1 payloads
+    ///   (magic `0x010B1A86`); omitting it answers HTTP 500, and `Some(3)`
+    ///   answers a wrong-magic error. Once such a file lives in the DB, every
+    ///   subsequent export is a normal v3 tree, so in-place re-imports are
+    ///   version-less again.
+    ///
+    /// The `end` event is decoded by [`sse::decode_import_end`], which accepts
+    /// both the array (`["~u<id>"]`, v3) and transit-set
+    /// (`{"~#set":["~u<id>"]}`, legacy) shapes.
+    pub async fn import_binfile_versioned(
+        &self,
+        name: &str,
+        project_id: &str,
+        file_id: Option<&str>,
+        penpot_zip: Vec<u8>,
+        version: Option<u8>,
+    ) -> Result<Vec<String>> {
         let mut form = Form::new()
             .text("name", name.to_string())
             .text("project-id", project_id.to_string());
         if let Some(fid) = file_id {
             form = form.text("file-id", fid.to_string());
+        }
+        if let Some(v) = version {
+            form = form.text("version", v.to_string());
         }
         let part = Part::bytes(penpot_zip)
             .file_name("import.penpot")

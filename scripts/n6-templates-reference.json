@@ -1,0 +1,191 @@
+{
+  "avataaars": {
+    "boards": 370,
+    "kind": "legacy",
+    "pages": 6,
+    "recipe": "legacy-version1",
+    "texts": [
+      "avataaars",
+      "Mix and match avatar library",
+      "Customize your avataaar with features Browse the c",
+      "Video Tutorial:  https://url.candide.media/avataaa",
+      "\"Body/Skin\""
+    ]
+  },
+  "black-white-mobile-templates": {
+    "boards": 139,
+    "kind": "v3-zip",
+    "pages": 3,
+    "recipe": "v3-noversion",
+    "texts": [
+      "Settings",
+      "news",
+      "deep house",
+      "grunge",
+      "fashion & design"
+    ]
+  },
+  "flex-layout-playground": {
+    "boards": 2602,
+    "kind": "legacy",
+    "pages": 13,
+    "recipe": "legacy-version1",
+    "texts": [
+      "Pages",
+      "Welcome Penmate!",
+      "Let's get to work!",
+      "A bit of theory before starting...",
+      "Presionando Ctrl/Shift ⇧ + A."
+    ]
+  },
+  "font-awesome": {
+    "boards": 2065,
+    "kind": "legacy",
+    "pages": 2,
+    "recipe": "legacy-version1",
+    "texts": []
+  },
+  "lucide-icons": {
+    "boards": 2924,
+    "kind": "legacy",
+    "pages": 3,
+    "recipe": "legacy-version1",
+    "texts": [
+      "Lucide",
+      "About this file",
+      "Beautiful & consistent icon toolkit made by the co",
+      "How to use as a library",
+      "Icon library"
+    ]
+  },
+  "open-color-scheme": {
+    "boards": 7,
+    "kind": "legacy",
+    "pages": 2,
+    "recipe": "legacy-version1",
+    "texts": [
+      "Optimized for UI like font, background, border, et",
+      "Optimized for UI like font, background, border, et",
+      "To use this within your files on Penpot you must m",
+      "Open Color is an open-source color scheme",
+      "Usage (in Penpot)"
+    ]
+  },
+  "penpot-design-system": {
+    "boards": 11338,
+    "kind": "v3-zip",
+    "pages": 41,
+    "recipe": "v3-noversion",
+    "texts": [
+      "We are delighted that you have downloaded Pencil, ",
+      "Welcome to Pencil",
+      "Please contact us if you have any feedback, compli",
+      "The purpose of publishing this DS is to give you t",
+      "How to use Pencil as a library"
+    ]
+  },
+  "plants-app": {
+    "boards": 268,
+    "kind": "v3-zip",
+    "pages": 3,
+    "recipe": "v3-noversion",
+    "texts": [
+      "Annie Sprat,",
+      "Version 1.0",
+      "Photos by",
+      "Icon set by Eleonor Wang",
+      "Plants app"
+    ]
+  },
+  "prototype-examples": {
+    "boards": 81,
+    "kind": "legacy",
+    "pages": 6,
+    "recipe": "legacy-version1",
+    "texts": [
+      "Overlay  page:",
+      "This file contains four different examples of prot",
+      "What is in this Prototype examples template?",
+      "Prototyping an overlay that opens over another vie",
+      "2. Select any board in the canvas area, this will "
+    ]
+  },
+  "tokens-starter-kit": {
+    "boards": 548,
+    "kind": "v3-zip",
+    "pages": 10,
+    "recipe": "v3-noversion",
+    "texts": [
+      "Select any object on the canvas or choose a layer ",
+      "When a design token is applied to the current laye",
+      "Use the  THEMES  switcher to choose between differ",
+      "Have fun!",
+      "Use the  +  button alongside each token type to ad"
+    ]
+  },
+  "tutorial-for-beginners": {
+    "boards": 34,
+    "kind": "legacy",
+    "pages": 3,
+    "recipe": "legacy-version1",
+    "texts": [
+      "Penpot tutorial",
+      "P",
+      "Path",
+      "Layers are displayed from the bottom to the top of",
+      "X"
+    ]
+  },
+  "ux-notes": {
+    "boards": 98,
+    "kind": "legacy",
+    "pages": 3,
+    "recipe": "legacy-version1",
+    "texts": [
+      "UX notes",
+      "Annotations",
+      "risk scoring",
+      "risk scoring",
+      "risk scoring"
+    ]
+  },
+  "welcome": {
+    "boards": 5,
+    "kind": "legacy",
+    "pages": 1,
+    "recipe": "legacy-version1",
+    "texts": [
+      "Welcome to Penpot, Willy!",
+      "Use the     board tool above to create a new board",
+      "Double-click the layer’s icon in the ←  LAYERS  pa",
+      "Hold down the  space key  and use your      mouse ",
+      "Double-click any object and make changes from the "
+    ]
+  },
+  "whiteboarding-kit": {
+    "boards": 128,
+    "kind": "legacy",
+    "pages": 2,
+    "recipe": "legacy-version1",
+    "texts": [
+      "This is a comment",
+      "This is a sticky note  Write anything you want in ",
+      "This is a sticky note  Write anything you want in ",
+      "Name",
+      "Name"
+    ]
+  },
+  "wireframing-kit": {
+    "boards": 228,
+    "kind": "legacy",
+    "pages": 5,
+    "recipe": "legacy-version1",
+    "texts": [
+      "This is a file where you can find different compon",
+      "Wireframing Kit library assets",
+      "What is this Wireframing kit?",
+      "You can also customize your colors right from the ",
+      "Use the provided components to design your wirefra"
+    ]
+  }
+}

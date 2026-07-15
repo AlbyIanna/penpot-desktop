@@ -459,6 +459,36 @@ else
     echo "last palette response: $PAL_RESP" >&2
 fi
 
+# (g3) PACKAGED NEW-FROM-TEMPLATE: N6's offline template gallery must ship in the artifact
+# and create a REAL on-disk .penpot file in the packaged app, offline (templates are
+# bundled in penpot-runtime/backend/builtin-templates; import is loopback RPC only).
+TPL_CODE="$(curl -s -o "$WORK/templates.json" -w '%{http_code}' "$BASE/__api/templates" 2>/dev/null || echo 000)"
+TPL_COUNT="$(python3 -c "import json;print(json.load(open('$WORK/templates.json')).get('count',0))" 2>/dev/null || echo 0)"
+if [ "$TPL_CODE" = "200" ] && [ "${TPL_COUNT:-0}" -ge 4 ]; then
+    pass "(g3a) /__api/templates listed $TPL_COUNT templates OFFLINE through the .app"
+else
+    fail "(g3a) /__api/templates not served offline (code=$TPL_CODE count=$TPL_COUNT)"
+fi
+# Create a new file from the smallest template (fastest import) and confirm a real .penpot
+# directory materialises on disk in the active vault (<data>/designs).
+TID="$(python3 -c "import json;ts=json.load(open('$WORK/templates.json')).get('templates',[]);ts.sort(key=lambda t:t.get('sizeBytes',0));print(ts[0]['id'] if ts else '')" 2>/dev/null || echo '')"
+BEFORE_N="$(find "$DATA_DIR/designs" -type d -name '*.penpot' 2>/dev/null | wc -l | tr -d ' ')"
+curl -sS -X POST "$BASE/__api/templates/new" -H 'Content-Type: application/json' \
+    -d "{\"templateId\":\"$TID\"}" -o "$WORK/newtpl.json" 2>/dev/null || true
+NEW_OK="$(python3 -c "import json;print(json.load(open('$WORK/newtpl.json')).get('ok'))" 2>/dev/null || echo None)"
+AFTER_N="$BEFORE_N"
+for _ in $(seq 1 45); do
+    AFTER_N="$(find "$DATA_DIR/designs" -type d -name '*.penpot' 2>/dev/null | wc -l | tr -d ' ')"
+    [ "${AFTER_N:-0}" -gt "${BEFORE_N:-0}" ] && break
+    sleep 2
+done
+if [ "$NEW_OK" = "True" ] && [ "${AFTER_N:-0}" -gt "${BEFORE_N:-0}" ]; then
+    pass "(g3b) new-from-template '$TID' materialised a real on-disk .penpot dir OFFLINE (dirs $BEFORE_N -> $AFTER_N)"
+else
+    fail "(g3b) new-from-template did not materialise an on-disk .penpot dir (ok=$NEW_OK id=$TID before=$BEFORE_N after=$AFTER_N)"
+    cat "$WORK/newtpl.json" >&2 2>/dev/null || true
+fi
+
 # (e) SIGTERM: clean exit, no orphans ---------------------------------------------------
 CHILL_PIDS="$(stack_pids)"
 kill -TERM "$APP_PID" 2>/dev/null
