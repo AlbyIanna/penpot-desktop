@@ -27,6 +27,7 @@
 //! moved, an entry vanished, or a path was re-keyed.
 
 pub mod boards;
+pub mod contract;
 pub mod db;
 pub mod extract;
 pub mod palette;
@@ -37,6 +38,10 @@ mod http;
 pub use boards::{
     assemble_cards, exports_rel_path, load_stem_map, resolve_thumb_path, thumb_url, BoardCard,
     BoardListing, FileMeta, Sort,
+};
+pub use contract::{
+    diff_contracts, extract_contracts, Bump, Classification, Contract, FieldDelta, LibraryContract,
+    SetDelta, SetKind, TokenExport,
 };
 pub use db::{BoardRow, Hit, IndexDb, SearchError, SearchHandle, SCHEMA_VERSION};
 pub use extract::{extract_docs, DocKind, DocRow, ROOT_FRAME_ID};
