@@ -49,6 +49,32 @@ pub const LOCK_FILE_NAME: &str = "lock.json";
 /// Current schema version written by this crate.
 pub const LOCK_SCHEMA_VERSION: u32 = 1;
 
+/// One library this consumer file links (E3). The consumer references the
+/// library's components by the library's **vault-local file-id**
+/// (`library_file_id`); the DB-side `file_library_rel` is derived/disposable and
+/// re-established from this record after a DB wipe via `link-file-to-library`.
+///
+/// Added WITHOUT a schema bump: it is a `#[serde(default)]` field on
+/// [`LockEntry`], so an E2 lockfile with no `links` loads forward-compatibly as
+/// an empty list (like `library_shared`/`plugin_props`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LibraryLink {
+    /// The library's vault-local Penpot file id (the `componentFile` value the
+    /// consumer's instances carry, and the `library-id` for
+    /// `link-file-to-library`). The durable pointer, stable across a DB-wipe
+    /// rebuild (M2 resurrect-by-id).
+    pub library_file_id: String,
+    /// The package id (`.penpot-packages/<id>`) the library was installed from —
+    /// the update channel (E1 contract diff) is keyed off this package's entry.
+    pub library_package_id: String,
+    /// The library package version pinned at link time (`library@version`).
+    pub version: String,
+    /// E1 `extract_contracts` hash of the library at link time. Drift is surfaced
+    /// as a CONTRACT diff (E1 patch/minor/major), never `revn`.
+    pub contract_hash: String,
+}
+
 /// One installed package's pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -79,6 +105,12 @@ pub struct LockEntry {
     /// DB-only pointer: the plugin registry profile-props (E7). Empty for E2.
     #[serde(default)]
     pub plugin_props: BTreeMap<String, String>,
+    /// E3: the libraries this file links (references components from). Empty for
+    /// a plain design-data or library package. The DB-side `file_library_rel`
+    /// each entry maps to is derived/disposable — re-established from these
+    /// records after a DB wipe via `link-file-to-library` (see [`plan_relink`]).
+    #[serde(default)]
+    pub links: Vec<LibraryLink>,
 }
 
 /// The lockfile document. Keys of `packages` are package ids.
@@ -209,6 +241,69 @@ pub fn plan_reapply(lock: &Lockfile, present_file_ids: &BTreeSet<String>) -> Vec
         .collect()
 }
 
+/// One library link to re-establish after a DB wipe (E3). Carries the ids the
+/// boot-time re-link reconcile feeds to `link-file-to-library {fileId:
+/// consumer_file_id, libraryId: library_file_id}` (idempotent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelinkOp {
+    /// The consumer file whose instances reference the library.
+    pub consumer_file_id: String,
+    /// The library file to re-link the consumer to.
+    pub library_file_id: String,
+    /// The library's package id (for logging / update-channel correlation).
+    pub library_package_id: String,
+}
+
+/// The re-link decision for one lockfile link after a DB wipe. The DB-side
+/// `file_library_rel` is disposable (it does NOT ride the binfile), so on
+/// rebuild every link is re-derived by re-running the idempotent
+/// `link-file-to-library`. This splits, per link, whether both endpoints are
+/// live yet (M2 resurrected them by id → ready to re-link) or an endpoint is
+/// still absent (blocked — its file must be resurrected first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelinkAction {
+    /// Both consumer and library files are live in the DB — re-run
+    /// `link-file-to-library` now (idempotent).
+    Ready(RelinkOp),
+    /// One endpoint (consumer or library) is not yet present — cannot re-link
+    /// until it is resurrected.
+    Blocked(RelinkOp),
+}
+
+impl RelinkAction {
+    pub fn op(&self) -> &RelinkOp {
+        match self {
+            RelinkAction::Ready(op) | RelinkAction::Blocked(op) => op,
+        }
+    }
+}
+
+/// Decide, per lockfile link, whether it can be re-established now (both the
+/// consumer and library file-ids are among `present_file_ids`, resurrected by
+/// M2) or is blocked on a still-absent endpoint. Pure and deterministic
+/// (packages sorted by id, links in entry order) so it is unit-testable without
+/// a live stack. Mirrors [`plan_reapply`].
+pub fn plan_relink(lock: &Lockfile, present_file_ids: &BTreeSet<String>) -> Vec<RelinkAction> {
+    let mut out = Vec::new();
+    for entry in lock.packages.values() {
+        for link in &entry.links {
+            let op = RelinkOp {
+                consumer_file_id: entry.file_id.clone(),
+                library_file_id: link.library_file_id.clone(),
+                library_package_id: link.library_package_id.clone(),
+            };
+            if present_file_ids.contains(&entry.file_id)
+                && present_file_ids.contains(&link.library_file_id)
+            {
+                out.push(RelinkAction::Ready(op));
+            } else {
+                out.push(RelinkAction::Blocked(op));
+            }
+        }
+    }
+    out
+}
+
 /// Current time as an RFC 3339 UTC string (delegates to the manifest helper).
 pub fn now_rfc3339() -> String {
     crate::manifest::now_rfc3339()
@@ -230,6 +325,16 @@ mod tests {
             installed_at: "2026-07-15T00:00:00Z".into(),
             library_shared: false,
             plugin_props: BTreeMap::new(),
+            links: Vec::new(),
+        }
+    }
+
+    fn link(library_file_id: &str, package_id: &str) -> LibraryLink {
+        LibraryLink {
+            library_file_id: library_file_id.into(),
+            library_package_id: package_id.into(),
+            version: "1.0.0".into(),
+            contract_hash: "lch".into(),
         }
     }
 
@@ -334,5 +439,103 @@ mod tests {
         let present: BTreeSet<String> = ["file-a".to_string()].into_iter().collect();
         let plan = plan_reapply(&lock, &present);
         assert!(matches!(plan[0], ReapplyAction::AlreadyResurrected { .. }));
+    }
+
+    /// An E3 lockfile with `links` round-trips through disk unchanged.
+    #[test]
+    fn links_round_trip_through_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lock = Lockfile::default();
+        let mut consumer = entry("consumer-file", "hc");
+        consumer.links.push(link("library-file", "button-library"));
+        lock.upsert("app-screens", consumer);
+        lock.upsert("button-library", entry("library-file", "hl"));
+        lock.save(tmp.path()).unwrap();
+
+        let loaded = Lockfile::load(tmp.path()).unwrap().unwrap();
+        assert_eq!(loaded, lock);
+        assert_eq!(loaded.packages["app-screens"].links.len(), 1);
+        assert_eq!(
+            loaded.packages["app-screens"].links[0].library_file_id,
+            "library-file"
+        );
+    }
+
+    /// An E2 lockfile written BEFORE E3 (no `links` field anywhere) still loads —
+    /// `links` is `#[serde(default)]`, so forward-compat load yields an empty
+    /// list, never an "unknown field" or "missing field" error.
+    #[test]
+    fn e2_lockfile_without_links_loads_forward_compatibly() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            Lockfile::path_in(tmp.path()),
+            br#"{
+              "schemaVersion": 1,
+              "packages": {
+                "buttons": {
+                  "version": "1.0.0",
+                  "kind": "component-library",
+                  "contentHash": "h",
+                  "contractHash": "ch",
+                  "sourceGitUrl": "",
+                  "fileId": "file-a",
+                  "name": "Buttons",
+                  "installedAt": "2026-07-15T00:00:00Z"
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let loaded = Lockfile::load(tmp.path()).unwrap().unwrap();
+        assert!(loaded.packages["buttons"].links.is_empty());
+        assert!(!loaded.packages["buttons"].library_shared);
+    }
+
+    #[test]
+    fn plan_relink_splits_ready_from_blocked() {
+        let mut lock = Lockfile::default();
+        // Consumer links a library; library also has an entry of its own.
+        let mut consumer = entry("consumer-file", "hc");
+        consumer.links.push(link("library-file", "button-library"));
+        lock.upsert("app-screens", consumer);
+        lock.upsert("button-library", entry("library-file", "hl"));
+        // A second consumer whose library is NOT resurrected yet.
+        let mut other = entry("other-consumer", "ho");
+        other.links.push(link("absent-library", "icons"));
+        lock.upsert("other-screens", other);
+
+        // Only the first consumer + its library are live.
+        let present: BTreeSet<String> = ["consumer-file", "library-file", "other-consumer"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let plan = plan_relink(&lock, &present);
+        // Packages sorted by id: app-screens, button-library, other-screens.
+        // button-library has no links → contributes nothing.
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0],
+            RelinkAction::Ready(RelinkOp {
+                consumer_file_id: "consumer-file".into(),
+                library_file_id: "library-file".into(),
+                library_package_id: "button-library".into(),
+            })
+        );
+        assert_eq!(
+            plan[1],
+            RelinkAction::Blocked(RelinkOp {
+                consumer_file_id: "other-consumer".into(),
+                library_file_id: "absent-library".into(),
+                library_package_id: "icons".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn plan_relink_empty_when_no_links() {
+        let mut lock = Lockfile::default();
+        lock.upsert("buttons", entry("file-a", "ha"));
+        let present: BTreeSet<String> = ["file-a".to_string()].into_iter().collect();
+        assert!(plan_relink(&lock, &present).is_empty());
     }
 }

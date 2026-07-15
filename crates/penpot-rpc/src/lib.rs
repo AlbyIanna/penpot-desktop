@@ -395,6 +395,68 @@ impl PenpotClient {
     }
 
     // ------------------------------------------------------------------
+    // Library linking (E3) — verified live on 2.16.2 in the E3 spike
+    // (docs/ecosystem-spikes/e3-linking.md). All wire keys are camelCase.
+    // ------------------------------------------------------------------
+
+    /// `set-file-shared` — publish/unpublish a file as a shared library
+    /// (`{id, isShared}`). Idempotent server-side. Publishing is sticky: E3
+    /// never auto-unpublishes, because `isShared:false` additionally deletes
+    /// every `file_library_rel` where this file is the library (detaches all
+    /// consumers). `isShared` also rides the binfile, so it survives a DB wipe
+    /// for free; this call is the cheap defensive re-assert on rebuild.
+    pub async fn set_file_shared(&self, file_id: &str, is_shared: bool) -> Result<()> {
+        self.rpc_response(
+            "set-file-shared",
+            &json!({ "id": file_id, "isShared": is_shared }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `link-file-to-library` — link a consumer file to a shared library
+    /// (`{fileId, libraryId}`). **Idempotent** (`insert … on conflict do
+    /// nothing`), so it is safe to re-run on every rebuild to re-derive the
+    /// disposable `file_library_rel`. Returns the recursive list of libraries
+    /// the linked library itself depends on (`[]` for a leaf library). Rejects
+    /// `fileId == libraryId` (`:invalid-library`).
+    pub async fn link_file_to_library(
+        &self,
+        file_id: &str,
+        library_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.rpc(
+            "link-file-to-library",
+            &json!({ "fileId": file_id, "libraryId": library_id }),
+        )
+        .await
+    }
+
+    /// `unlink-file-from-library` — remove the link (`{fileId, libraryId}`).
+    /// A single `db/delete!` on `file_library_rel`; answers `null`.
+    pub async fn unlink_file_from_library(
+        &self,
+        file_id: &str,
+        library_id: &str,
+    ) -> Result<()> {
+        self.rpc_response(
+            "unlink-file-from-library",
+            &json!({ "fileId": file_id, "libraryId": library_id }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `get-file-libraries` — the libraries a consumer file links (`{fileId}`),
+    /// surfacing the derived `file_library_rel` relation with full library
+    /// metadata. Returns `[]` before any link and (post-wipe) until the link is
+    /// re-derived. Raw JSON — E3 only needs the ids/`isShared` witness.
+    pub async fn get_file_libraries(&self, file_id: &str) -> Result<Vec<serde_json::Value>> {
+        self.rpc("get-file-libraries", &json!({ "fileId": file_id }))
+            .await
+    }
+
+    // ------------------------------------------------------------------
     // Binfile export / import (implemented for M2; unit-tested only in M1)
     // ------------------------------------------------------------------
 

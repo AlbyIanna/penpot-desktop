@@ -107,6 +107,22 @@ contract:
 e2:
     bash scripts/e2-packages.sh
 
+# E3 component-library linking (PLAN3 milestone E3). A LIVE gate: publishes a
+# component-library package shared (`set-file-shared`), links a consumer package
+# to it (`link-file-to-library`) that places a component instance referencing the
+# library by its vault-local file-id, and proves the surgical linked export keeps
+# that reference on disk WITHOUT inlining the library (single-file tree). Then
+# delete-DB + reboot rebuilds both files under their original ids with the
+# instance still resolving and file_library_rel re-derived from the lockfile
+# (invariant 1); a patch edit surfaces no bump while minor/major surface the
+# correct bump via the E1 contract-diff channel (not `revn`); unlink clears the
+# relation. Dedicated ports 8974/6435/5509/6452 (control 8975); live stack + the
+# runtime bundle. Documented E3-scope limit: a linked consumer that ALSO uploads
+# its own raster media loses that media on disk (spike §9) — E3 consumers place
+# vector instances only.
+e3:
+    bash scripts/e3-library.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -135,6 +151,7 @@ e2e:
     bash scripts/n6-templates.sh
     bash scripts/e1-contract.sh
     bash scripts/e2-packages.sh
+    bash scripts/e3-library.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

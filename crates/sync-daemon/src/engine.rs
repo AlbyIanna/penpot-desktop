@@ -28,7 +28,7 @@ use anyhow::Context;
 use penpot_rpc::{PenpotClient, ProjectInfo};
 use sync_core::{
     cleanup_orphans, commit_dir_swap, manifest::now_rfc3339, normalize_tree, semantic_tree_hash,
-    stage_path_for, unzip_to, zip_dir, Manifest, ManifestEntry,
+    stage_path_for, trim_to_single_file, unzip_to, zip_dir, Lockfile, Manifest, ManifestEntry,
 };
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -208,6 +208,15 @@ pub(crate) struct Engine {
     /// per-file-dir timer. On fire: re-key pass + route leftovers through the
     /// normal per-dir handling.
     sweep_deadline: Option<Instant>,
+    /// E3: the set of vault-local file-ids that are LINKED consumers (their
+    /// lock entry has ≥1 library link). Only these get the SURGICAL export path
+    /// (`export-binfile(include=true, embed=false)` + trim to own subtree) that
+    /// preserves `componentFile=<libId>` on disk; every other file keeps the
+    /// current `(include=false, embed=true)` path BYTE-FOR-BYTE so M2/M3/N5
+    /// cannot regress (spike §9). Refreshed from `lock.json` (a local read, no
+    /// RPC) once per poll/reconcile/fs pass. Empty when `lock.json` is absent →
+    /// pure E2 behaviour.
+    linked_file_ids: BTreeSet<String>,
 }
 
 /// Daemon entry point (spawned by [`crate::spawn`]).
@@ -321,6 +330,32 @@ pub(crate) async fn run(
     }
 }
 
+/// E3: the set of linked-consumer file-ids from the vault `lock.json` — every
+/// `LockEntry.file_id` whose entry declares ≥1 library link. A local read (no
+/// RPC). An absent lockfile (pure-E2 vault) or an unreadable/newer-schema one
+/// yields an EMPTY set: E3's export change is opt-in via a present, valid link,
+/// so a lockfile problem can never silently flip a plain file onto the surgical
+/// path (it stays byte-for-byte E2). Editor-created links outside the package
+/// flow are E4+ scope — only lockfile links drive this set.
+fn load_linked_file_ids(sync_root: &Path) -> BTreeSet<String> {
+    match Lockfile::load(sync_root) {
+        Ok(Some(lock)) => lock
+            .packages
+            .values()
+            .filter(|e| !e.links.is_empty())
+            .map(|e| e.file_id.clone())
+            .collect(),
+        Ok(None) => BTreeSet::new(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read lock.json for E3 link detection; treating all files as unlinked (pure E2 export path)"
+            );
+            BTreeSet::new()
+        }
+    }
+}
+
 impl Engine {
     fn new(client: PenpotClient, mut cfg: SyncConfig, status: StatusHub) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&cfg.sync_root)
@@ -336,6 +371,7 @@ impl Engine {
         let manifest = Manifest::load(&cfg.sync_root)
             .context("loading .penpot-sync.json")?
             .unwrap_or_default();
+        let linked_file_ids = load_linked_file_ids(&cfg.sync_root);
         Ok(Engine {
             client,
             cfg,
@@ -344,7 +380,22 @@ impl Engine {
             fs_debounce: FsDebounce::new(),
             status,
             sweep_deadline: None,
+            linked_file_ids,
         })
+    }
+
+    /// E3: reload the linked-consumer file-id set from `lock.json` (local read,
+    /// no RPC). Called once at the top of each poll/reconcile/fs pass so a
+    /// just-installed link takes effect on the next export without a restart.
+    fn refresh_linked_file_ids(&mut self) {
+        self.linked_file_ids = load_linked_file_ids(&self.cfg.sync_root);
+    }
+
+    /// Whether `file_id` is a linked consumer (E3 SURGICAL export path). A
+    /// missing/absent `lock.json` yields an empty set, so this is `false` for
+    /// every file in a pure-E2 vault.
+    fn is_linked(&self, file_id: &str) -> bool {
+        self.linked_file_ids.contains(file_id)
     }
 
     // ------------------------------------------------------------------
@@ -385,6 +436,9 @@ impl Engine {
     }
 
     async fn process_due_fs_changes(&mut self) {
+        // E3: refresh the link set so conflict-copy exports on this FS pass use
+        // the correct (surgical vs plain) export representation.
+        self.refresh_linked_file_ids();
         if self.sweep_deadline.is_some_and(|dl| dl <= Instant::now()) {
             self.sweep_deadline = None;
             self.structural_sweep().await;
@@ -1110,10 +1164,16 @@ impl Engine {
     /// version of `file_id` into a conflict copy next to `rel`.
     async fn write_conflict_copy(&self, file_id: &str, rel: &str) -> anyhow::Result<String> {
         let zip = self.download_export(file_id).await?;
+        let linked = self.is_linked(file_id);
         let target = self.cfg.sync_root.join(rel);
         let stage = stage_path_for(&target);
         let staged: anyhow::Result<String> = (|| {
             unzip_to(&zip, &stage)?;
+            // E3: keep the conflict copy in the same one-file representation as
+            // the file's normal on-disk tree (trim the inlined library away).
+            if linked {
+                trim_to_single_file(&stage, file_id)?;
+            }
             normalize_tree(&stage)?;
             self.stage_to_conflict_copy(&stage, rel)
         })();
@@ -1135,14 +1195,24 @@ impl Engine {
 
     /// `export-binfile` + authenticated download, retried as one unit (the
     /// artifact URI may not outlive a backend restart).
+    ///
+    /// E3 SURGICAL flag selection (spike §9): a LINKED consumer is exported with
+    /// `(includeLibraries=true, embedAssets=false)` — the only combination that
+    /// keeps its instances' `componentFile=<libId>` reference on disk — and its
+    /// unzipped tree is then TRIMMED to its own subtree (caller side, before
+    /// normalize/hash). Every other file keeps the current
+    /// `(includeLibraries=false, embedAssets=true)` path BYTE-FOR-BYTE, so
+    /// M2/M3/N5 (and files with their own embedded media) cannot regress.
     async fn download_export(&self, file_id: &str) -> anyhow::Result<Vec<u8>> {
         let client = self.client.clone();
         let fid = file_id.to_string();
+        let linked = self.is_linked(file_id);
         with_retry("export-binfile", || {
             let c = client.clone();
             let id = fid.clone();
             async move {
-                let exported = c.export_binfile(&id, false, true).await?;
+                // linked → (include=true, embed=false); unlinked → (false, true).
+                let exported = c.export_binfile(&id, linked, !linked).await?;
                 c.download_exported_binfile(&exported.uri).await
             }
         })
@@ -1155,6 +1225,8 @@ impl Engine {
     // ------------------------------------------------------------------
 
     async fn poll_cycle(&mut self) {
+        // E3: pick up a just-installed/removed link before this pass exports.
+        self.refresh_linked_file_ids();
         match fetch_snapshot(&self.client, &self.cfg.team_id).await {
             Ok(snap) => {
                 let vanished =
@@ -1241,9 +1313,16 @@ impl Engine {
         self.status.set_file(&rel, FileState::Exporting);
 
         let zip = self.download_export(&db.id).await?;
+        let linked = self.is_linked(&db.id);
         let stage = stage_path_for(&target);
         let staged: anyhow::Result<String> = (|| {
             unzip_to(&zip, &stage)?;
+            // E3: a linked consumer was exported with includeLibraries; trim the
+            // inlined library subtree away BEFORE normalize/hash so the on-disk
+            // tree is one file carrying a bare componentFile=<libId> reference.
+            if linked {
+                trim_to_single_file(&stage, &db.id)?;
+            }
             normalize_tree(&stage)?;
             Ok(semantic_tree_hash(&stage)?)
         })();
@@ -1553,6 +1632,10 @@ impl Engine {
 
     pub(crate) async fn reconcile(&mut self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.cfg.sync_root)?;
+
+        // E3: refresh the link set so any export during startup reconcile
+        // (conflict copies) uses the correct surgical/plain representation.
+        self.refresh_linked_file_ids();
 
         // 1. Sweep interrupted-swap leftovers.
         let sweep = cleanup_orphans(&self.cfg.sync_root)?;

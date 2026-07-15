@@ -18,6 +18,7 @@
 //! extracted trees; `revn` is advisory; normalization = sorted keys, 2-space
 //! indent, non-ASCII preserved, LF, trailing newline.
 
+pub mod binfile;
 pub mod hash;
 pub mod lock;
 pub mod manifest;
@@ -26,11 +27,13 @@ pub mod swap;
 mod util;
 pub mod ziputil;
 
+pub use binfile::trim_to_single_file;
 pub use hash::{
     read_tree, semantic_tree_hash, semantic_view, sha256_hex, strip_volatile, tree_hash,
 };
 pub use lock::{
-    plan_reapply, LockEntry, Lockfile, ReapplyAction, LOCK_FILE_NAME, LOCK_SCHEMA_VERSION,
+    plan_reapply, plan_relink, LibraryLink, LockEntry, Lockfile, ReapplyAction, RelinkAction,
+    RelinkOp, LOCK_FILE_NAME, LOCK_SCHEMA_VERSION,
 };
 pub use manifest::{Manifest, ManifestEntry, MANIFEST_FILE_NAME, MANIFEST_SCHEMA_VERSION};
 pub use normalize::{dumps, normalize_json_bytes, normalize_tree, VOLATILE_KEYS};

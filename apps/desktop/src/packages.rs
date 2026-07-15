@@ -77,6 +77,8 @@ pub fn router(state: Arc<PackagesState>) -> Router {
         .route("/__api/packages", get(list_packages))
         .route("/__api/packages/fetch", post(fetch_package))
         .route("/__api/packages/install", post(install_package))
+        .route("/__api/packages/publish", post(publish_package))
+        .route("/__api/packages/link", post(link_package))
         .with_state(state)
 }
 
@@ -220,6 +222,33 @@ struct PackageStatus {
     /// Whether the materialized vault file is currently live in the DB. After a
     /// delete-DB + reboot this is the re-apply witness: M2 resurrected it by id.
     live: bool,
+    /// E3: whether this package's file is published as a shared library
+    /// (`set-file-shared`). Rides the binfile + re-asserted on boot.
+    library_shared: bool,
+    /// E3: the libraries this package's file links (references components from).
+    /// The linked-state witness the gate asserts; empty for a plain package.
+    links: Vec<LinkView>,
+}
+
+/// One link surfaced in the `GET /__api/packages` witness (E3).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkView {
+    library_file_id: String,
+    library_package_id: String,
+    version: String,
+    contract_hash: String,
+}
+
+impl From<&sync_core::LibraryLink> for LinkView {
+    fn from(l: &sync_core::LibraryLink) -> Self {
+        LinkView {
+            library_file_id: l.library_file_id.clone(),
+            library_package_id: l.library_package_id.clone(),
+            version: l.version.clone(),
+            contract_hash: l.contract_hash.clone(),
+        }
+    }
 }
 
 async fn list_packages(State(state): State<Arc<PackagesState>>) -> Response {
@@ -249,6 +278,8 @@ async fn list_packages(State(state): State<Arc<PackagesState>>) -> Response {
             contract_hash: e.contract_hash.clone(),
             source_git_url: e.source_git_url.clone(),
             live,
+            library_shared: e.library_shared,
+            links: e.links.iter().map(LinkView::from).collect(),
         });
     }
     Json(json!({ "ok": true, "count": out.len(), "packages": out })).into_response()
@@ -393,6 +424,18 @@ async fn install_package(
     }
 }
 
+/// Whether the vault's sync manifest still pins `file_id` — i.e. its `.penpot`
+/// tree is on disk and M2 will resurrect it by id. Used to tell "momentarily
+/// absent from the DB while resurrecting after a wipe" (keep the pinned id) from
+/// "genuinely gone" (re-materialize). A missing/unreadable manifest reads as
+/// "not pinned" (safe: nothing to resurrect).
+fn manifest_pins(vault_root: &Path, file_id: &str) -> bool {
+    sync_core::Manifest::load(vault_root)
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.files.contains_key(file_id))
+}
+
 async fn do_install(
     state: &PackagesState,
     client: &PenpotClient,
@@ -420,15 +463,25 @@ async fn do_install(
         .or_else(|| manifest.name.clone())
         .unwrap_or_else(|| display_name_from_id(id));
 
-    // Idempotency: same contentHash pinned AND still live → no-op (no phantom
-    // diff on a second install).
+    // Idempotency: same contentHash already pinned → a second install is a
+    // no-op. The pinned file may be momentarily ABSENT from the DB while M2
+    // resurrects it by id after a database wipe; in that window its `.penpot`
+    // tree is still on disk (the sync manifest pins it). Re-importing then would
+    // mint a DUPLICATE id and orphan the file every link/instance references
+    // (invariant 1). So no-op when the file is live OR still on disk
+    // (resurrecting); only re-materialize when it is genuinely gone from both.
     let mut lock = Lockfile::load_or_default(&state.vault_root)?;
     if let Some(existing) = lock.packages.get(id) {
-        if existing.content_hash == content_hash && client.get_file(&existing.file_id).await.is_ok()
-        {
-            let page_id = crate::installer::first_page_id(client, &existing.file_id).await;
-            tracing::info!(package = %id, file = %existing.file_id, "install no-op (already pinned + live)");
-            return Ok(InstallResp {
+        if existing.content_hash == content_hash {
+            let live = client.get_file(&existing.file_id).await.is_ok();
+            let resurrecting = !live && manifest_pins(&state.vault_root, &existing.file_id);
+            if live || resurrecting {
+                let page_id = crate::installer::first_page_id(client, &existing.file_id).await;
+                tracing::info!(
+                    package = %id, file = %existing.file_id, live, resurrecting,
+                    "install no-op (already pinned; live or resurrecting from disk)"
+                );
+                return Ok(InstallResp {
                 ok: true,
                 id: id.to_string(),
                 file_id: existing.file_id.clone(),
@@ -444,7 +497,8 @@ async fn do_install(
                     &existing.file_id,
                     page_id.as_deref(),
                 ),
-            });
+                });
+            }
         }
     }
 
@@ -459,6 +513,16 @@ async fn do_install(
         "imported + settled package to a round-trip fixpoint"
     );
 
+    // Preserve the DB-only pointers a content re-import must NOT erase: whether
+    // the file is published shared (E3) and the libraries it links (E3) — these
+    // are re-derived from the lockfile after a DB wipe, so dropping them on a
+    // content change would silently break the boot re-link.
+    let (library_shared, links, plugin_props) = lock
+        .packages
+        .get(id)
+        .map(|e| (e.library_shared, e.links.clone(), e.plugin_props.clone()))
+        .unwrap_or_default();
+
     // Record the pin (git-diffable lock.json at the vault root).
     lock.upsert(
         id.to_string(),
@@ -471,8 +535,9 @@ async fn do_install(
             file_id: file_id.clone(),
             name: display.clone(),
             installed_at: sync_core::lock::now_rfc3339(),
-            library_shared: false,
-            plugin_props: Default::default(),
+            library_shared,
+            plugin_props,
+            links,
         },
     );
     lock.save(&state.vault_root)?;
@@ -494,6 +559,332 @@ async fn do_install(
         settle_cycles,
         deep_link,
     })
+}
+
+// ---------------------------------------------------------------------------
+// POST /__api/packages/publish — install (if needed) + set-file-shared (E3)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishReq {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishResp {
+    ok: bool,
+    id: String,
+    file_id: String,
+    library_shared: bool,
+    already_installed: bool,
+    deep_link: String,
+}
+
+async fn publish_package(
+    State(state): State<Arc<PackagesState>>,
+    Json(req): Json<PublishReq>,
+) -> Response {
+    let id = req.id.trim().to_string();
+    if !is_safe_id(&id) {
+        return bad_request(format!("unsafe package id {id:?}"));
+    }
+    let Some(client) = state.client() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "no access token provisioned; cannot publish"})),
+        )
+            .into_response();
+    };
+    match do_publish(&state, &client, &id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => {
+            tracing::error!(package = %id, error = format!("{e:#}"), "package publish failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"ok": false, "error": format!("publish failed: {e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Publish a package's materialized file as a shared library: ensure it is
+/// installed/live (the idempotent E2 install path), flip `set-file-shared`, and
+/// record `library_shared=true` in its lock entry. Publishing is sticky (E3
+/// never auto-unpublishes). Returns the file id + `library_shared` witness.
+async fn do_publish(
+    state: &PackagesState,
+    client: &PenpotClient,
+    id: &str,
+) -> anyhow::Result<PublishResp> {
+    let installed = do_install(state, client, id, None).await?;
+    let file_id = installed.file_id.clone();
+
+    client
+        .set_file_shared(&file_id, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("set-file-shared for {file_id}: {e}"))?;
+
+    let mut lock = Lockfile::load_or_default(&state.vault_root)?;
+    if let Some(e) = lock.packages.get_mut(id) {
+        e.library_shared = true;
+    }
+    lock.save(&state.vault_root)?;
+
+    let page_id = crate::installer::first_page_id(client, &file_id).await;
+    Ok(PublishResp {
+        ok: true,
+        id: id.to_string(),
+        file_id: file_id.clone(),
+        library_shared: true,
+        already_installed: installed.already_installed,
+        deep_link: vault_index::workspace_deep_link(&state.team_id, &file_id, page_id.as_deref()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// POST /__api/packages/link — link a consumer package to a library package (E3)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkReq {
+    consumer_id: String,
+    library_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkResp {
+    ok: bool,
+    consumer_id: String,
+    consumer_file_id: String,
+    library_id: String,
+    library_file_id: String,
+    /// Recursive libraries the linked library itself depends on (0 for a leaf).
+    library_recursive_deps: usize,
+}
+
+async fn link_package(State(state): State<Arc<PackagesState>>, Json(req): Json<LinkReq>) -> Response {
+    let consumer_id = req.consumer_id.trim().to_string();
+    let library_id = req.library_id.trim().to_string();
+    if !is_safe_id(&consumer_id) {
+        return bad_request(format!("unsafe consumer package id {consumer_id:?}"));
+    }
+    if !is_safe_id(&library_id) {
+        return bad_request(format!("unsafe library package id {library_id:?}"));
+    }
+    let Some(client) = state.client() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "no access token provisioned; cannot link"})),
+        )
+            .into_response();
+    };
+    match do_link(&state, &client, &consumer_id, &library_id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => {
+            tracing::error!(
+                consumer = %consumer_id, library = %library_id,
+                error = format!("{e:#}"), "package link failed"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"ok": false, "error": format!("link failed: {e:#}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Link a consumer package to a library package within one vault (E3). Ensures
+/// the library is installed + published shared, ensures the consumer is
+/// installed, runs the idempotent `link-file-to-library {consumerFileId,
+/// libraryFileId}`, and records a [`sync_core::LibraryLink`] in the consumer's
+/// lock entry (dedup by library file id, sorted for git-diffability).
+/// Resolution is by vault-local id — no id remap (that is E6).
+async fn do_link(
+    state: &PackagesState,
+    client: &PenpotClient,
+    consumer_id: &str,
+    library_id: &str,
+) -> anyhow::Result<LinkResp> {
+    if consumer_id == library_id {
+        anyhow::bail!("a package cannot link itself as its own library");
+    }
+    // Library first: installed + shared (publish is idempotent).
+    let library = do_publish(state, client, library_id).await?;
+    let library_file_id = library.file_id.clone();
+    // Consumer: installed/live.
+    let consumer = do_install(state, client, consumer_id, None).await?;
+    let consumer_file_id = consumer.file_id.clone();
+    if consumer_file_id == library_file_id {
+        anyhow::bail!(
+            "consumer and library resolved to the same vault file id {consumer_file_id}"
+        );
+    }
+
+    // Derive the disposable file_library_rel (idempotent — safe to re-run).
+    let link_resp = client
+        .link_file_to_library(&consumer_file_id, &library_file_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("link-file-to-library: {e}"))?;
+    let library_recursive_deps = link_resp.as_array().map(|a| a.len()).unwrap_or(0);
+
+    // Pin the link in the consumer's lock entry (source of truth for rebuild).
+    let mut lock = Lockfile::load_or_default(&state.vault_root)?;
+    let (lib_version, lib_contract_hash) = lock
+        .packages
+        .get(library_id)
+        .map(|e| (e.version.clone(), e.contract_hash.clone()))
+        .unwrap_or_default();
+    let consumer_entry = lock.packages.get_mut(consumer_id).ok_or_else(|| {
+        anyhow::anyhow!("consumer {consumer_id:?} has no lock entry after install")
+    })?;
+    consumer_entry
+        .links
+        .retain(|l| l.library_file_id != library_file_id);
+    consumer_entry.links.push(sync_core::LibraryLink {
+        library_file_id: library_file_id.clone(),
+        library_package_id: library_id.to_string(),
+        version: lib_version,
+        contract_hash: lib_contract_hash,
+    });
+    consumer_entry
+        .links
+        .sort_by(|a, b| a.library_file_id.cmp(&b.library_file_id));
+    lock.save(&state.vault_root)?;
+
+    Ok(LinkResp {
+        ok: true,
+        consumer_id: consumer_id.to_string(),
+        consumer_file_id,
+        library_id: library_id.to_string(),
+        library_file_id,
+        library_recursive_deps,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Boot re-link reconcile (E3) — re-derive file_library_rel after a DB wipe
+// ---------------------------------------------------------------------------
+
+/// Bounded window for the boot re-link retry: files come alive as the sync
+/// daemon's startup reconcile resurrects them by id, so we poll until every
+/// lock link's endpoints are live (or the window closes).
+const RELINK_BOOT_ATTEMPTS: usize = 60;
+const RELINK_BOOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Outcome of one [`reapply_links`] pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RelinkSummary {
+    /// Links re-established this pass (both endpoints live).
+    pub applied: usize,
+    /// Links whose consumer or library file was not yet live.
+    pub blocked: usize,
+}
+
+/// Re-derive every lockfile link's disposable `file_library_rel` once its
+/// endpoints are live: for each [`sync_core::RelinkAction::Ready`] link,
+/// defensively `set-file-shared` the library and re-run the idempotent
+/// `link-file-to-library`. Pure DB-pointer re-derivation — it never writes the
+/// lockfile or any file tree. Returns a per-pass summary so the caller can
+/// decide whether to retry (blocked links await resurrection).
+pub async fn reapply_links(state: &PackagesState) -> anyhow::Result<RelinkSummary> {
+    let Some(client) = state.client() else {
+        return Ok(RelinkSummary::default());
+    };
+    let lock = Lockfile::load_or_default(&state.vault_root)?;
+
+    // The file ids either side of any link — the liveness probe set.
+    let mut candidates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for e in lock.packages.values() {
+        for l in &e.links {
+            candidates.insert(e.file_id.clone());
+            candidates.insert(l.library_file_id.clone());
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(RelinkSummary::default());
+    }
+    let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for id in &candidates {
+        if client.get_file(id).await.is_ok() {
+            present.insert(id.clone());
+        }
+    }
+
+    let mut summary = RelinkSummary::default();
+    for action in sync_core::plan_relink(&lock, &present) {
+        match action {
+            sync_core::RelinkAction::Ready(op) => {
+                // isShared rides the binfile, but re-assert defensively (cheap).
+                if let Err(e) = client.set_file_shared(&op.library_file_id, true).await {
+                    tracing::warn!(
+                        library = %op.library_file_id, error = %e,
+                        "E3 re-link: defensive set-file-shared failed (continuing to link)"
+                    );
+                }
+                if let Err(e) = client
+                    .link_file_to_library(&op.consumer_file_id, &op.library_file_id)
+                    .await
+                {
+                    // Isolate a persistently-failing link: log and count it as
+                    // blocked, then continue so a single bad link can't starve
+                    // every link sorted after it (each pass re-plans in the same
+                    // deterministic order). Transient failures self-heal on the
+                    // next retry pass; a persistent one no longer poisons the batch.
+                    tracing::warn!(
+                        consumer = %op.consumer_file_id, library = %op.library_file_id,
+                        error = %e, "E3 re-link: link-file-to-library failed; skipping this link this pass"
+                    );
+                    summary.blocked += 1;
+                    continue;
+                }
+                tracing::info!(
+                    consumer = %op.consumer_file_id, library = %op.library_file_id,
+                    package = %op.library_package_id, "E3 re-link: file_library_rel re-derived"
+                );
+                summary.applied += 1;
+            }
+            sync_core::RelinkAction::Blocked(op) => {
+                tracing::debug!(
+                    consumer = %op.consumer_file_id, library = %op.library_file_id,
+                    "E3 re-link: endpoint not live yet; will retry"
+                );
+                summary.blocked += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// Spawn the E3 boot re-link reconcile as a bounded background task. Wired from
+/// boot right after the sync daemon starts: the daemon resurrects vault files by
+/// id, and this re-derives the DB-only `file_library_rel` each lock link maps to
+/// once both endpoints are live. A vault with no links exits after one cheap
+/// pass. Idempotent, so a partial run is always safe to repeat.
+pub fn spawn_relink_reconcile(state: Arc<PackagesState>) {
+    tokio::spawn(async move {
+        for _ in 0..RELINK_BOOT_ATTEMPTS {
+            match reapply_links(&state).await {
+                Ok(s) if s.blocked == 0 => {
+                    if s.applied > 0 {
+                        tracing::info!(applied = s.applied, "E3 boot re-link reconcile complete");
+                    }
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = format!("{e:#}"), "E3 boot re-link pass errored; retrying")
+                }
+            }
+            tokio::time::sleep(RELINK_BOOT_INTERVAL).await;
+        }
+        tracing::warn!("E3 boot re-link reconcile window closed with links still blocked");
+    });
 }
 
 #[cfg(test)]
