@@ -43,19 +43,53 @@ pub use contract::{
     diff_contracts, extract_contracts, Bump, Classification, Contract, FieldDelta, LibraryContract,
     SetDelta, SetKind, TokenExport,
 };
-pub use db::{BoardRow, Hit, IndexDb, SearchError, SearchHandle, SCHEMA_VERSION};
-pub use extract::{extract_docs, DocKind, DocRow, ROOT_FRAME_ID};
+pub use db::{BoardRow, Hit, IndexDb, PackageRow, SearchError, SearchHandle, SCHEMA_VERSION};
+pub use extract::{extract_docs, package_tree_terms, DocKind, DocRow, ROOT_FRAME_ID};
 pub use palette::{assemble_items as assemble_palette_items, rank as rank_palette, PaletteHit, PaletteItem, PaletteKind};
 pub use http::router;
 pub use query::{build_match_query, workspace_deep_link};
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sync_core::Manifest;
+use sync_core::{LockEntry, Lockfile, Manifest};
 use tokio::sync::watch;
+
+/// Owner-id prefix for package rows (E4). Package rows live OUTSIDE the sync
+/// manifest (packages sit under `.penpot-packages/`, blind to sync), so they
+/// are keyed with this prefix and preserved by an augmented `drop_all_but`
+/// keep-set — never garbage-collected by the manifest diff.
+const PACKAGE_OWNER_PREFIX: &str = "pkg:";
+
+/// The index owner-id for a package id.
+fn package_owner_id(package_id: &str) -> String {
+    format!("{PACKAGE_OWNER_PREFIX}{package_id}")
+}
+
+/// Find a package's single `.penpot` source tree under its `.penpot-packages/
+/// <id>` dir: the first (sorted) direct child directory whose name ends in
+/// `.penpot` and is not a dotfile. Mirrors `apps/desktop`'s installer discovery;
+/// `None` if the package carries no design-data tree (a metadata-only gallery row
+/// still results).
+fn discover_penpot_tree(pkg_dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(pkg_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| !n.starts_with('.') && n.ends_with(".penpot"))
+                .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
 
 /// THE reindex decision: reindex iff nothing is recorded for the file or the
 /// manifest hash moved past the recorded one. Pure and total (the
@@ -135,26 +169,34 @@ impl Indexer {
     }
 
     /// One poll cycle: diff manifest hashes against the recorded hashes,
-    /// reindex what moved, drop what vanished, re-key what renamed.
+    /// reindex what moved, drop what vanished, re-key what renamed. Runs the E4
+    /// package pass too (independent of the manifest) so the gallery index is
+    /// kept fresh and its `pkg:`-owned rows survive the manifest garbage-collect.
     pub fn poll_once(&mut self) {
+        let recorded = match self.db.indexed_files() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "vault-index: cannot read index state");
+                return;
+            }
+        };
+
+        // Package rows are keyed off the lockfile, NOT the sync manifest: index
+        // them first so their owner ids join the `drop_all_but` keep-set below.
+        let package_keep = self.poll_packages(&recorded);
+
         let manifest = match Manifest::load(&self.cfg.vault_root) {
             Ok(Some(m)) => m,
             Ok(None) => {
                 // Fresh vault: nothing synced yet. Anything already indexed
-                // is stale (e.g. the vault was emptied) — drop it.
-                self.drop_all_but(&Default::default());
+                // from the manifest is stale (e.g. the vault was emptied) — drop
+                // it, but KEEP the package rows (they are lockfile-derived).
+                self.drop_all_but(&package_keep);
                 self.refresh_counts(0, 0);
                 return;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "vault-index: cannot read the sync manifest; skipping cycle");
-                return;
-            }
-        };
-        let recorded = match self.db.indexed_files() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(error = format!("{e:#}"), "vault-index: cannot read index state");
                 return;
             }
         };
@@ -207,8 +249,111 @@ impl Indexer {
             }
         }
 
-        self.drop_all_but(&manifest.files.keys().cloned().collect());
+        // Keep the manifest's files AND the lockfile's package rows: package
+        // owners (`pkg:<id>`) are never in the manifest, so without this union
+        // `drop_all_but` would garbage-collect the whole gallery every poll.
+        let mut keep: std::collections::BTreeSet<String> =
+            manifest.files.keys().cloned().collect();
+        keep.extend(package_keep);
+        self.drop_all_but(&keep);
         self.refresh_counts(indexed, pending);
+    }
+
+    /// The E4 package pass: index every package the lockfile pins (keyed
+    /// `pkg:<id>`, OUTSIDE the sync manifest), hash-gated on the lock entry's
+    /// `contentHash` so idle polls stay silent. Returns the set of package owner
+    /// ids currently locked — the keep-set addition that protects these rows from
+    /// the manifest garbage-collect (and drops rows for packages removed from the
+    /// lockfile via the same `drop_all_but`). A missing lockfile means no
+    /// packages: returns the empty set (so stale package rows are then dropped).
+    fn poll_packages(&mut self, recorded: &BTreeMap<String, (String, String)>) -> BTreeSet<String> {
+        let lock = match Lockfile::load_or_default(&self.cfg.vault_root) {
+            Ok(l) => l,
+            Err(e) => {
+                // A malformed/forward-schema lockfile must not empty the gallery:
+                // skip the pass and KEEP whatever package rows are already indexed.
+                tracing::warn!(error = format!("{e:#}"), "vault-index: cannot read lock.json; keeping existing package rows");
+                return recorded
+                    .keys()
+                    .filter(|k| k.starts_with(PACKAGE_OWNER_PREFIX))
+                    .cloned()
+                    .collect();
+            }
+        };
+        let mut keep = BTreeSet::new();
+        for (id, entry) in &lock.packages {
+            let owner = package_owner_id(id);
+            keep.insert(owner.clone());
+            let rec = recorded.get(&owner);
+            if !needs_reindex(&entry.content_hash, rec.map(|(_, h)| h.as_str())) {
+                continue; // hash-gated no-op — no churn.
+            }
+            if let Err(e) = self.reindex_package(id, entry) {
+                tracing::warn!(package = %id, error = format!("{e:#}"),
+                    "vault-index: package reindex failed (will retry next poll)");
+            }
+        }
+        keep
+    }
+
+    /// Index one locked package as a single `kind='package'` row: name/id/
+    /// version/kind plus the searchable names in its `.penpot` source tree (a
+    /// best-effort enrichment — a package with no on-disk source tree still gets
+    /// a searchable metadata row). Records the lock entry's `contentHash` as the
+    /// indexed hash so the pass is a no-op until the package is reinstalled.
+    fn reindex_package(&mut self, id: &str, entry: &LockEntry) -> anyhow::Result<()> {
+        let owner = package_owner_id(id);
+        let pkg_dir = self
+            .cfg
+            .vault_root
+            .join(sync_core::PACKAGES_DIR_NAME)
+            .join(id);
+        let tree = discover_penpot_tree(&pkg_dir);
+        let rel_path = tree
+            .as_ref()
+            .and_then(|t| t.strip_prefix(&self.cfg.vault_root).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| format!("{}/{id}", sync_core::PACKAGES_DIR_NAME));
+
+        // Best-effort: read the tree for the richer search body. A read failure
+        // (dir gone, unreadable) degrades to the metadata-only body, never an
+        // error — the package is still a real, installed, deep-linkable file.
+        let tree_terms = tree
+            .as_ref()
+            .and_then(|t| sync_core::read_tree(t).ok())
+            .and_then(|raw| sync_core::semantic_view(&raw).ok())
+            .map(|sem| extract::package_tree_terms(&sem))
+            .unwrap_or_default();
+
+        let name = if entry.name.trim().is_empty() {
+            id.to_string()
+        } else {
+            entry.name.clone()
+        };
+        // The body must let a search for the package id, name, version or any of
+        // its content names find the package. object_id carries the id (the
+        // gate's "correct id"); file_id is the deep-link target.
+        let mut body_parts = vec![id.to_string(), name.clone()];
+        if !entry.version.trim().is_empty() {
+            body_parts.push(entry.version.clone());
+        }
+        if !entry.kind.trim().is_empty() {
+            body_parts.push(entry.kind.clone());
+        }
+        body_parts.extend(tree_terms);
+        let doc = extract::DocRow {
+            kind: extract::DocKind::Package,
+            name,
+            body: body_parts.join(" "),
+            file_id: entry.file_id.clone(),
+            page_id: String::new(),
+            object_id: id.to_string(),
+            board_id: String::new(),
+        };
+        self.db
+            .replace_file(&owner, &rel_path, &entry.content_hash, &[doc])?;
+        tracing::info!(package = %id, file = %entry.file_id, "vault-index: indexed package");
+        Ok(())
     }
 
     /// Read the tree, extract docs, record THE HASH OF WHAT WAS READ (see
@@ -399,6 +544,145 @@ mod tests {
     fn indexer_for(root: &Path, db: &Path) -> (Indexer, watch::Receiver<IndexStatusSnapshot>) {
         let (tx, rx) = watch::channel(IndexStatusSnapshot::default());
         (Indexer::new(IndexConfig::new(root, db), tx).unwrap(), rx)
+    }
+
+    /// Write a package's `.penpot` source tree under `.penpot-packages/<id>/` and
+    /// return its semantic tree hash (== the lockfile `contentHash` a real install
+    /// would pin), so the package pass is a hash-gated no-op until it changes.
+    fn write_package(root: &Path, id: &str, board: &str, text: &str) -> String {
+        let rel = format!("{}/{id}/{id}.penpot", sync_core::PACKAGES_DIR_NAME);
+        write_penpot_dir(root, &rel, board, text);
+        sync_core::semantic_tree_hash(&root.join(&rel)).unwrap()
+    }
+
+    /// Write a `lock.json` at the vault root pinning `(id, file_id, content_hash)`
+    /// entries — the E4 gallery index source (NOT the sync manifest).
+    fn lock_with(root: &Path, entries: &[(&str, &str, &str)]) {
+        let mut lock = Lockfile::default();
+        for (id, file_id, content_hash) in entries {
+            lock.upsert(
+                id.to_string(),
+                LockEntry {
+                    version: "1.2.0".into(),
+                    kind: "component-library".into(),
+                    content_hash: content_hash.to_string(),
+                    contract_hash: "ch".into(),
+                    source_git_url: String::new(),
+                    file_id: file_id.to_string(),
+                    name: format!("{id} package"),
+                    installed_at: "2026-07-15T00:00:00Z".into(),
+                    library_shared: false,
+                    plugin_props: Default::default(),
+                    links: Vec::new(),
+                },
+            );
+        }
+        lock.save(root).unwrap();
+    }
+
+    /// E4 keep-set: package rows (`pkg:<id>`, keyed off the lockfile OUTSIDE the
+    /// sync manifest) must be indexed, searchable, and SURVIVE the manifest
+    /// `drop_all_but` garbage-collect on every idle poll — the critical caveat.
+    #[test]
+    fn packages_indexed_survive_manifest_gc_and_drop_on_uninstall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        let db_path = tmp.path().join("data/idx.sqlite3");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A normal synced file (in the manifest) + a package (NOT in it).
+        write_penpot_dir(&root, "Proj/home.penpot", "Home Board", "home page text");
+        manifest_with(&root, &[(FID, "Proj/home.penpot")]);
+        let ch = write_package(&root, "buttons", "Button Board", "primary-cta needle-pkg label");
+        lock_with(&root, &[("buttons", "pkgfile-1", &ch)]);
+
+        let (mut idx, rx) = indexer_for(&root, &db_path);
+        idx.poll_once();
+        let search = SearchHandle::new(&db_path);
+
+        // Indexed as a gallery row carrying the lock file_id (deep-link target).
+        let pkgs = search.all_packages().unwrap();
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].id, "buttons");
+        assert_eq!(pkgs[0].file_id, "pkgfile-1");
+
+        // Searchable via the FTS index, filtered to kind=package, by a term from
+        // its OWN source tree (proves the tree body enrichment).
+        let expr = build_match_query("needle-pkg").unwrap();
+        let hits = search.search(&expr, Some("package"), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].object_id, "buttons");
+        assert_eq!(hits[0].file_id, "pkgfile-1");
+        // The package id itself is a search key too.
+        let by_id = build_match_query("buttons").unwrap();
+        assert_eq!(search.search(&by_id, Some("package"), 10).unwrap().len(), 1);
+
+        // CRITICAL: idle re-polls must NOT drop the pkg row and must NOT churn
+        // (hash-gated). The manifest file + package = 2 mutations on first poll.
+        let mutations_after_first = rx.borrow().mutations;
+        idx.poll_once();
+        idx.poll_once();
+        assert_eq!(
+            search.all_packages().unwrap().len(),
+            1,
+            "package row must survive drop_all_but across idle polls"
+        );
+        assert_eq!(
+            rx.borrow().mutations,
+            mutations_after_first,
+            "idle polls must not re-index the package (no churn)"
+        );
+
+        // Uninstall = remove from lock.json → next poll drops the pkg row (same
+        // drop_all_but path, now that its owner left the keep-set).
+        lock_with(&root, &[]);
+        idx.poll_once();
+        assert!(
+            search.all_packages().unwrap().is_empty(),
+            "a package removed from the lockfile is dropped from the gallery"
+        );
+        // The ordinary synced file's rows are untouched by the package pass.
+        let home = build_match_query("home").unwrap();
+        assert!(!search.search(&home, None, 10).unwrap().is_empty());
+    }
+
+    /// A reinstall at a new contentHash re-indexes the package (hash moved);
+    /// delete-the-db rebuilds an identical gallery from disk alone (invariant 1).
+    #[test]
+    fn package_reindex_on_content_change_and_rebuild_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        let db_path = tmp.path().join("data/idx.sqlite3");
+        std::fs::create_dir_all(&root).unwrap();
+        // No sync manifest at all: packages index independently of it.
+        let ch1 = write_package(&root, "icons", "Icon Board", "alpha-term one");
+        lock_with(&root, &[("icons", "pkgfile-9", &ch1)]);
+
+        let (mut idx, _rx) = indexer_for(&root, &db_path);
+        idx.poll_once();
+        let search = SearchHandle::new(&db_path);
+        assert_eq!(search.all_packages().unwrap().len(), 1, "packages index with no manifest");
+        let alpha = build_match_query("alpha-term").unwrap();
+        assert_eq!(search.search(&alpha, Some("package"), 10).unwrap().len(), 1);
+
+        // Reinstall with edited content (hash moves) → old term gone, new found.
+        let ch2 = write_package(&root, "icons", "Icon Board", "beta-term two");
+        assert_ne!(ch1, ch2);
+        lock_with(&root, &[("icons", "pkgfile-9", &ch2)]);
+        idx.poll_once();
+        assert!(search.search(&alpha, Some("package"), 10).unwrap().is_empty(), "stale term gone");
+        let beta = build_match_query("beta-term").unwrap();
+        let before = search.search(&beta, Some("package"), 10).unwrap();
+        assert_eq!(before.len(), 1);
+
+        drop(idx);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(tmp.path().join(format!("data/idx.sqlite3{suffix}")));
+        }
+        let (mut idx, _rx) = indexer_for(&root, &db_path);
+        idx.poll_once();
+        let after = SearchHandle::new(&db_path).search(&beta, Some("package"), 10).unwrap();
+        assert_eq!(before, after, "package gallery rebuilds identically from disk");
     }
 
     #[test]

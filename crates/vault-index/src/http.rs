@@ -22,6 +22,7 @@ use crate::db::{SearchError, SearchHandle};
 use crate::{palette, query, IndexStatusSnapshot, VaultIndexHandle};
 
 const SEARCH_PAGE_HTML: &str = include_str!("search_page.html");
+const PACKAGES_PAGE_HTML: &str = include_str!("packages_page.html");
 
 /// Hard cap on `limit` (the page asks for 50).
 const MAX_LIMIT: usize = 200;
@@ -55,7 +56,9 @@ pub fn router(
         .route("/__api/vault/boards", get(list_boards))
         .route("/__api/vault/palette", get(list_palette))
         .route("/__api/vault/status", get(status))
+        .route("/__api/packages/search", get(search_packages))
         .route("/__search", get(search_page))
+        .route("/__packages", get(packages_page))
         .with_state(state)
 }
 
@@ -308,6 +311,133 @@ async fn search(
     .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct PackageSearchParams {
+    #[serde(default)]
+    q: String,
+    limit: Option<usize>,
+}
+
+/// `GET /__api/packages/search?q=&limit=` — the E4 flat package gallery query.
+/// An empty `q` lists every installed package (the gallery's initial view),
+/// deterministically by id; a non-empty `q` runs the FTS index filtered to
+/// `kind='package'` (bm25-ranked, no tier/badge weighting). Each result carries
+/// its exact `workspace_deep_link` (the card's click target) and a `tookMs`.
+/// version/kind are enriched from `lock.json` so one endpoint feeds the whole
+/// card. Does NOT clobber `apps/desktop`'s `GET /__api/packages` (the install
+/// LIST) — a distinct sub-path.
+async fn search_packages(
+    State(state): State<Arc<RouterState>>,
+    Query(params): Query<PackageSearchParams>,
+) -> Response {
+    let search = state.search.clone();
+    let vault_root = state.vault_root.clone();
+    let team_id = state.team_id.clone();
+    let q = params.q.trim().to_string();
+    let limit = params.limit.unwrap_or(50).min(MAX_LIMIT);
+    // Empty query → the full gallery listing; otherwise an FTS match expression.
+    let match_expr = query::build_match_query(&q);
+    let started = Instant::now();
+    // rusqlite + lockfile read are synchronous: keep them off the async worker.
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, SearchError> {
+        // Enrich each card with version/kind from the lockfile (single small
+        // read; the index carries id/name/fileId but not the version pin).
+        let lock = sync_core::Lockfile::load_or_default(&vault_root)
+            .map_err(|e| SearchError::Other(anyhow::anyhow!("{e}")))?;
+        let meta: std::collections::BTreeMap<String, (String, String)> = lock
+            .packages
+            .iter()
+            .map(|(id, e)| (id.clone(), (e.version.clone(), e.kind.clone())))
+            .collect();
+        let card = |id: &str,
+                    name: &str,
+                    file_id: &str,
+                    rel_path: &str,
+                    snippet: Option<&str>,
+                    score: Option<f64>|
+         -> serde_json::Value {
+            let (version, kind) = meta.get(id).cloned().unwrap_or_default();
+            // Packages deep-link to their materialized vault file (no page id
+            // offline — the imported page ids differ from the source tree's).
+            let deep_link = query::workspace_deep_link(&team_id, file_id, None);
+            let mut v = json!({
+                "id": id,
+                "name": name,
+                "version": version,
+                "kind": kind,
+                "fileId": file_id,
+                "relPath": rel_path,
+                "deepLink": deep_link,
+            });
+            if let Some(s) = snippet {
+                v["snippet"] = json!(s);
+            }
+            if let Some(s) = score {
+                v["score"] = json!(s);
+            }
+            v
+        };
+        match match_expr {
+            None => {
+                let rows = search.all_packages()?;
+                Ok(rows
+                    .iter()
+                    .take(limit)
+                    .map(|r| card(&r.id, &r.name, &r.file_id, &r.rel_path, None, None))
+                    .collect())
+            }
+            Some(expr) => {
+                let hits = search.search(&expr, Some("package"), limit)?;
+                Ok(hits
+                    .iter()
+                    .map(|h| {
+                        card(
+                            &h.object_id,
+                            &h.name,
+                            &h.file_id,
+                            &h.rel_path,
+                            Some(&h.snippet),
+                            Some(h.score),
+                        )
+                    })
+                    .collect())
+            }
+        }
+    })
+    .await;
+    let took_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok(Ok(packages)) => Json(json!({
+            "query": params.q,
+            "tookMs": took_ms,
+            "count": packages.len(),
+            "packages": packages,
+        }))
+        .into_response(),
+        Ok(Err(SearchError::NotReady)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "index not ready yet"})),
+        )
+            .into_response(),
+        Ok(Err(SearchError::Other(e))) => {
+            tracing::error!(error = format!("{e:#}"), "package gallery search failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "package search failed"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "package gallery task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "package search failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn status(State(state): State<Arc<RouterState>>) -> Response {
     let s = state.status_rx.borrow().clone();
     Json(json!({
@@ -323,4 +453,9 @@ async fn status(State(state): State<Arc<RouterState>>) -> Response {
 
 async fn search_page() -> Html<&'static str> {
     Html(SEARCH_PAGE_HTML)
+}
+
+/// The E4 flat package gallery page (framework-free, mirrors `/__search`).
+async fn packages_page() -> Html<&'static str> {
+    Html(PACKAGES_PAGE_HTML)
 }

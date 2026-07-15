@@ -740,12 +740,25 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     // is an explicit verb that imports a package's `.penpot` tree as an ordinary
     // vault file (generalized N6 installer) and pins it in `lock.json` at the
     // vault root. Same-origin routes through the proxy, like `/__templates`.
+    // E4b: the surface-don't-apply update poller. Recomputes the per-package
+    // update model (pinned contract hash vs a freshly computed one over the
+    // `.penpot-packages/<id>` source) on an interval and publishes it debounced
+    // on a watch channel — the `/__api/packages/updates` endpoint borrows it. The
+    // consumer's materialized `.penpot` file is NEVER rewritten (surface, not
+    // applied); drift is preserved via `/__api/packages/preserve-drift`.
+    let packages_dir = config.designs_dir.join(sync_core::PACKAGES_DIR_NAME);
+    let updates_rx = packages::spawn_updates_poller(
+        config.designs_dir.clone(),
+        packages_dir.clone(),
+        team_id.clone(),
+    );
     let packages_state = Arc::new(packages::PackagesState {
-        packages_dir: config.designs_dir.join(sync_core::PACKAGES_DIR_NAME),
+        packages_dir,
         vault_root: config.designs_dir.clone(),
         backend_base: readiness.backend_base_url.clone(),
         token: credentials.access_token.clone(),
         team_id: team_id.clone(),
+        updates_rx,
     });
     let packages_routes = packages::router(packages_state.clone());
 

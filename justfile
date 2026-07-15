@@ -123,6 +123,23 @@ e2:
 e3:
     bash scripts/e3-library.sh
 
+# E4 package gallery + surface-don't-apply update/conflict + ecosystem gate
+# (PLAN3 milestone E4). A LIVE gate: indexes a managed component-library package
+# into the DocKind::Package FTS gallery, deep-links a card to its exact
+# /#/workspace URL via a bundled-offline headless browser (routes-gate style),
+# surfaces the correct minor/major bump through the /__api/packages/updates poll
+# WHILE the consumer's materialized .penpot stays byte-unchanged (surface, don't
+# apply), preserves a drifted managed package as a .conflict-<ts> copy that
+# overwrites neither side, proves the package rows come back identically after an
+# index-db wipe (invariant 1), and searches 200 synthetic torture-scale package
+# rows returning correct ids in <100ms. Dedicated ports 8986/6447/5521/6464
+# (control 8987); live stack + the runtime bundle WITH browsers
+# (`bash scripts/fetch-penpot.sh --with-browsers`). Flat gallery — no verified
+# tier, badges, or monetization (docs/ecosystem-concept.md). The offline
+# packaged-artifact leg (g4) lives in scripts/m4-artifact-test.sh (needs a dmg).
+e4:
+    bash scripts/e4-gallery.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -132,12 +149,13 @@ routes-gate:
 
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
-# so never run them in parallel. Chains every landed gate (N1–N6, E1, E2).
-# e1-contract is a fast static gate (no stack); e2-packages boots its own live
-# stack (dedicated ports) like the m/n suites, safe to chain at the tail.
-# n2-thumbs needs the runtime bundle (`bash scripts/build-runtime-bundle.sh`);
-# m4-artifact-test.sh stays separate: it needs a dmg build
-# (`bash scripts/build-dmg.sh` first).
+# so never run them in parallel. Chains every landed gate (N1–N6, E1–E4).
+# e1-contract is a fast static gate (no stack); e2/e3/e4 boot their own live
+# stacks (dedicated ports) like the m/n suites, safe to chain at the tail.
+# n2-thumbs + e4-gallery need the runtime bundle WITH browsers
+# (`bash scripts/fetch-penpot.sh --with-browsers`); m4-artifact-test.sh stays
+# separate: it needs a dmg build (`bash scripts/build-dmg.sh` first) and carries
+# the E4 offline packaged-gallery leg (g4).
 e2e:
     bash scripts/m1-smoke.sh
     bash scripts/m2-invariant.sh
@@ -152,6 +170,7 @@ e2e:
     bash scripts/e1-contract.sh
     bash scripts/e2-packages.sh
     bash scripts/e3-library.sh
+    bash scripts/e4-gallery.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

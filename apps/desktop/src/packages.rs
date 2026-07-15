@@ -37,6 +37,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -47,6 +48,7 @@ use penpot_rpc::{Auth, PenpotClient};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sync_core::{LockEntry, Lockfile};
+use tokio::sync::watch;
 
 /// Router state: where packages live + how to reach the backend. Rebuilt per
 /// boot (and per vault switch) so `vault_root`/`team_id`/`token` stay fresh.
@@ -61,6 +63,10 @@ pub struct PackagesState {
     pub token: Option<String>,
     /// The single team's id (deep-link `team-id` + import target team).
     pub team_id: String,
+    /// E4b: the latest surface-don't-apply update model, published on a `watch`
+    /// channel by [`spawn_updates_poller`] (debounced via `send_if_modified`).
+    /// The `/__api/packages/updates` poll endpoint just borrows the current value.
+    pub updates_rx: watch::Receiver<PackageUpdatesModel>,
 }
 
 impl PackagesState {
@@ -79,6 +85,9 @@ pub fn router(state: Arc<PackagesState>) -> Router {
         .route("/__api/packages/install", post(install_package))
         .route("/__api/packages/publish", post(publish_package))
         .route("/__api/packages/link", post(link_package))
+        // E4b — surface-don't-apply update channel + drift conflict copy.
+        .route("/__api/packages/updates", get(updates))
+        .route("/__api/packages/preserve-drift", post(preserve_drift))
         .with_state(state)
 }
 
@@ -164,13 +173,18 @@ pub fn discover_penpot_tree(pkg_dir: &Path) -> Option<PathBuf> {
 /// as a version pin the consumer diffs against.
 pub fn contract_hash_of_tree(tree_dir: &Path) -> anyhow::Result<String> {
     let files = sync_core::read_tree(tree_dir)?;
-    let lib = vault_index::extract_contracts(&files);
+    Ok(contract_hash_of_lib(&vault_index::extract_contracts(&files)))
+}
+
+/// The file-id-excluded canonical sha256 of an already-extracted contract — the
+/// shared core of [`contract_hash_of_tree`]. Factored out so the E4b update
+/// channel can derive a tree's contract AND its pin hash from a single read.
+fn contract_hash_of_lib(lib: &vault_index::LibraryContract) -> String {
     let mut j = lib.to_json();
     if let Some(obj) = j.as_object_mut() {
         obj.remove("fileId");
     }
-    let canonical = sync_core::dumps(&j);
-    Ok(sync_core::sha256_hex(canonical.as_bytes()))
+    sync_core::sha256_hex(sync_core::dumps(&j).as_bytes())
 }
 
 /// Best-effort `git remote get-url origin` for a cloned package (empty string
@@ -887,6 +901,371 @@ pub fn spawn_relink_reconcile(state: Arc<PackagesState>) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// E4b — surface-don't-apply update channel + drift conflict copy
+// ---------------------------------------------------------------------------
+//
+// THE CORE VALUE: a consumer's materialized `.penpot` file on disk stays
+// BYTE-UNCHANGED. We SURFACE a package's update (its `.penpot-packages/<id>`
+// source moved since install) and classify the bump; we NEVER rewrite the
+// installed file to apply it. Drift (a managed package whose incoming source
+// diverges) is preserved as a `.conflict-<ts>.penpot` copy that overwrites
+// neither side — the exact M3 conflict rule, reused verbatim.
+
+/// How often the background poller recomputes the update model. The
+/// `send_if_modified` debounce means an unchanged model is never republished, so
+/// a short interval is cheap for the small set of installed packages.
+pub const UPDATES_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One package's surface-don't-apply update status, serialized camelCase.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageUpdateRow {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    /// The materialized vault file id (the durable M2 resurrect-by-id target).
+    pub file_id: String,
+    /// The contract hash pinned in `lock.json` at install time (the "before").
+    pub pinned_contract_hash: String,
+    /// Freshly computed contract hash over the current `.penpot-packages/<id>`
+    /// source (the "after"). Empty when the package carries no readable source.
+    pub live_contract_hash: String,
+    /// True when `live != pinned` — the source moved since install.
+    pub update_available: bool,
+    /// Bump severity of the change: `patch` | `migration` | `minor` | `major`.
+    /// `None` when there is no update, or the pinned "before" contract could not
+    /// be reconstructed (surface the update without over-claiming a severity).
+    pub bump: Option<String>,
+    /// True for a contract-**major** bump (a breaking change surfaced).
+    pub is_major: bool,
+    /// Exact deep link to open the materialized file in the workspace.
+    pub deep_link: String,
+    /// A drift conflict copy already preserved next to the installed file
+    /// (`<stem>.conflict-<ts>.penpot`), if one exists — read-only detection.
+    pub conflict_copy_path: Option<String>,
+}
+
+/// The whole update model, serialized camelCase. Deterministic (packages are
+/// iterated in lockfile key order), so `send_if_modified` only fires on a real
+/// change.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageUpdatesModel {
+    /// Count of packages with `update_available`.
+    pub updates: usize,
+    /// Count of packages whose surfaced bump is `major`.
+    pub majors: usize,
+    pub rows: Vec<PackageUpdateRow>,
+}
+
+/// Pure classification core: given the pinned "before" contract, the live
+/// "after" contract, and their file-id-excluded hashes, decide whether an update
+/// is available and its bump. `diff_contracts` is uuid-invariant (E1), so the
+/// "before" may be reconstructed from the materialized vault file even though it
+/// carries different ids than the source. Read-only — it mutates nothing.
+pub fn classify_update(
+    pinned_hash: &str,
+    live_hash: &str,
+    before: Option<&vault_index::LibraryContract>,
+    after: &vault_index::LibraryContract,
+) -> (bool, Option<vault_index::Bump>) {
+    if pinned_hash == live_hash {
+        // Contract byte-identical (patch or no change) — nothing to surface.
+        (false, None)
+    } else {
+        let bump = before.map(|b| vault_index::diff_contracts(b, after).overall);
+        (true, bump)
+    }
+}
+
+/// Extract the contract of the tree materialized on disk for `file_id`, located
+/// via the sync manifest (file_id → vault-relative `.penpot` dir). This is the
+/// honest "before": install round-trips the source through the DB, and the
+/// contract is round-trip- and uuid-invariant, so the materialized file's
+/// contract equals the source-at-install contract. `None` if no manifest, no
+/// entry, or the tree is unreadable (→ update surfaced without a bump).
+fn materialized_contract(vault_root: &Path, file_id: &str) -> Option<vault_index::LibraryContract> {
+    let manifest = sync_core::Manifest::load(vault_root).ok().flatten()?;
+    let rel = &manifest.files.get(file_id)?.path;
+    let files = sync_core::read_tree(&vault_root.join(rel)).ok()?;
+    Some(vault_index::extract_contracts(&files))
+}
+
+/// Read-only: existing drift conflict copies (`<stem>.conflict-<ts>.penpot`)
+/// sitting next to the installed file at `installed_rel`. Sorted for
+/// determinism.
+fn existing_conflict_copies(vault_root: &Path, installed_rel: &str) -> Vec<String> {
+    let stem = installed_rel
+        .strip_suffix(sync_daemon::paths::PENPOT_DIR_SUFFIX)
+        .unwrap_or(installed_rel);
+    let (dir_rel, base) = match stem.rsplit_once('/') {
+        Some((d, b)) => (d.to_string(), b.to_string()),
+        None => (String::new(), stem.to_string()),
+    };
+    let prefix = format!("{base}{}", sync_daemon::paths::CONFLICT_MARKER);
+    let scan_dir = if dir_rel.is_empty() {
+        vault_root.to_path_buf()
+    } else {
+        vault_root.join(&dir_rel)
+    };
+    let mut out: Vec<String> = std::fs::read_dir(&scan_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.starts_with(&prefix) && sync_daemon::paths::is_conflict_dir_name(n))
+        .map(|n| if dir_rel.is_empty() { n.clone() } else { format!("{dir_rel}/{n}") })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Compute the surface-don't-apply update model from disk. Read-only: it loads
+/// `lock.json`, the sync manifest, and each package's `.penpot-packages/<id>`
+/// source tree, and NEVER writes any file (the "surface, don't apply"
+/// guarantee). Errors degrade to an empty/partial model rather than propagating.
+pub fn compute_updates_model(
+    vault_root: &Path,
+    packages_dir: &Path,
+    team_id: &str,
+) -> PackageUpdatesModel {
+    let lock = match Lockfile::load_or_default(vault_root) {
+        Ok(l) => l,
+        Err(_) => return PackageUpdatesModel::default(),
+    };
+    let mut rows: Vec<PackageUpdateRow> = Vec::new();
+    let mut updates = 0usize;
+    let mut majors = 0usize;
+
+    for (id, entry) in &lock.packages {
+        // The live "after": the current source tree's contract + its pin hash,
+        // from a single read. Missing/unreadable source → nothing to surface.
+        let after = discover_penpot_tree(&packages_dir.join(id))
+            .and_then(|tree| sync_core::read_tree(&tree).ok())
+            .map(|files| vault_index::extract_contracts(&files));
+
+        let (update_available, bump, live_hash) = match &after {
+            Some(after) => {
+                let live_hash = contract_hash_of_lib(after);
+                let before = if live_hash == entry.contract_hash {
+                    None // no need to reconstruct — no update.
+                } else {
+                    // Reconstruct the "before" from the installed vault file, but
+                    // only TRUST it as the baseline if it still hashes to the pin.
+                    // lock.json stores only the pinned hash (not the contract
+                    // body), and the materialized file is sync-tracked — a local
+                    // edit to the installed package would drift its contract and
+                    // skew the surfaced bump (e.g. a false MAJOR). The pinned hash
+                    // is uuid-invariant (E1), so `contract_hash_of_lib(materialized)
+                    // == entry.contract_hash` iff the install has NOT drifted at the
+                    // contract level. When it has, surface the update WITHOUT a
+                    // (potentially wrong) severity rather than a misleading one.
+                    // Exact severity under a drifted install would need the pinned
+                    // contract body in lock.json — a deliberate future refinement.
+                    materialized_contract(vault_root, &entry.file_id)
+                        .filter(|m| contract_hash_of_lib(m) == entry.contract_hash)
+                };
+                let (avail, bump) =
+                    classify_update(&entry.contract_hash, &live_hash, before.as_ref(), after);
+                (avail, bump, live_hash)
+            }
+            None => (false, None, String::new()),
+        };
+
+        if update_available {
+            updates += 1;
+        }
+        let is_major = bump == Some(vault_index::Bump::Major);
+        if is_major {
+            majors += 1;
+        }
+
+        // Read-only: surface an already-preserved drift copy, if any.
+        let conflict_copy_path = sync_core::Manifest::load(vault_root)
+            .ok()
+            .flatten()
+            .and_then(|m| m.files.get(&entry.file_id).map(|e| e.path.clone()))
+            .map(|rel| existing_conflict_copies(vault_root, &rel))
+            .and_then(|mut v| v.pop());
+
+        rows.push(PackageUpdateRow {
+            id: id.clone(),
+            name: entry.name.clone(),
+            version: entry.version.clone(),
+            file_id: entry.file_id.clone(),
+            pinned_contract_hash: entry.contract_hash.clone(),
+            live_contract_hash: live_hash,
+            update_available,
+            bump: bump.map(|b| b.as_str().to_string()),
+            is_major,
+            deep_link: vault_index::workspace_deep_link(team_id, &entry.file_id, None),
+            conflict_copy_path,
+        });
+    }
+
+    PackageUpdatesModel { updates, majors, rows }
+}
+
+/// Spawn the background update poller. It recomputes [`compute_updates_model`] on
+/// [`UPDATES_POLL_INTERVAL`] in a `spawn_blocking` (off the async worker) and
+/// publishes to a `watch` channel with `send_if_modified` — the debounce, so an
+/// unchanged model never churns the channel. Returns the receiver the
+/// `/__api/packages/updates` endpoint borrows.
+pub fn spawn_updates_poller(
+    vault_root: PathBuf,
+    packages_dir: PathBuf,
+    team_id: String,
+) -> watch::Receiver<PackageUpdatesModel> {
+    let (tx, rx) = watch::channel(PackageUpdatesModel::default());
+    tokio::spawn(async move {
+        loop {
+            let (vr, pd, tid) = (vault_root.clone(), packages_dir.clone(), team_id.clone());
+            let model = tokio::task::spawn_blocking(move || compute_updates_model(&vr, &pd, &tid))
+                .await
+                .unwrap_or_default();
+            // send_if_modified = the debounce: publish ONLY on an actual change.
+            tx.send_if_modified(move |cur| {
+                if *cur != model {
+                    *cur = model;
+                    true
+                } else {
+                    false
+                }
+            });
+            // Stop once no one is listening (the receiver in state was dropped).
+            if tx.is_closed() {
+                break;
+            }
+            tokio::time::sleep(UPDATES_POLL_INTERVAL).await;
+        }
+    });
+    rx
+}
+
+async fn updates(State(state): State<Arc<PackagesState>>) -> Response {
+    let model = state.updates_rx.borrow().clone();
+    Json(model).into_response()
+}
+
+/// The conflict rule for drift of a managed package (reuses
+/// [`sync_daemon::paths::conflict_path_for`]): preserve the INCOMING source
+/// version as a uniquified `<stem>.conflict-<ts>.penpot` sibling of the installed
+/// file, NEVER overwriting the installed file OR the source. Returns the
+/// vault-relative path of the copy. Surface-don't-apply: the installed file is
+/// left byte-unchanged (we do not import the update over it).
+pub fn preserve_package_drift(
+    vault_root: &Path,
+    installed_rel: &str,
+    source_tree: &Path,
+) -> anyhow::Result<String> {
+    // Uniquify against anything already on disk — never overwrite (mirrors the
+    // engine's `stage_to_conflict_copy`).
+    let now = sync_core::lock::now_rfc3339();
+    let mut conflict_rel = sync_daemon::paths::conflict_path_for(installed_rel, &now);
+    let mut counter = 1u32;
+    while vault_root.join(&conflict_rel).symlink_metadata().is_ok() {
+        counter += 1;
+        conflict_rel =
+            sync_daemon::paths::conflict_path_for(installed_rel, &format!("{now}-{counter}"));
+    }
+    let target = vault_root.join(&conflict_rel);
+    // Copy the incoming source tree file-by-file, then normalize it into the same
+    // clean `.penpot` representation every managed file has.
+    let files = sync_core::read_tree(source_tree)?;
+    for (rel, bytes) in &files {
+        let dest = target.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, bytes)?;
+    }
+    sync_core::normalize_tree(&target)?;
+    tracing::warn!(
+        installed = %installed_rel, copy = %conflict_rel,
+        "PACKAGE DRIFT: incoming source preserved as a conflict copy — installed file left byte-unchanged (surface, not applied)"
+    );
+    Ok(conflict_rel)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriftReq {
+    id: String,
+}
+
+async fn preserve_drift(
+    State(state): State<Arc<PackagesState>>,
+    Json(req): Json<DriftReq>,
+) -> Response {
+    let id = req.id.trim().to_string();
+    if !is_safe_id(&id) {
+        return bad_request(format!("unsafe package id {id:?}"));
+    }
+    let vault_root = state.vault_root.clone();
+    let packages_dir = state.packages_dir.clone();
+    let result =
+        tokio::task::spawn_blocking(move || do_preserve_drift(&vault_root, &packages_dir, &id)).await;
+    match result {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": format!("{e:#}")})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": format!("drift task join: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+fn do_preserve_drift(
+    vault_root: &Path,
+    packages_dir: &Path,
+    id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let lock = Lockfile::load_or_default(vault_root)?;
+    let entry = lock
+        .packages
+        .get(id)
+        .ok_or_else(|| anyhow::anyhow!("package {id:?} is not installed"))?;
+    let source_tree = discover_penpot_tree(&packages_dir.join(id))
+        .ok_or_else(|| anyhow::anyhow!("package {id:?} carries no .penpot source tree"))?;
+    let manifest = sync_core::Manifest::load(vault_root)?
+        .ok_or_else(|| anyhow::anyhow!("no sync manifest yet — nothing installed on disk"))?;
+    let installed_rel = manifest
+        .files
+        .get(&entry.file_id)
+        .map(|e| e.path.clone())
+        .ok_or_else(|| anyhow::anyhow!("package {id:?} file {} not on disk", entry.file_id))?;
+    // Drift gate: only preserve a copy when the source actually differs from the
+    // pinned contract. Calling this with nothing drifted is a safe no-op — never
+    // litter the vault with a spurious `.conflict-<ts>` copy. (When there IS
+    // drift, each call snapshots the incoming source as a fresh uniquified copy,
+    // overwriting neither side.) The pin hash is uuid-invariant (E1), so this
+    // matches the update channel's own availability signal.
+    let source_contract_hash = contract_hash_of_tree(&source_tree)?;
+    if source_contract_hash == entry.contract_hash {
+        return Ok(json!({
+            "ok": true,
+            "id": id,
+            "installedRel": installed_rel,
+            "conflictCopyPath": serde_json::Value::Null,
+            "drifted": false,
+        }));
+    }
+    let conflict_rel = preserve_package_drift(vault_root, &installed_rel, &source_tree)?;
+    Ok(json!({
+        "ok": true,
+        "id": id,
+        "installedRel": installed_rel,
+        "conflictCopyPath": conflict_rel,
+        "drifted": true,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1008,5 +1387,237 @@ mod tests {
     fn display_name_title_cases_the_id() {
         assert_eq!(display_name_from_id("button-library"), "Button Library");
         assert_eq!(display_name_from_id("icons_v2"), "Icons V2");
+    }
+
+    // -----------------------------------------------------------------------
+    // E4b — surface-don't-apply update channel + drift conflict copy
+    // -----------------------------------------------------------------------
+
+    /// Write a minimal contract-bearing `.penpot` tree: a `manifest.json`
+    /// pinning `file_id` plus one color doc per name (the library-level exported
+    /// surface `diff_contracts` classifies). Distinct file ids exercise the
+    /// uuid-invariance of the contract.
+    fn write_color_tree(tree_dir: &Path, file_id: &str, colors: &[&str]) {
+        let write = |rel: &str, v: &serde_json::Value| {
+            let p = tree_dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, serde_json::to_vec(v).unwrap()).unwrap();
+        };
+        write("manifest.json", &json!({"files": [{"id": file_id}]}));
+        for (i, name) in colors.iter().enumerate() {
+            write(
+                &format!("files/{file_id}/colors/col{i}.json"),
+                &json!({"id": format!("col-{i}"), "name": name}),
+            );
+        }
+    }
+
+    const MAT_ID: &str = "aaaa1111-2222-3333-4444-555566667777";
+    const SRC_ID: &str = "bbbb9999-8888-7777-6666-555544443333";
+
+    /// Build a vault fixture: a package `kit` installed as `Drafts/kit.penpot`
+    /// (the materialized file, id `MAT_ID`) pinned in `lock.json`, plus its
+    /// source tree under `.penpot-packages/kit/kit.penpot` (id `SRC_ID`). Both
+    /// start with the same colors, so the pinned contract hash matches the
+    /// source. Returns the vault root and the packages dir.
+    fn setup_vault(colors: &[&str]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_root = tmp.path().to_path_buf();
+        let packages_dir = vault_root.join(sync_core::PACKAGES_DIR_NAME);
+
+        // Materialized vault file (the "before" — byte-frozen at install).
+        let installed = vault_root.join("Drafts/kit.penpot");
+        write_color_tree(&installed, MAT_ID, colors);
+
+        // Package source tree (the "after" — may drift/update).
+        let source = packages_dir.join("kit/kit.penpot");
+        write_color_tree(&source, SRC_ID, colors);
+
+        // Sync manifest: file_id → on-disk path (the resurrect-by-id spine).
+        let mut manifest = sync_core::Manifest::default();
+        manifest.files.insert(
+            MAT_ID.to_string(),
+            sync_core::ManifestEntry {
+                path: "Drafts/kit.penpot".to_string(),
+                project_id: "proj".to_string(),
+                project_name: "Drafts".to_string(),
+                revn: 1,
+                db_modified_at: String::new(),
+                last_synced_hash: "h".to_string(),
+                last_synced_at: "2026-07-15T00:00:00Z".to_string(),
+            },
+        );
+        manifest.save(&vault_root).unwrap();
+
+        // Lockfile: pin kit at the source's contract hash (== materialized hash).
+        let pinned = contract_hash_of_tree(&source).unwrap();
+        let mut lock = Lockfile::default();
+        lock.upsert(
+            "kit",
+            LockEntry {
+                version: "1.0.0".into(),
+                kind: "component-library".into(),
+                content_hash: "content".into(),
+                contract_hash: pinned,
+                source_git_url: String::new(),
+                file_id: MAT_ID.into(),
+                name: "Kit".into(),
+                installed_at: "2026-07-15T00:00:00Z".into(),
+                library_shared: false,
+                plugin_props: Default::default(),
+                links: Vec::new(),
+            },
+        );
+        lock.save(&vault_root).unwrap();
+
+        (tmp, vault_root, packages_dir)
+    }
+
+    /// Snapshot a tree's bytes for a byte-unchanged assertion.
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        sync_core::read_tree(dir).unwrap()
+    }
+
+    #[test]
+    fn classify_update_is_pure_and_hash_gated() {
+        let before = vault_index::extract_contracts(
+            &{
+                let t = tempfile::tempdir().unwrap();
+                write_color_tree(t.path(), MAT_ID, &["Brand"]);
+                sync_core::read_tree(t.path()).unwrap()
+            },
+        );
+        let after = vault_index::extract_contracts(
+            &{
+                let t = tempfile::tempdir().unwrap();
+                write_color_tree(t.path(), SRC_ID, &["Brand", "Accent"]);
+                sync_core::read_tree(t.path()).unwrap()
+            },
+        );
+        // Equal hashes → no update, regardless of the contracts.
+        let (avail, bump) = classify_update("H", "H", Some(&before), &after);
+        assert!(!avail);
+        assert_eq!(bump, None);
+        // Different hashes → update; added color → minor.
+        let (avail, bump) = classify_update("H1", "H2", Some(&before), &after);
+        assert!(avail);
+        assert_eq!(bump, Some(vault_index::Bump::Minor));
+        // Different hashes but no "before" → update surfaced without a severity.
+        let (avail, bump) = classify_update("H1", "H2", None, &after);
+        assert!(avail);
+        assert_eq!(bump, None);
+    }
+
+    #[test]
+    fn updates_model_surfaces_no_update_when_source_matches() {
+        let (_tmp, vault_root, packages_dir) = setup_vault(&["Brand"]);
+        let before = snapshot(&vault_root.join("Drafts/kit.penpot"));
+        let model = compute_updates_model(&vault_root, &packages_dir, "team-1");
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.updates, 0);
+        assert_eq!(model.majors, 0);
+        let row = &model.rows[0];
+        assert_eq!(row.id, "kit");
+        assert!(!row.update_available);
+        assert_eq!(row.bump, None);
+        assert_eq!(row.pinned_contract_hash, row.live_contract_hash);
+        assert_eq!(
+            row.deep_link,
+            format!("/#/workspace?team-id=team-1&file-id={MAT_ID}")
+        );
+        // Surface, don't apply: the materialized file is byte-unchanged.
+        assert_eq!(before, snapshot(&vault_root.join("Drafts/kit.penpot")));
+    }
+
+    #[test]
+    fn updates_model_surfaces_minor_bump_and_leaves_file_byte_unchanged() {
+        let (_tmp, vault_root, packages_dir) = setup_vault(&["Brand"]);
+        // Edit the SOURCE only: add a color (a minor, additive change).
+        write_color_tree(&packages_dir.join("kit/kit.penpot"), SRC_ID, &["Brand", "Accent"]);
+        let before = snapshot(&vault_root.join("Drafts/kit.penpot"));
+
+        let model = compute_updates_model(&vault_root, &packages_dir, "team-1");
+        let row = &model.rows[0];
+        assert!(row.update_available);
+        assert_eq!(row.bump.as_deref(), Some("minor"));
+        assert!(!row.is_major);
+        assert_ne!(row.pinned_contract_hash, row.live_contract_hash);
+        assert_eq!(model.updates, 1);
+        assert_eq!(model.majors, 0);
+        // THE CORE VALUE: the installed file was NOT rewritten to apply it.
+        assert_eq!(before, snapshot(&vault_root.join("Drafts/kit.penpot")));
+    }
+
+    #[test]
+    fn updates_model_surfaces_major_bump_on_removed_element() {
+        let (_tmp, vault_root, packages_dir) = setup_vault(&["Brand"]);
+        // Edit the SOURCE: drop "Brand", add "Accent" → a removed element = major.
+        write_color_tree(&packages_dir.join("kit/kit.penpot"), SRC_ID, &["Accent"]);
+        let before = snapshot(&vault_root.join("Drafts/kit.penpot"));
+
+        let model = compute_updates_model(&vault_root, &packages_dir, "team-1");
+        let row = &model.rows[0];
+        assert!(row.update_available);
+        assert_eq!(row.bump.as_deref(), Some("major"));
+        assert!(row.is_major);
+        assert_eq!(model.majors, 1);
+        assert_eq!(before, snapshot(&vault_root.join("Drafts/kit.penpot")));
+    }
+
+    #[test]
+    fn preserve_drift_writes_conflict_copy_overwriting_neither_side() {
+        let (_tmp, vault_root, packages_dir) = setup_vault(&["Brand"]);
+        // The source has drifted from the installed file.
+        write_color_tree(&packages_dir.join("kit/kit.penpot"), SRC_ID, &["Brand", "Accent"]);
+        let installed = vault_root.join("Drafts/kit.penpot");
+        let source = packages_dir.join("kit/kit.penpot");
+        let installed_before = snapshot(&installed);
+        let source_before = snapshot(&source);
+
+        let copy_rel = preserve_package_drift(&vault_root, "Drafts/kit.penpot", &source).unwrap();
+        // A conflict-copy name next to the installed file.
+        assert!(copy_rel.starts_with("Drafts/kit.conflict-"));
+        assert!(sync_daemon::paths::is_conflict_dir_name(
+            copy_rel.rsplit('/').next().unwrap()
+        ));
+        assert!(vault_root.join(&copy_rel).is_dir());
+        // Neither side was overwritten.
+        assert_eq!(installed_before, snapshot(&installed), "installed file untouched");
+        assert_eq!(source_before, snapshot(&source), "package source untouched");
+        // The copy holds the INCOMING (drifted) version: 2 colors.
+        let copy_files = snapshot(&vault_root.join(&copy_rel));
+        let colors = copy_files
+            .keys()
+            .filter(|k| k.contains("/colors/"))
+            .count();
+        assert_eq!(colors, 2);
+
+        // A second preservation in the same second uniquifies — never overwrites.
+        let copy_rel2 = preserve_package_drift(&vault_root, "Drafts/kit.penpot", &source).unwrap();
+        assert_ne!(copy_rel, copy_rel2);
+        assert!(vault_root.join(&copy_rel).is_dir());
+        assert!(vault_root.join(&copy_rel2).is_dir());
+    }
+
+    #[test]
+    fn model_surfaces_an_existing_drift_conflict_copy() {
+        let (_tmp, vault_root, packages_dir) = setup_vault(&["Brand"]);
+        write_color_tree(&packages_dir.join("kit/kit.penpot"), SRC_ID, &["Brand", "Accent"]);
+        let source = packages_dir.join("kit/kit.penpot");
+        let copy_rel = preserve_package_drift(&vault_root, "Drafts/kit.penpot", &source).unwrap();
+
+        let model = compute_updates_model(&vault_root, &packages_dir, "team-1");
+        assert_eq!(model.rows[0].conflict_copy_path.as_deref(), Some(copy_rel.as_str()));
+    }
+
+    #[test]
+    fn empty_vault_yields_an_empty_updates_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model = compute_updates_model(
+            tmp.path(),
+            &tmp.path().join(sync_core::PACKAGES_DIR_NAME),
+            "team-1",
+        );
+        assert_eq!(model, PackageUpdatesModel::default());
     }
 }
