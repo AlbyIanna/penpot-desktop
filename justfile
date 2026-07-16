@@ -140,6 +140,27 @@ e3:
 e4:
     bash scripts/e4-gallery.sh
 
+# E5 cross-package token-resolver SPIKE gate (PLAN3 milestone E5). Ships a
+# VERDICT (docs/ecosystem-spikes/token-resolver.md) + this gate — no UI, no
+# product Rust changes. Against a fresh re-provisioned 2.16.2: mirrors the
+# tokens-starter-kit's DTCG sets into a consumer (edit exported tree +
+# in-place re-import, provenance-stamped via a theme id -> tokens_lib
+# :external-id) and asserts the merged file round-trips A=B per roundtrip.py;
+# asserts a scripted collision resolves to the tokenSetOrder-winner AND that
+# flipping the order flips the resolved value (order-is-contract, RPC-
+# observable); runs the STATIC resolver headless over the starter-kit dump
+# (per-token free-variable deps; pre-existing dangling paths pinned as
+# baseline noise; synthetic dropped token = MAJOR) — and re-runs it with the
+# stack DOWN (never injected, ecosystem invariant 3). Drift of a mirrored set
+# is detected and prescribes the conflict copy. Dedicated ports
+# 8998/6459/5533/6476 (control 8999); live stack + the runtime bundle.
+# DECISION: deliberately NOT chained into `just e2e` — spike precedent (the
+# contract-extractability spike was never chained); E5 lands no product code,
+# so the ladder has nothing of E5's to regress. Re-run on Penpot version
+# bumps or when the token-package build (PLAN3 ch.4) starts.
+e5:
+    bash scripts/e5-tokens-spike.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -155,7 +176,9 @@ routes-gate:
 # n2-thumbs + e4-gallery need the runtime bundle WITH browsers
 # (`bash scripts/fetch-penpot.sh --with-browsers`); m4-artifact-test.sh stays
 # separate: it needs a dmg build (`bash scripts/build-dmg.sh` first) and carries
-# the E4 offline packaged-gallery leg (g4).
+# the E4 offline packaged-gallery leg (g4). e5-tokens-spike.sh (`just e5`)
+# also stays out by decision: it is a SPIKE gate with no product code to
+# regress (see the e5 recipe comment).
 e2e:
     bash scripts/m1-smoke.sh
     bash scripts/m2-invariant.sh
