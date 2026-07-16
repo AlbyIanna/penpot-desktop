@@ -192,6 +192,21 @@ pub struct BoardRow {
     pub rel_path: String,
 }
 
+/// One package row of the index (E4): the raw material of the flat package
+/// gallery. `id` is the package id (`.penpot-packages/<id>`), `file_id` is the
+/// materialized vault file the gallery deep-links to. Serialized camelCase for
+/// the `/__api/packages/search` listing.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageRow {
+    /// The package id (`docs.object_id` for a `kind='package'` row).
+    pub id: String,
+    pub name: String,
+    /// The materialized vault Penpot file id (the deep-link target).
+    pub file_id: String,
+    pub rel_path: String,
+}
+
 // ---------------------------------------------------------------------------
 // Search (read side — separate connections, safe under WAL while the
 // service writes)
@@ -331,6 +346,46 @@ impl SearchHandle {
         }
         Ok(out)
     }
+
+    /// Every package (`kind = 'package'`) in the index, deterministically ordered
+    /// by package id so a rebuilt index lists the gallery identically. A full
+    /// scan of an UNINDEXED column — cheap at vault scale and off the search hot
+    /// path. Powers the empty-query `/__api/packages/search` gallery listing (E4).
+    pub fn all_packages(&self) -> Result<Vec<PackageRow>, SearchError> {
+        let conn = Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| SearchError::NotReady)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| SearchError::Other(e.into()))?;
+        let sql = "
+            SELECT object_id, name, file_id, rel_path
+            FROM docs
+            WHERE kind = 'package'
+            ORDER BY object_id";
+        let mut stmt = conn.prepare(sql).map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(_, Some(ref m)) if m.contains("no such table") => {
+                SearchError::NotReady
+            }
+            e => SearchError::Other(e.into()),
+        })?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PackageRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    file_id: r.get(2)?,
+                    rel_path: r.get(3)?,
+                })
+            })
+            .map_err(|e| SearchError::Other(e.into()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| SearchError::Other(e.into()))?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +495,50 @@ mod tests {
                 ("z/last.penpot", "bZ", "Cover"),
             ]
         );
+    }
+
+    /// E4: `all_packages` lists only `kind='package'` rows, ordered by package
+    /// id, carrying the deep-link file id — and ignores every other doc kind.
+    #[test]
+    fn all_packages_lists_only_packages_deterministically() {
+        fn pkg(id: &str, name: &str, file_id: &str) -> DocRow {
+            DocRow {
+                kind: DocKind::Package,
+                name: name.into(),
+                body: format!("{id} {name}"),
+                file_id: file_id.into(),
+                page_id: String::new(),
+                object_id: id.into(),
+                board_id: String::new(),
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("idx.sqlite3");
+        let mut db = IndexDb::open(&path).unwrap();
+        // Insert out of order; a board doc must NOT leak into the package list.
+        db.replace_file("pkg:zeta", ".penpot-packages/zeta/z.penpot", "hz", &[pkg("zeta", "Zeta Kit", "file-z")])
+            .unwrap();
+        db.replace_file("pkg:alpha", ".penpot-packages/alpha/a.penpot", "ha", &[pkg("alpha", "Alpha Kit", "file-a")])
+            .unwrap();
+        db.replace_file("f1", "proj/home.penpot", "h", &[doc(DocKind::Board, "Just A Board", "b1")])
+            .unwrap();
+
+        let pkgs = SearchHandle::new(&path).all_packages().unwrap();
+        assert_eq!(
+            pkgs.iter().map(|p| (p.id.as_str(), p.file_id.as_str())).collect::<Vec<_>>(),
+            vec![("alpha", "file-a"), ("zeta", "file-z")]
+        );
+        // And the kind filter on search isolates packages from everything else.
+        let search = SearchHandle::new(&path);
+        assert_eq!(search.search("\"kit\"", Some("package"), 10).unwrap().len(), 2);
+        assert!(search.search("\"board\"", Some("package"), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_packages_on_missing_db_is_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let search = SearchHandle::new(tmp.path().join("nope.sqlite3"));
+        assert!(matches!(search.all_packages(), Err(SearchError::NotReady)));
     }
 
     #[test]

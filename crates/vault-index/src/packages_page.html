@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Package gallery</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; font-weight: 600; }
+  p.lead { color: #888; margin-top: -.4rem; }
+  form { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  input[type=search] { flex: 1; font: inherit; padding: .45rem .6rem;
+    border: 1px solid #8884; border-radius: 6px; background: transparent; color: inherit; }
+  button { font: inherit; padding: .45rem .9rem; border: 1px solid #8884;
+    border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+  #meta { color: #888; font-size: .85rem; margin: .5rem 0; }
+  /* Flat gallery: every card is rendered identically — no tier, badge, rank,
+     promotion, or price. Ecosystem value = uniform browse surface. */
+  #grid { list-style: none; padding: 0; margin: 0;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: .75rem; }
+  li { margin: 0; }
+  a.package-card { display: block; text-decoration: none; color: inherit;
+    border: 1px solid #8883; border-radius: 8px; padding: .75rem .85rem; height: 100%; }
+  a.package-card:hover { border-color: #8888; }
+  a.package-card:hover .name { text-decoration: underline; }
+  .name { font-weight: 600; display: block; }
+  .info { color: #888; font-size: .8rem; margin-top: .15rem; }
+  .id { color: #777; font-size: .75rem; margin-top: .35rem; word-break: break-all; }
+  .snippet { color: #999; font-size: .82rem; margin-top: .35rem; }
+  .snippet b { color: inherit; font-weight: 700; }
+  #empty { color: #888; padding: 1rem 0; }
+</style>
+</head>
+<body>
+<h1>Package gallery</h1>
+<p class="lead">Installed packages in this vault. Open one to jump straight to its file.</p>
+<form id="f" action="/__packages" method="get">
+  <input id="q" name="q" type="search" placeholder="Search packages by name, id, or contents…" autofocus>
+  <button type="submit">Search</button>
+</form>
+<div id="meta"></div>
+<ul id="grid"></ul>
+<div id="empty" hidden>No packages match.</div>
+<script>
+(function () {
+  var form = document.getElementById('f');
+  var input = document.getElementById('q');
+  var meta = document.getElementById('meta');
+  var grid = document.getElementById('grid');
+  var empty = document.getElementById('empty');
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
+    });
+  }
+  // The API marks matches with « »; convert to <b> AFTER escaping.
+  function snippetHtml(s) {
+    return esc(s).replace(/«/g, '<b>').replace(/»/g, '</b>');
+  }
+
+  function infoLine(p) {
+    var bits = [];
+    if (p.version) { bits.push('v' + esc(p.version)); }
+    if (p.kind) { bits.push(esc(p.kind)); }
+    return bits.join(' · ');
+  }
+
+  function render(data) {
+    meta.textContent = data.count + ' package' + (data.count === 1 ? '' : 's') +
+      ' · ' + data.tookMs.toFixed(1) + ' ms';
+    empty.hidden = data.count !== 0;
+    grid.innerHTML = data.packages.map(function (p) {
+      var info = infoLine(p);
+      var snippet = p.snippet ? '<div class="snippet">' + snippetHtml(p.snippet) + '</div>' : '';
+      return '<li><a class="package-card" data-deeplink="' + esc(p.deepLink) + '" href="' + esc(p.deepLink) + '">' +
+        '<span class="name">' + esc(p.name || p.id || '(unnamed)') + '</span>' +
+        (info ? '<div class="info">' + info + '</div>' : '') +
+        snippet +
+        '<div class="id">' + esc(p.id) + '</div>' +
+        '</a></li>';
+    }).join('');
+  }
+
+  function run(q) {
+    fetch('/__api/packages/search?q=' + encodeURIComponent(q || ''))
+      .then(function (r) {
+        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+        return r.json();
+      })
+      .then(render)
+      .catch(function (e) { meta.textContent = 'Gallery failed: ' + e.message; });
+  }
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var q = input.value.trim();
+    var url = new URL(window.location.href);
+    if (q) { url.searchParams.set('q', q); } else { url.searchParams.delete('q'); }
+    history.replaceState(null, '', url);
+    run(q);
+  });
+
+  var initial = new URLSearchParams(window.location.search).get('q') || '';
+  input.value = initial;
+  run(initial);
+})();
+</script>
+</body>
+</html>

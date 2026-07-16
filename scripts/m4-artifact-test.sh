@@ -29,7 +29,10 @@
 #   (g) PACKAGED SEARCH: the bundled N1 vault-index service indexes the seeded
 #       designs offline and /__api/vault/search returns the 'Cover' board hit
 #       (kind=board, alpha fileId, /#/workspace deep link) — the surface N3's
-#       board grid depends on, proven present in the shipped artifact;
+#       board grid depends on, proven present in the shipped artifact; plus the
+#       N4 palette (g2), N6 new-from-template (g3), and the E4 package gallery
+#       (g4): an offline install + /__packages page + /__api/packages/search
+#       returning the seeded package by id with an exact /#/workspace deep link;
 #   (e) SIGTERM -> clean exit, no orphans; then a SIGKILL run -> the watchdog
 #       reaps every child (incl. the exporter node child — the M5 orphan gap).
 #
@@ -487,6 +490,75 @@ if [ "$NEW_OK" = "True" ] && [ "${AFTER_N:-0}" -gt "${BEFORE_N:-0}" ]; then
 else
     fail "(g3b) new-from-template did not materialise an on-disk .penpot dir (ok=$NEW_OK id=$TID before=$BEFORE_N after=$AFTER_N)"
     cat "$WORK/newtpl.json" >&2 2>/dev/null || true
+fi
+
+# (g4) PACKAGED GALLERY (E4): the offline package gallery + FTS search must ship ----------
+# E4's browse surface. Author a package under the packaged app's own vault
+# (<data>/designs/.penpot-packages, blind to sync — the E2 invariant), install it
+# via the loopback verb (import-as-new, offline), then prove BOTH E4a surfaces
+# serve through the installed .app with the proxies still poisoned: /__packages
+# (the framework-free gallery page) and /__api/packages/search (the DocKind::Package
+# FTS listing) returning the seeded package by id with an exact /#/workspace deep
+# link. Reuses the g3 template dir as the package source — no new boot machinery.
+PKG_SRC="$(find "$DATA_DIR/designs" -type d -name '*.penpot' -not -path '*/.penpot-packages/*' 2>/dev/null | head -1)"
+PKG_HOME="$DATA_DIR/designs/.penpot-packages/m4pkg"
+if [ -n "$PKG_SRC" ] && [ -d "$PKG_SRC" ]; then
+    mkdir -p "$PKG_HOME"
+    cp -R "$PKG_SRC" "$PKG_HOME/m4pkg.penpot"
+    cat >"$PKG_HOME/package.json" <<'PKGJSON'
+{ "id": "m4pkg", "version": "1.0.0", "kind": "design-data", "name": "M4 Seed Package" }
+PKGJSON
+    INSTALL_RESP="$(curl -sS -X POST "$BASE/__api/packages/install" -H 'Content-Type: application/json' \
+        -d '{"id":"m4pkg"}' 2>/dev/null || true)"
+    INSTALL_OK="$(echo "$INSTALL_RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("ok"))' 2>/dev/null || echo None)"
+    PKG_FILE_ID="$(echo "$INSTALL_RESP" | json_field fileId 2>/dev/null || true)"
+    if [ "$INSTALL_OK" = "True" ] && [ -n "$PKG_FILE_ID" ]; then
+        pass "(g4a) installed a package OFFLINE through the .app (m4pkg fileId=$PKG_FILE_ID)"
+    else
+        fail "(g4a) offline package install failed: $INSTALL_RESP"
+    fi
+    # The gallery HTML page must serve offline.
+    PKG_PAGE_CODE="$(curl -s -o "$WORK/packages.html" -w '%{http_code}' "$BASE/__packages" 2>/dev/null || echo 000)"
+    if [ "$PKG_PAGE_CODE" = "200" ] && grep -qi "Package gallery" "$WORK/packages.html"; then
+        pass "(g4b) /__packages gallery page served OFFLINE through the .app (HTTP 200)"
+    else
+        fail "(g4b) /__packages page not served (code=$PKG_PAGE_CODE)"
+    fi
+    # The FTS package search must return the seeded package (the index picks it up
+    # from lock.json on its next poll) with the exact /#/workspace deep link.
+    PKG_SEARCH_OK=0
+    PKG_SEARCH_RESP=""
+    G4_DEADLINE=$(($(date +%s) + 120))
+    while [ "$(date +%s)" -lt "$G4_DEADLINE" ]; do
+        PKG_SEARCH_RESP="$(curl -sS "$BASE/__api/packages/search?q=m4pkg&limit=10" 2>/dev/null || true)"
+        if echo "$PKG_SEARCH_RESP" | python3 -c '
+import json, sys
+want = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for p in d.get("packages", []):
+    if p.get("id") == "m4pkg" and str(p.get("deepLink", "")).startswith("/#/workspace"):
+        if want and p.get("fileId") != want:
+            continue
+        sys.exit(0)
+sys.exit(1)
+' "$PKG_FILE_ID" 2>/dev/null; then
+            PKG_SEARCH_OK=1
+            break
+        fi
+        sleep 3
+    done
+    PKG_MS="$(echo "$PKG_SEARCH_RESP" | json_field tookMs 2>/dev/null || echo '?')"
+    if [ "$PKG_SEARCH_OK" -eq 1 ]; then
+        pass "(g4c) /__api/packages/search returned the seeded 'm4pkg' hit OFFLINE (id=m4pkg, exact /#/workspace deep link; tookMs=$PKG_MS)"
+    else
+        fail "(g4c) /__api/packages/search returned no seeded 'm4pkg' hit within 120s (packaged E4 gallery surface)"
+        echo "last packages search response: $PKG_SEARCH_RESP" >&2
+    fi
+else
+    fail "(g4) could not stage a package source from a g3 template dir (PKG_SRC=$PKG_SRC)"
 fi
 
 # (e) SIGTERM: clean exit, no orphans ---------------------------------------------------

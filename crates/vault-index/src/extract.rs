@@ -37,6 +37,12 @@ pub enum DocKind {
     Color,
     /// A typography name + font family.
     Typography,
+    /// An installed package (E4): one row per locked package, keyed OUTSIDE the
+    /// sync manifest (`pkg:<id>` owner). Its body aggregates the package's
+    /// name/id/version plus the searchable names in its `.penpot` source tree,
+    /// and it deep-links to the package's materialized vault file. This is the
+    /// unit the flat gallery browses — no tier, badge, or ranking beyond bm25.
+    Package,
 }
 
 impl DocKind {
@@ -47,8 +53,28 @@ impl DocKind {
             DocKind::Component => "component",
             DocKind::Color => "color",
             DocKind::Typography => "typography",
+            DocKind::Package => "package",
         }
     }
+}
+
+/// Build the aggregated search body for a package's `.penpot` source tree: the
+/// name (and text body) of every doc the tree yields, whitespace-joined and
+/// deduped in first-seen order. Pure over the semantic view (`{relpath: bytes}`
+/// as returned by `sync_core::read_tree`/`semantic_view`), so it stays testable
+/// and is stable across the import uuid churn (only names/text, never ids).
+pub fn package_tree_terms(files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for doc in extract_docs(files) {
+        for term in [doc.name, doc.body] {
+            let term = term.trim().to_string();
+            if !term.is_empty() && seen.insert(term.clone()) {
+                out.push(term);
+            }
+        }
+    }
+    out
 }
 
 /// One searchable document extracted from a `.penpot` tree.
