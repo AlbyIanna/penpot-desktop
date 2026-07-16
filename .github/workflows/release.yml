@@ -156,8 +156,33 @@ jobs:
       - name: Build the macOS penpot-runtime bundle (crane path + proofs)
         run: bash scripts/build-runtime-bundle.sh --no-docker
 
-      - name: Build the dmg
-        run: bash scripts/build-dmg.sh --skip-bundle
+      - name: Build the dmg (retry — tauri's bundle_dmg.sh is CI-flaky)
+        # bundle_dmg.sh drives the DMG layout via Finder/AppleScript on the
+        # runner; it fails intermittently (a hung `Finder` osascript, or a stale
+        # mount from a previous attempt) — the local build never hits this. A
+        # transient failure here previously skipped the whole publish and left
+        # the rolling `latest` release stale (E6-merge run 29506932224). Retry up
+        # to 3x, detaching any stale mount + clearing partial output between
+        # attempts, so an intermittent flake never blocks the auto-publish.
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::dmg build attempt $attempt/3"
+            if bash scripts/build-dmg.sh --skip-bundle; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "dmg build attempt $attempt failed; cleaning up before retry"
+            # A failed bundle_dmg.sh often leaves the rw dmg mounted + a partial
+            # output dmg; both break the next attempt if left in place.
+            for vol in /Volumes/"Penpot Local"*; do
+              [ -d "$vol" ] && hdiutil detach "$vol" -force 2>/dev/null || true
+            done
+            rm -f target/release/bundle/dmg/*.dmg 2>/dev/null || true
+            sleep 15
+          done
+          echo "::error::dmg build failed after 3 attempts"
+          exit 1
 
       - name: Stage dmg under a canonical asset name
         id: stage
