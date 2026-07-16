@@ -161,6 +161,33 @@ e4:
 e5:
     bash scripts/e5-tokens-spike.sh
 
+# E6 cross-vault library-portability SPIKE gate (PLAN3 milestone E6). Ships a
+# VERDICT (docs/ecosystem-spikes/library-portability.md) + a REWRITE TOOL
+# (scripts/ecosystem-spike/e6_rewrite.py) + this gate — no UI, no product Rust
+# changes. Live, on ONE app instance switching vaults via the control endpoint:
+# installs the SAME component-library package into vaults A and B and asserts
+# the minted :component-file ids DIFFER (and CAPTURES whether internal
+# component/shape ids are preserved or remapped — on 2.16.2 binfile-v3
+# import-as-new remaps FILE ids only, so they are preserved); authors in A a
+# consumer with a root-only + a nested-subtree instance PLUS library-styled
+# shapes (fill/stroke color + typography ASSET refs); carries its on-disk
+# tree to B, proves the naive carry DANGLES, runs the offline static rewrite
+# (E1-keyed identity map — components, shapes, colors, typographies — over
+# the two materialized library trees), pins a lock.json entry +
+# link-file-to-library, and asserts ZERO dangling refs in B over RPC and on
+# disk; then delete-DB + reboot on BOTH vaults re-asserts (invariant 1),
+# including a post-wipe static on-disk verify. An offline selftest leg
+# (e6_rewrite.py selftest) proves the mapping DISCRIMINATES and the
+# duplicate-key/subtree-size refusals fire. Dedicated ports 9010/6472/5545/6488 (control 9011; the plan
+# sketch's 6471 is N2's exporter port — 6472 is the free neighbor); live stack
+# + the runtime bundle. DECISION: deliberately NOT chained into `just e2e` —
+# spike precedent (E5, contract-extractability): E6 lands no product code, so
+# the ladder has nothing of E6's to regress. Re-run on every Penpot version
+# bump: the preserved-internal-ids behavior is UNDOCUMENTED in upstream's
+# binfile-v3 import, and this gate records which world the running Penpot is in.
+e6:
+    bash scripts/e6-library-portability-spike.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -176,9 +203,9 @@ routes-gate:
 # n2-thumbs + e4-gallery need the runtime bundle WITH browsers
 # (`bash scripts/fetch-penpot.sh --with-browsers`); m4-artifact-test.sh stays
 # separate: it needs a dmg build (`bash scripts/build-dmg.sh` first) and carries
-# the E4 offline packaged-gallery leg (g4). e5-tokens-spike.sh (`just e5`)
-# also stays out by decision: it is a SPIKE gate with no product code to
-# regress (see the e5 recipe comment).
+# the E4 offline packaged-gallery leg (g4). e5-tokens-spike.sh (`just e5`) +
+# e6-library-portability-spike.sh (`just e6`) stay out by decision: SPIKE gates
+# with no product code to regress (see their recipe comments).
 e2e:
     bash scripts/m1-smoke.sh
     bash scripts/m2-invariant.sh
