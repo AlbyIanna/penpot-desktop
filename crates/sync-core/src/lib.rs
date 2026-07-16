@@ -19,6 +19,7 @@
 //! indent, non-ASCII preserved, LF, trailing newline.
 
 pub mod binfile;
+pub mod consent;
 pub mod hash;
 pub mod lock;
 pub mod manifest;
@@ -28,6 +29,7 @@ mod util;
 pub mod ziputil;
 
 pub use binfile::trim_to_single_file;
+pub use consent::{ConsentLedger, ConsentRecord, CONSENT_FILE_NAME, CONSENT_SCHEMA_VERSION};
 pub use hash::{
     read_tree, semantic_tree_hash, semantic_view, sha256_hex, strip_volatile, tree_hash,
 };
@@ -76,6 +78,8 @@ pub enum Error {
     ManifestSchema { found: u32, expected: u32 },
     #[error("lock.json schema version {found} is not supported (expected {expected})")]
     LockSchema { found: u32, expected: u32 },
+    #[error("plugin-consent.json schema version {found} is not supported (expected {expected})")]
+    ConsentSchema { found: u32, expected: u32 },
     #[error("{0}")]
     Swap(String),
 }

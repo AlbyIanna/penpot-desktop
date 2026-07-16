@@ -57,6 +57,14 @@ pub struct PackagesState {
     pub packages_dir: PathBuf,
     /// `<vault>` — the lockfile (`lock.json`) lives at its root.
     pub vault_root: PathBuf,
+    /// The app DATA dir (sibling of `postgres/`, OUTSIDE the vault). The E7
+    /// local consent ledger (`plugin-consent.json`) lives at its root — it must
+    /// NOT travel with a cloned vault, so it is anchored here, not in the vault.
+    pub data_dir: PathBuf,
+    /// The local proxy origins (both `localhost` and `127.0.0.1` spellings) a
+    /// plugin pointer's `host` must equal to be treated as vault-local (E7
+    /// finding 5: classify local by HOST, not by the code-path prefix).
+    pub local_origins: Vec<String>,
     /// Backend RPC base URL (loopback).
     pub backend_base: String,
     /// Provisioned access token (None → install/fetch unavailable; listing OK).
@@ -88,6 +96,15 @@ pub fn router(state: Arc<PackagesState>) -> Router {
         // E4b — surface-don't-apply update channel + drift conflict copy.
         .route("/__api/packages/updates", get(updates))
         .route("/__api/packages/preserve-drift", post(preserve_drift))
+        // E7 — plugin packages are static assets served AT THE LOCAL PROXY
+        // ORIGIN (`/__packages/<pkg>/manifest.json`, `plugin.js`, icon...).
+        // Carried-and-pointed-at, never imported into the design DB. The
+        // exact `/__packages` path (no subpath) stays the E4 gallery page.
+        .route("/__packages/{pkg}/{*path}", get(serve_plugin_asset))
+        // E7 — the discovered-plugin surface the gallery renders: each plugin
+        // package's local manifest URL + install state. Surface-don't-apply:
+        // installing happens ONLY through Penpot's own native Plugin Manager.
+        .route("/__api/packages/plugins", get(list_plugins))
         .with_state(state)
 }
 
@@ -217,6 +234,892 @@ fn display_name_from_id(id: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// E7 — plugin packages (PLAN3 ch. 3, activation GO / CSP-GO)
+// ---------------------------------------------------------------------------
+//
+// A plugin package is a git repo of STATIC assets (a Penpot plugin
+// `manifest.json` + `plugin.js` + icon) under `.penpot-packages/<pkg>/`,
+// served at the LOCAL PROXY ORIGIN under `/__packages/<pkg>/*` and installed
+// ONLY through Penpot's own native Plugin Manager URL boundary (the user
+// pastes the local manifest URL, Penpot shows its own consent dialog) —
+// never imported into the design DB, never auto-registered by us.
+//
+// The registry pointer Penpot writes on Install+Allow lives in profile props
+// (`props.plugins.data.<pluginId>`, via the public `update-profile-props`
+// RPC — verified live in the E7 activation spike). That is DB-only derived
+// state. Two SEPARATE files govern it (adversarial-review finding 1):
+//
+//   - `lock.json` (vault root, git-versioned, E6-portable) pins each captured
+//     pointer under `LockEntry.plugin_props` for PORTABILITY + gallery
+//     visibility. It is NO LONGER sufficient to auto-register a plugin.
+//   - `plugin-consent.json` (`<data_dir>`, NOT in the vault, NOT git-versioned,
+//     survives a DB wipe) is the AUTHORITY for boot re-apply. It records only
+//     genuine native-manager consent observed on THIS machine, pinning the
+//     content hash that was consented.
+//
+// So this module:
+//   - CAPTURES the pointers the USER created through the native manager into
+//     BOTH `lock.json` (portability pin) AND the consent ledger (re-apply
+//     authority) — recording consent already given, never granting it;
+//   - RE-APPLIES a pinned pointer at boot after a DB wipe ONLY when the ledger
+//     authorizes it AND the consented content hash still matches the live
+//     served code AND the pointer host is local (insert-only merge through
+//     `update-profile-props`), mirroring the E3 re-link reconcile — invariant
+//     1: delete the DB and the consented plugin registry is rebuilt.
+//
+// Opening a CLONED/pulled vault therefore seeds NOTHING (lock pin present,
+// ledger absent → `availableNeedsConsent`); a package whose served code drifted
+// since consent is NOT re-registered (`driftedNeedsReconsent`). Both are
+// surfaced on `/__api/packages/plugins`, never silently applied.
+//
+// The exact shipped promise (docs/ecosystem-spikes/plugin-supply-chain.md):
+// content-pinned + offline + consent-gated + CSP(default-src+connect-src)
+// egress-containment (the whitelist is cosmetic — disclaimer-only). NOT
+// data-isolation: a `content:write` plugin still reads/rewrites the open file.
+
+/// The lockfile `kind` a captured plugin package is pinned under.
+pub const PLUGIN_KIND: &str = "plugin";
+
+/// A parsed Penpot plugin `manifest.json` (the file the user pastes into the
+/// native Plugin Manager). The presence of a string `code` field is what
+/// marks a package directory as a plugin package. All other fields optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginManifest {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub code: String,
+    pub icon: Option<String>,
+    pub permissions: Vec<String>,
+}
+
+/// Parse a package dir's Penpot plugin `manifest.json`. `None` when the file
+/// is absent/malformed or carries no string `code` field (i.e. the package is
+/// not a plugin package). NOTE the E7 design finding: `code`/`icon` must be
+/// ORIGIN-ABSOLUTE paths (`/__packages/<pkg>/plugin.js`) — Penpot v1
+/// manifests resolve `code` against the ORIGIN, not the manifest directory.
+pub fn read_plugin_manifest(pkg_dir: &Path) -> Option<PluginManifest> {
+    let raw = std::fs::read(pkg_dir.join("manifest.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let code = v.get("code")?.as_str()?.to_string();
+    let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    Some(PluginManifest {
+        name: get("name"),
+        description: get("description"),
+        code,
+        icon: get("icon"),
+        permissions: v
+            .get("permissions")
+            .and_then(|p| p.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// Relative asset-path safety for `/__packages/{pkg}/{*path}`: every `/`
+/// segment must be a plain component — never empty, `.`/`..`, a dotfile
+/// (blocks `.git/config` & co.), a backslash, or a NUL.
+pub fn is_safe_asset_path(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.contains('\\')
+        && !rel.contains('\0')
+        && rel
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.starts_with('.'))
+}
+
+/// Deterministic content hash of a plugin package's SERVED surface: sha256
+/// over sorted `(relpath, sha256(bytes))` pairs of every non-dot file under
+/// the package dir (the same tree-hash discipline as the normalization spec;
+/// dot entries are skipped exactly like the serve route refuses them). This
+/// is the lockfile content pin — drift between the pin and the live assets is
+/// SURFACED (gallery `drifted` flag), never silently re-pinned.
+pub fn plugin_content_hash(pkg_dir: &Path) -> anyhow::Result<String> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) -> anyhow::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with('.') {
+                continue; // dot entries (.git, dotfiles) are never served
+            }
+            let path = entry.path();
+            let ftype = entry.file_type()?;
+            if ftype.is_dir() {
+                walk(&path, root, out)?;
+            } else if ftype.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("walk stays under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let bytes = std::fs::read(&path)?;
+                out.push((rel, sync_core::sha256_hex(&bytes)));
+            }
+            // symlinks are skipped: the serve route refuses to follow them
+            // outside the package home, so they are not served surface.
+        }
+        Ok(())
+    }
+    let mut pairs = Vec::new();
+    walk(pkg_dir, pkg_dir, &mut pairs)?;
+    pairs.sort();
+    let mut acc = String::new();
+    for (rel, h) in &pairs {
+        acc.push_str(rel);
+        acc.push('\n');
+        acc.push_str(h);
+        acc.push('\n');
+    }
+    Ok(sync_core::sha256_hex(acc.as_bytes()))
+}
+
+// ---------------------------------------------------------------------------
+// GET /__packages/{pkg}/{*path} — E7 plugin-package static assets
+// ---------------------------------------------------------------------------
+
+/// Serve a static asset out of `<vault>/.penpot-packages/<pkg>/<path>` at the
+/// local proxy origin. This is how a plugin package's `manifest.json` /
+/// `plugin.js` / icon become installable through Penpot's OWN native Plugin
+/// Manager URL boundary — the assets never enter the design DB. Hardened:
+/// the package id must be a safe id (no traversal, no dotfile), every path
+/// segment a plain non-dot component, and the RESOLVED file (symlinks
+/// followed) must still live under the package home — a hostile package
+/// containing `evil -> /Users/me/.ssh/id_ed25519` gets a 404, never the file.
+async fn serve_plugin_asset(
+    State(state): State<Arc<PackagesState>>,
+    axum::extract::Path((pkg, path)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !is_safe_id(&pkg) || !is_safe_asset_path(&path) {
+        return (StatusCode::BAD_REQUEST, "invalid package asset path").into_response();
+    }
+    let root = state.packages_dir.join(&pkg);
+    let full = root.join(&path);
+    // Symlink-escape guard: canonicalize BOTH sides and require containment.
+    let (canon_root, canon) = match (
+        tokio::fs::canonicalize(&root).await,
+        tokio::fs::canonicalize(&full).await,
+    ) {
+        (Ok(r), Ok(f)) => (r, f),
+        _ => return (StatusCode::NOT_FOUND, "no such package asset").into_response(),
+    };
+    if !canon.starts_with(&canon_root) {
+        return (StatusCode::NOT_FOUND, "no such package asset").into_response();
+    }
+    let bytes = match tokio::fs::read(&canon).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "no such package asset").into_response(),
+    };
+    let ctype = match full.extension().and_then(|e| e.to_str()) {
+        Some("json") => "application/json",
+        Some("js") | Some("mjs") => "application/javascript",
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("txt") | Some("md") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    ([(http::header::CONTENT_TYPE, ctype)], bytes).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// E7 — plugin registry pointer: lock.json pin + boot-time re-apply
+// ---------------------------------------------------------------------------
+
+/// Parse a plugin pointer's `code` path into the local package id it is
+/// served from: `/__packages/<pkg>/…` → `pkg`. `None` for a code that is not a
+/// `/__packages/<pkg>/<asset>` path. NOTE (E7 finding 5): parsing the pkg from
+/// the code path is how we KEY the lock/ledger, but it is NOT how we decide a
+/// pointer is local — Penpot resolves code as `new URL(code, host)`, so a
+/// REMOTE plugin (`host = https://evil.example`) could carry a `code` of
+/// `/__packages/…` yet resolve off-origin. Local-ness is decided by
+/// [`is_local_host`] on the pointer's `host`; this helper only maps a
+/// confirmed-local pointer's code to its package directory.
+pub fn plugin_pkg_from_code(code: &str) -> Option<String> {
+    let rest = code.strip_prefix("/__packages/")?;
+    let (pkg, _asset) = rest.split_once('/')?;
+    is_safe_id(pkg).then(|| pkg.to_string())
+}
+
+/// The local proxy origins a plugin pointer's `host` must equal to be treated
+/// as vault-local — both `http://localhost:<port>` and `http://127.0.0.1:<port>`
+/// spellings (Penpot stores the manifest ORIGIN as `host`).
+pub fn local_proxy_origins(proxy_port: u16) -> Vec<String> {
+    vec![
+        format!("http://localhost:{proxy_port}"),
+        format!("http://127.0.0.1:{proxy_port}"),
+    ]
+}
+
+/// Whether a pointer's `host` (the manifest ORIGIN) is one of our local proxy
+/// origins (E7 finding 5). Trailing-slash tolerant. Only host-local pointers
+/// are ever pinned to `lock.json` / the consent ledger / re-applied — a remote
+/// plugin the user installed from elsewhere is the user's own business and is
+/// never resurrected by us, regardless of its `code` path.
+pub fn is_local_host(host: &str, local_origins: &[String]) -> bool {
+    let h = host.trim_end_matches('/');
+    local_origins
+        .iter()
+        .any(|o| o.trim_end_matches('/') == h)
+}
+
+/// The per-plugin consent state the boot re-apply and the `/__api/packages/plugins`
+/// listing both derive from three authorities: the vault `lock.json` pin
+/// (portability), the per-machine consent ledger (re-apply authority), and the
+/// live served-code content hash. Pure/deterministic — the security decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginConsentState {
+    /// Discovered on disk with no local lock pin and no ledger entry — never
+    /// installed on this machine.
+    Available,
+    /// A local lock pin is present (carried in `lock.json`) but there is NO
+    /// ledger entry on THIS machine — a cloned/pulled vault. NOT re-applied
+    /// (no native Install/Allow ever happened here).
+    AvailableNeedsConsent,
+    /// A ledger entry exists but its `consentedContentHash` != the live content
+    /// hash — the served code changed since consent. NOT re-applied (consent
+    /// was for the old code).
+    DriftedNeedsReconsent,
+    /// Genuine, current consent on this machine (ledger present, hash matches).
+    /// The ONLY state that authorizes a boot re-apply.
+    Installed,
+}
+
+impl PluginConsentState {
+    /// The camelCase state string surfaced in the plugins listing.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::AvailableNeedsConsent => "availableNeedsConsent",
+            Self::DriftedNeedsReconsent => "driftedNeedsReconsent",
+            Self::Installed => "installed",
+        }
+    }
+    /// Only a genuine current consent (ledger authority) is re-appliable.
+    pub fn is_reappliable(&self) -> bool {
+        matches!(self, Self::Installed)
+    }
+    /// Priority for merging per-pluginId states into a per-package state
+    /// (higher wins): a package with any Installed pointer reads Installed.
+    fn priority(&self) -> u8 {
+        match self {
+            Self::Available => 0,
+            Self::AvailableNeedsConsent => 1,
+            Self::DriftedNeedsReconsent => 2,
+            Self::Installed => 3,
+        }
+    }
+    fn merged_with(self, other: Self) -> Self {
+        if other.priority() > self.priority() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// Classify one plugin pointer's consent state (pure — the re-apply gate). The
+/// caller has already confirmed the lock pin's `host` is local (finding 5) and
+/// passes that as `has_local_lock_pin`; `ledger_entry` is the per-machine
+/// consent record (if any); `live_content_hash` is a fresh hash over the served
+/// assets. Re-apply happens ONLY for [`PluginConsentState::Installed`].
+pub fn classify_plugin_consent(
+    has_local_lock_pin: bool,
+    ledger_entry: Option<&sync_core::ConsentRecord>,
+    live_content_hash: &str,
+) -> PluginConsentState {
+    match ledger_entry {
+        Some(rec) if rec.consented_content_hash == live_content_hash => {
+            PluginConsentState::Installed
+        }
+        Some(_) => PluginConsentState::DriftedNeedsReconsent,
+        None if has_local_lock_pin => PluginConsentState::AvailableNeedsConsent,
+        None => PluginConsentState::Available,
+    }
+}
+
+/// Extract `(host, code)` from a canonical pointer-JSON string.
+fn pointer_host_code(pointer_json: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(pointer_json).ok()?;
+    let host = v.get("host").and_then(|h| h.as_str())?.to_string();
+    let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("").to_string();
+    Some((host, code))
+}
+
+/// Canonical single-line JSON for a pointer value — the `plugin_props` pin
+/// format. serde_json without `preserve_order` keeps map keys sorted, so this
+/// is deterministic and git-diffable inside `lock.json`.
+fn canonical_pointer_json(v: &serde_json::Value) -> String {
+    serde_json::to_string(v).unwrap_or_default()
+}
+
+/// Extract every LOCAL plugin pointer from profile props: the entries under
+/// `props.plugins.data` whose `host` is one of our local proxy origins (E7
+/// finding 5 — local-ness is decided by `host`, NOT the `code` path) and whose
+/// `code` maps to a `/__packages/<pkg>/` package directory. Returns pkg id →
+/// (pluginId → canonical pointer JSON). Pure — unit-tested against the exact
+/// props shape captured live in the E7 spike.
+pub fn local_plugin_pointers(
+    props: &serde_json::Value,
+    local_origins: &[String],
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+    let mut out: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        std::collections::BTreeMap::new();
+    let Some(data) = props
+        .get("plugins")
+        .and_then(|p| p.get("data"))
+        .and_then(|d| d.as_object())
+    else {
+        return out;
+    };
+    for (plugin_id, value) in data {
+        // Finding 5: gate on the HOST first — a remote plugin whose code happens
+        // to start `/__packages/` is NOT local and is never pinned/resurrected.
+        let host = value.get("host").and_then(|h| h.as_str()).unwrap_or("");
+        if !is_local_host(host, local_origins) {
+            continue;
+        }
+        let Some(code) = value.get("code").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        let Some(pkg) = plugin_pkg_from_code(code) else {
+            continue;
+        };
+        out.entry(pkg)
+            .or_default()
+            .insert(plugin_id.clone(), canonical_pointer_json(value));
+    }
+    out
+}
+
+/// Compute the live content hash of every package that currently carries a
+/// plugin pin in `lock.json` (pkg id → fresh `plugin_content_hash`). The
+/// re-apply / listing drift gate compares the consented hash against these.
+fn live_plugin_content_hashes(
+    packages_dir: &Path,
+    lock: &Lockfile,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (pkg, entry) in &lock.packages {
+        if entry.plugin_props.is_empty() {
+            continue;
+        }
+        let h = plugin_content_hash(&packages_dir.join(pkg)).unwrap_or_default();
+        out.insert(pkg.clone(), h);
+    }
+    out
+}
+
+/// Plan the boot-time re-apply (THE security decision, pure/unit-tested): the
+/// merged `plugins` props value with every AUTHORIZED lock-pinned pointer that
+/// is MISSING from the live props inserted, plus how many were inserted (0 →
+/// nothing to apply). A pointer is re-applied ONLY when ALL hold:
+///
+///   (a) a `lock.json` pin exists (iterated here);
+///   (b) the pointer `host` is one of our local proxy origins (finding 5);
+///   (c) a consent-ledger entry exists for that pluginId (finding 1 — the
+///       per-machine authority; a cloned vault has none → nothing re-applied);
+///   (d) the ledger's `consentedContentHash` == the CURRENT package content
+///       hash (finding 3 — drift → not re-applied, consent was for old code).
+///
+/// **Insert-only**: an entry already present in the DB is never overwritten —
+/// the DB carries the user's latest consent (install/permission changes made
+/// through the native manager win over the pin). Pure and deterministic.
+///
+/// Wire shape (2.16.2, malli-validated server-side — probed live):
+/// `props.plugins = {ids: [string], data: {<pluginId> → pointer}}` where each
+/// pointer requires `pluginId`/`name`/`host`/`code`/`permissions`. The merge
+/// keeps `ids` in sync with `data` (existing order preserved, new ids
+/// appended sorted) or the RPC rejects the whole write.
+pub fn plan_plugin_reapply(
+    lock: &Lockfile,
+    ledger: &sync_core::ConsentLedger,
+    live_content_hashes: &std::collections::BTreeMap<String, String>,
+    props: &serde_json::Value,
+    local_origins: &[String],
+) -> (serde_json::Value, usize) {
+    let mut plugins = props
+        .get("plugins")
+        .cloned()
+        .unwrap_or_else(|| json!({ "ids": [], "data": {} }));
+    if !plugins.is_object() {
+        plugins = json!({ "ids": [], "data": {} });
+    }
+    if !plugins.get("data").map(|d| d.is_object()).unwrap_or(false) {
+        plugins["data"] = json!({});
+    }
+    let mut inserted = 0usize;
+    for (pkg, entry) in &lock.packages {
+        let live_hash = live_content_hashes.get(pkg).map(String::as_str).unwrap_or("");
+        for (plugin_id, pointer_json) in &entry.plugin_props {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(pointer_json) else {
+                tracing::warn!(plugin = %plugin_id, "lock.json plugin_props value is not JSON; skipping");
+                continue;
+            };
+            // (b) finding 5: only host-local pins are ever re-applied.
+            let host = value.get("host").and_then(|h| h.as_str()).unwrap_or("");
+            let has_local_lock_pin = is_local_host(host, local_origins);
+            if !has_local_lock_pin {
+                continue;
+            }
+            // (c)+(d): the ledger is the authority, gated on content freshness.
+            let state = classify_plugin_consent(
+                has_local_lock_pin,
+                ledger.plugins.get(plugin_id),
+                live_hash,
+            );
+            if !state.is_reappliable() {
+                continue;
+            }
+            // Insert-only: never overwrite a pointer the user already has.
+            if plugins["data"].get(plugin_id).is_some() {
+                continue;
+            }
+            plugins["data"][plugin_id] = value;
+            inserted += 1;
+        }
+    }
+    // Re-sync `ids` with the data keys: keep the existing order for ids still
+    // present, then append any data key not yet listed (sorted — data is a
+    // sorted map). The server schema requires ids to be present.
+    let data_keys: Vec<String> = plugins["data"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut ids: Vec<String> = plugins
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .filter(|id| data_keys.contains(id))
+                .collect()
+        })
+        .unwrap_or_default();
+    for key in &data_keys {
+        if !ids.contains(key) {
+            ids.push(key.clone());
+        }
+    }
+    plugins["ids"] = json!(ids);
+    (plugins, inserted)
+}
+
+/// One boot re-apply pass: re-insert every lock-pinned plugin pointer missing
+/// from profile props via the public `update-profile-props` RPC (the same
+/// call class as `import-binfile`). Returns how many pointers were applied
+/// (0 = already complete / nothing pinned). Pure DB-pointer re-derivation —
+/// it never writes the lockfile or any file tree.
+pub async fn reapply_plugin_props(state: &PackagesState) -> anyhow::Result<usize> {
+    let Some(client) = state.client() else {
+        return Ok(0);
+    };
+    let lock = Lockfile::load_or_default(&state.vault_root)?;
+    if lock.packages.values().all(|e| e.plugin_props.is_empty()) {
+        return Ok(0);
+    }
+    // The consent ledger is the re-apply AUTHORITY (finding 1); the live content
+    // hashes gate on freshness (finding 3). Both are read off the DB.
+    let ledger = sync_core::ConsentLedger::load_or_default(&state.data_dir)?;
+    let live_hashes = live_plugin_content_hashes(&state.packages_dir, &lock);
+    let props = client.get_profile_props().await?;
+    let (merged, inserted) =
+        plan_plugin_reapply(&lock, &ledger, &live_hashes, &props, &state.local_origins);
+    if inserted == 0 {
+        return Ok(0);
+    }
+    client
+        .update_profile_props(&json!({ "plugins": merged }))
+        .await?;
+    tracing::info!(
+        applied = inserted,
+        "E7 boot re-apply: plugin registry pointer(s) re-derived from lock.json via update-profile-props"
+    );
+    Ok(inserted)
+}
+
+/// One capture pass: RECORD the local-origin plugin pointers the USER created
+/// through Penpot's native Plugin Manager into BOTH `lock.json` (portability
+/// pin) AND the per-machine consent ledger (re-apply authority, finding 1) —
+/// consent already given, we only record it so a DB wipe can re-derive it;
+/// surface-don't-apply is intact because this never writes profile props.
+///
+/// Recording into the ledger is SOUND because boot re-apply never seeds a
+/// pointer without ledger authority: so any local-origin pointer live in the DB
+/// is either a genuine native consent on this machine OR one WE re-applied from
+/// an already-valid ledger entry — recording the current content hash for it is
+/// correct in both cases.
+///
+/// A `seen` set (session-scoped, starts empty each boot) tracks pluginIds
+/// observed present. A pluginId we SAW present and that then vanishes is a
+/// genuine native-manager UNINSTALL → unpin `lock.json` AND prune the ledger
+/// (no resurrection against intent). Crucially, absence we NEVER saw present
+/// (a cloned-vault pin, or a drifted pin re-apply declined to seed) is left
+/// untouched — it is not an uninstall, so the `availableNeedsConsent` /
+/// `driftedNeedsReconsent` surface survives. Returns whether anything changed.
+pub async fn capture_plugin_props(
+    state: &PackagesState,
+    seen: &mut std::collections::BTreeSet<String>,
+) -> anyhow::Result<bool> {
+    let Some(client) = state.client() else {
+        return Ok(false);
+    };
+    let props = client.get_profile_props().await?;
+    let captured = local_plugin_pointers(&props, &state.local_origins);
+    let mut lock = Lockfile::load_or_default(&state.vault_root)?;
+    let mut ledger = sync_core::ConsentLedger::load_or_default(&state.data_dir)?;
+    let mut lock_changed = false;
+    let mut ledger_changed = false;
+
+    let live_plugin_ids: std::collections::BTreeSet<String> = captured
+        .values()
+        .flat_map(|m| m.keys().cloned())
+        .collect();
+
+    // Pin / refresh every package that currently has a live local pointer, and
+    // record the consent ledger entry (consentedContentHash = CURRENT hash).
+    for (pkg, pins) in &captured {
+        let pkg_dir = state.packages_dir.join(pkg);
+        let content_hash = plugin_content_hash(&pkg_dir).unwrap_or_default();
+        match lock.packages.get_mut(pkg) {
+            Some(entry) => {
+                if entry.plugin_props != *pins {
+                    entry.plugin_props = pins.clone();
+                    lock_changed = true;
+                }
+                // The lock content_hash is the portability pin recorded at
+                // first capture; drift is judged against the LEDGER's
+                // consentedContentHash, not this, so it is not refreshed here.
+            }
+            None => {
+                let manifest = read_manifest(&pkg_dir);
+                let plugin_manifest = read_plugin_manifest(&pkg_dir);
+                let name = manifest
+                    .name
+                    .clone()
+                    .or_else(|| plugin_manifest.as_ref().and_then(|m| m.name.clone()))
+                    .unwrap_or_else(|| display_name_from_id(pkg));
+                lock.upsert(
+                    pkg.clone(),
+                    LockEntry {
+                        version: manifest.version.clone().unwrap_or_else(|| "0.0.0".into()),
+                        kind: manifest.kind.clone().unwrap_or_else(|| PLUGIN_KIND.into()),
+                        // The content pin: hash of the SERVED asset surface.
+                        content_hash: content_hash.clone(),
+                        contract_hash: String::new(),
+                        source_git_url: origin_url(&pkg_dir),
+                        // A plugin package materializes NO vault file — it is
+                        // carried-and-pointed-at, never imported into the DB.
+                        file_id: String::new(),
+                        name,
+                        installed_at: sync_core::lock::now_rfc3339(),
+                        library_shared: false,
+                        plugin_props: pins.clone(),
+                        links: Vec::new(),
+                    },
+                );
+                lock_changed = true;
+                tracing::info!(
+                    package = %pkg,
+                    "E7 capture: user-installed plugin pointer pinned in lock.json"
+                );
+            }
+        }
+        // Record / refresh the per-machine consent ledger — the re-apply
+        // authority. Preserve the original `consentedAt`; refresh the content
+        // hash to the currently-served surface.
+        for (plugin_id, pointer_json) in pins {
+            let (host, code) = pointer_host_code(pointer_json)
+                .unwrap_or_else(|| (String::new(), String::new()));
+            let consented_at = ledger
+                .plugins
+                .get(plugin_id)
+                .map(|r| r.consented_at.clone())
+                .unwrap_or_else(sync_core::lock::now_rfc3339);
+            let rec = sync_core::ConsentRecord {
+                consented_content_hash: content_hash.clone(),
+                host,
+                code,
+                consented_at,
+            };
+            if ledger.plugins.get(plugin_id) != Some(&rec) {
+                let first = !ledger.plugins.contains_key(plugin_id);
+                ledger.plugins.insert(plugin_id.clone(), rec);
+                ledger_changed = true;
+                if first {
+                    tracing::info!(
+                        plugin = %plugin_id,
+                        "E7 capture: native-manager consent recorded in the local consent ledger"
+                    );
+                }
+            }
+            seen.insert(plugin_id.clone());
+        }
+    }
+
+    // Genuine uninstall: a pluginId we SAW present this session that is now gone
+    // → unpin lock.json AND prune the ledger. Never triggered for a cloned pin
+    // or a drift-declined pin (those were never observed present this session).
+    let uninstalled: Vec<String> = seen
+        .iter()
+        .filter(|id| !live_plugin_ids.contains(*id))
+        .cloned()
+        .collect();
+    for plugin_id in uninstalled {
+        if ledger.plugins.remove(&plugin_id).is_some() {
+            ledger_changed = true;
+        }
+        let pkgs: Vec<String> = lock
+            .packages
+            .iter()
+            .filter(|(_, e)| e.plugin_props.contains_key(&plugin_id))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for pkg in pkgs {
+            if let Some(entry) = lock.packages.get_mut(&pkg) {
+                entry.plugin_props.remove(&plugin_id);
+                if entry.plugin_props.is_empty()
+                    && entry.kind == PLUGIN_KIND
+                    && entry.file_id.is_empty()
+                {
+                    lock.packages.remove(&pkg);
+                }
+                lock_changed = true;
+            }
+        }
+        seen.remove(&plugin_id);
+        tracing::info!(
+            plugin = %plugin_id,
+            "E7 capture: plugin uninstalled through the native manager — unpinned from lock.json + pruned from consent ledger"
+        );
+    }
+
+    if lock_changed {
+        lock.save(&state.vault_root)?;
+    }
+    if ledger_changed {
+        ledger.save(&state.data_dir)?;
+    }
+    Ok(lock_changed || ledger_changed)
+}
+
+/// Bounded window for the boot re-apply retry (mirrors the E3 re-link
+/// constants): the backend is already provisioned when this spawns, so the
+/// first pass usually completes; retries cover transient RPC hiccups.
+const PLUGIN_REAPPLY_BOOT_ATTEMPTS: usize = 60;
+const PLUGIN_REAPPLY_BOOT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the capture loop re-reads profile props to pin/unpin what the
+/// user did through the native Plugin Manager. Loopback `get-profile` — cheap.
+pub const PLUGIN_CAPTURE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawn the E7 plugin reconcile (mirrors [`spawn_relink_reconcile`]):
+///
+/// 1. **Boot re-apply phase** (bounded): after a DB wipe the registry pointer
+///    is gone (DB-only derived state) — re-insert every lock-pinned pointer
+///    via `update-profile-props`. Insert-only; runs once to completion.
+/// 2. **Capture loop**: keep `lock.json` recording the pointers the USER
+///    installs/uninstalls through the native manager, so the pin is always
+///    current when the next wipe happens. Never writes profile props.
+pub fn spawn_plugin_reconcile(state: Arc<PackagesState>) {
+    tokio::spawn(async move {
+        for _ in 0..PLUGIN_REAPPLY_BOOT_ATTEMPTS {
+            match reapply_plugin_props(&state).await {
+                Ok(applied) => {
+                    if applied > 0 {
+                        tracing::info!(applied, "E7 boot plugin re-apply complete");
+                    }
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "E7 boot plugin re-apply pass errored; retrying"
+                    );
+                }
+            }
+            tokio::time::sleep(PLUGIN_REAPPLY_BOOT_INTERVAL).await;
+        }
+        // Session-scoped set of pluginIds observed present. Starts empty each
+        // boot so the capture prune only fires on a within-session uninstall
+        // transition (was present → now gone), never on a wipe/clone/drift
+        // absence we never saw present.
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            if let Err(e) = capture_plugin_props(&state, &mut seen).await {
+                tracing::debug!(
+                    error = format!("{e:#}"),
+                    "E7 plugin capture pass errored; will retry"
+                );
+            }
+            tokio::time::sleep(PLUGIN_CAPTURE_INTERVAL).await;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// GET /__api/packages/plugins — the discovered-plugin surface (E7)
+// ---------------------------------------------------------------------------
+
+/// One discovered plugin package, as the gallery renders it. The install
+/// affordance is the LOCAL MANIFEST URL — the user pastes it into Penpot's
+/// own native Plugin Manager (surface-don't-apply: presenting is ours,
+/// installing is the user's, consent is Penpot's).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginView {
+    id: String,
+    name: String,
+    description: String,
+    version: String,
+    kind: String,
+    /// `/__packages/<id>/manifest.json` — what the user pastes into the
+    /// native Plugin Manager.
+    manifest_url: String,
+    icon_url: Option<String>,
+    permissions: Vec<String>,
+    /// True ONLY for a genuine current consent on this machine (ledger entry
+    /// present AND its consented content hash == the live hash). A cloned-vault
+    /// pin (no ledger) or a drifted pin reads `installed=false` — a `lock.json`
+    /// pin alone is NOT "installed" (finding 1).
+    installed: bool,
+    /// The pointer is currently present in profile props (live in the DB).
+    live: bool,
+    /// The per-machine consent state (finding 1): `available` |
+    /// `availableNeedsConsent` (cloned vault) | `driftedNeedsReconsent`
+    /// (served code changed since consent) | `installed`.
+    state: String,
+    /// The lockfile content pin over the served assets ("" if never pinned).
+    pinned_content_hash: String,
+    /// The content hash recorded in the local consent ledger at consent time
+    /// ("" if never consented on this machine).
+    consented_content_hash: String,
+    /// Fresh hash over the current on-disk assets.
+    live_content_hash: String,
+    /// `state == driftedNeedsReconsent` — the served assets moved since
+    /// consent. Surfaced, never auto-re-registered (surface-don't-apply).
+    drifted: bool,
+}
+
+async fn list_plugins(State(state): State<Arc<PackagesState>>) -> Response {
+    let packages_dir = state.packages_dir.clone();
+    let vault_root = state.vault_root.clone();
+    let data_dir = state.data_dir.clone();
+
+    // Disk scan + lockfile + consent-ledger read off the async worker.
+    let scanned = tokio::task::spawn_blocking(move || {
+        let lock = Lockfile::load_or_default(&vault_root).unwrap_or_default();
+        let ledger = sync_core::ConsentLedger::load_or_default(&data_dir).unwrap_or_default();
+        let mut dirs: Vec<String> = std::fs::read_dir(&packages_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| is_safe_id(n))
+            .collect();
+        dirs.sort();
+        let mut out: Vec<(String, PluginManifest, String)> = Vec::new();
+        for id in dirs {
+            let pkg_dir = packages_dir.join(&id);
+            let Some(pm) = read_plugin_manifest(&pkg_dir) else {
+                continue; // not a plugin package (no manifest.json code field)
+            };
+            let live_hash = plugin_content_hash(&pkg_dir).unwrap_or_default();
+            out.push((id, pm, live_hash));
+        }
+        (lock, ledger, out)
+    })
+    .await;
+    let (lock, ledger, discovered) = match scanned {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": format!("plugin scan join: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    // Live witness: which local pointers are currently in profile props.
+    let live_pkgs: std::collections::BTreeSet<String> = match state.client() {
+        Some(client) => match client.get_profile_props().await {
+            Ok(props) => local_plugin_pointers(&props, &state.local_origins)
+                .into_keys()
+                .collect(),
+            Err(_) => Default::default(),
+        },
+        None => Default::default(),
+    };
+
+    let plugins: Vec<PluginView> = discovered
+        .into_iter()
+        .map(|(id, pm, live_hash)| {
+            let manifest = read_manifest(&state.packages_dir.join(&id));
+            let entry = lock.packages.get(&id);
+            let pinned_hash = entry.map(|e| e.content_hash.clone()).unwrap_or_default();
+
+            // Per-package consent state (finding 1): merge across the package's
+            // host-local lock pins, gated on the per-machine ledger + drift.
+            let mut consent_state = PluginConsentState::Available;
+            let mut consented_content_hash = String::new();
+            if let Some(entry) = entry {
+                for (plugin_id, pointer_json) in &entry.plugin_props {
+                    let host_local = pointer_host_code(pointer_json)
+                        .map(|(h, _)| is_local_host(&h, &state.local_origins))
+                        .unwrap_or(false);
+                    if !host_local {
+                        continue;
+                    }
+                    let led = ledger.plugins.get(plugin_id);
+                    if let Some(rec) = led {
+                        consented_content_hash = rec.consented_content_hash.clone();
+                    }
+                    let s = classify_plugin_consent(true, led, &live_hash);
+                    consent_state = consent_state.merged_with(s);
+                }
+            }
+
+            PluginView {
+                name: pm
+                    .name
+                    .clone()
+                    .or_else(|| manifest.name.clone())
+                    .unwrap_or_else(|| display_name_from_id(&id)),
+                description: pm.description.clone().unwrap_or_default(),
+                version: manifest.version.unwrap_or_else(|| "0.0.0".into()),
+                kind: manifest.kind.unwrap_or_else(|| PLUGIN_KIND.into()),
+                manifest_url: format!("/__packages/{id}/manifest.json"),
+                icon_url: pm.icon.clone(),
+                permissions: pm.permissions.clone(),
+                installed: consent_state == PluginConsentState::Installed,
+                live: live_pkgs.contains(&id),
+                state: consent_state.as_str().to_string(),
+                drifted: consent_state == PluginConsentState::DriftedNeedsReconsent,
+                pinned_content_hash: pinned_hash,
+                consented_content_hash,
+                live_content_hash: live_hash,
+                id,
+            }
+        })
+        .collect();
+
+    Json(json!({ "ok": true, "count": plugins.len(), "plugins": plugins })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,5 +2522,362 @@ mod tests {
             "team-1",
         );
         assert_eq!(model, PackageUpdatesModel::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // E7 — plugin packages: static-route safety + pointer pin/re-apply
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safe_asset_path_rejects_traversal_dotfiles_and_junk() {
+        assert!(is_safe_asset_path("manifest.json"));
+        assert!(is_safe_asset_path("assets/ui/panel.html"));
+        assert!(!is_safe_asset_path(""));
+        assert!(!is_safe_asset_path("/etc/passwd"));
+        assert!(!is_safe_asset_path("../../secret"));
+        assert!(!is_safe_asset_path("a/../b"));
+        assert!(!is_safe_asset_path("a/./b"));
+        assert!(!is_safe_asset_path(".git/config"));
+        assert!(!is_safe_asset_path("assets/.hidden"));
+        assert!(!is_safe_asset_path("a//b"));
+        assert!(!is_safe_asset_path("a\\b"));
+        assert!(!is_safe_asset_path("a\0b"));
+    }
+
+    #[test]
+    fn plugin_pkg_from_code_parses_only_local_package_paths() {
+        assert_eq!(
+            plugin_pkg_from_code("/__packages/e7-fixture-plugin/plugin.js").as_deref(),
+            Some("e7-fixture-plugin")
+        );
+        assert_eq!(
+            plugin_pkg_from_code("/__packages/kit/sub/dir/code.js").as_deref(),
+            Some("kit")
+        );
+        // Third-party / non-local pointers are never pinned.
+        assert_eq!(plugin_pkg_from_code("https://plugins.example.com/x/plugin.js"), None);
+        assert_eq!(plugin_pkg_from_code("/plugin.js"), None);
+        assert_eq!(plugin_pkg_from_code("/__packages/"), None);
+        assert_eq!(plugin_pkg_from_code("/__packages/only-pkg-no-asset"), None);
+        assert_eq!(plugin_pkg_from_code("/__packages/../escape/x.js"), None);
+        assert_eq!(plugin_pkg_from_code("/__packages/.dot/x.js"), None);
+    }
+
+    #[test]
+    fn plugin_manifest_requires_a_code_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No manifest at all → not a plugin package.
+        assert_eq!(read_plugin_manifest(tmp.path()), None);
+        // A manifest without `code` (e.g. some random JSON) → not a plugin.
+        std::fs::write(tmp.path().join("manifest.json"), br#"{"files": []}"#).unwrap();
+        assert_eq!(read_plugin_manifest(tmp.path()), None);
+        // A real plugin manifest parses (the E7 fixture shape).
+        std::fs::write(
+            tmp.path().join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "name": "E7 Fixture Plugin",
+                "description": "fixture",
+                "code": "/__packages/e7-fixture-plugin/plugin.js",
+                "icon": "/__packages/e7-fixture-plugin/icon.png",
+                "permissions": ["content:write"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let pm = read_plugin_manifest(tmp.path()).unwrap();
+        assert_eq!(pm.name.as_deref(), Some("E7 Fixture Plugin"));
+        assert_eq!(pm.code, "/__packages/e7-fixture-plugin/plugin.js");
+        assert_eq!(pm.permissions, vec!["content:write".to_string()]);
+    }
+
+    #[test]
+    fn plugin_content_hash_is_deterministic_and_skips_dot_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("manifest.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("plugin.js"), b"code").unwrap();
+        std::fs::create_dir_all(tmp.path().join("assets")).unwrap();
+        std::fs::write(tmp.path().join("assets/icon.png"), b"png").unwrap();
+        let h1 = plugin_content_hash(tmp.path()).unwrap();
+        assert_eq!(h1.len(), 64);
+        // Adding dot entries (a .git dir, a dotfile) does NOT move the hash —
+        // they are never served, so they are not pinned surface.
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git/config"), b"secret").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), b"secret").unwrap();
+        assert_eq!(plugin_content_hash(tmp.path()).unwrap(), h1);
+        // Changing a served byte DOES move the hash.
+        std::fs::write(tmp.path().join("plugin.js"), b"code2").unwrap();
+        assert_ne!(plugin_content_hash(tmp.path()).unwrap(), h1);
+    }
+
+    /// The exact props shape captured/probed live on 2.16.2:
+    /// `plugins = {ids: [string], data: {pluginId → pointer}}`, each pointer
+    /// carrying `pluginId`/`name`/`host`/`code`/`permissions`.
+    fn spike_props(with_local: bool, with_foreign: bool) -> serde_json::Value {
+        let mut data = serde_json::Map::new();
+        let mut ids: Vec<String> = Vec::new();
+        if with_local {
+            ids.push("plugin-a".into());
+            data.insert(
+                "plugin-a".into(),
+                json!({
+                    "pluginId": "plugin-a",
+                    "code": "/__packages/e7-fixture-plugin/plugin.js",
+                    "host": "http://localhost:9022",
+                    "icon": "/__packages/e7-fixture-plugin/icon.png",
+                    "name": "E7 Fixture Plugin",
+                    "permissions": ["content:write"]
+                }),
+            );
+        }
+        if with_foreign {
+            ids.push("plugin-b".into());
+            data.insert(
+                "plugin-b".into(),
+                json!({
+                    "pluginId": "plugin-b",
+                    "code": "https://plugins.example.com/b/plugin.js",
+                    "host": "https://plugins.example.com",
+                    "name": "Foreign",
+                    "permissions": []
+                }),
+            );
+        }
+        json!({ "plugins": { "ids": ids, "data": data } })
+    }
+
+    const PKG: &str = "e7-fixture-plugin";
+
+    fn local_origins() -> Vec<String> {
+        vec![
+            "http://localhost:9022".to_string(),
+            "http://127.0.0.1:9022".to_string(),
+        ]
+    }
+
+    /// A consent ledger authorizing `plugin-a` at content hash `hash`.
+    fn ledger_with(hash: &str) -> sync_core::ConsentLedger {
+        let mut l = sync_core::ConsentLedger::default();
+        l.plugins.insert(
+            "plugin-a".to_string(),
+            sync_core::ConsentRecord {
+                consented_content_hash: hash.into(),
+                host: "http://localhost:9022".into(),
+                code: format!("/__packages/{PKG}/plugin.js"),
+                consented_at: "2026-07-16T00:00:00Z".into(),
+            },
+        );
+        l
+    }
+
+    /// pkg id → live content hash (the drift-gate input).
+    fn live_hashes(hash: &str) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(PKG.to_string(), hash.to_string());
+        m
+    }
+
+    #[test]
+    fn local_plugin_pointers_gated_on_local_host_not_code_path() {
+        let origins = local_origins();
+        let props = spike_props(true, true);
+        let pins = local_plugin_pointers(&props, &origins);
+        assert_eq!(pins.len(), 1, "only the local-host pointer is captured");
+        let pkg = &pins[PKG];
+        assert_eq!(pkg.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&pkg["plugin-a"]).unwrap();
+        assert_eq!(value["code"].as_str().unwrap(), format!("/__packages/{PKG}/plugin.js"));
+
+        // Finding 5: a REMOTE-host pointer whose `code` starts `/__packages/`
+        // is NOT local — it must never be captured/pinned/resurrected.
+        let spoof = json!({ "plugins": { "ids": ["evil"], "data": { "evil": {
+            "pluginId": "evil",
+            "code": "/__packages/e7-fixture-plugin/plugin.js",
+            "host": "https://evil.example.com",
+            "name": "Spoof",
+            "permissions": ["content:write"]
+        }}}});
+        assert!(
+            local_plugin_pointers(&spoof, &origins).is_empty(),
+            "a remote host with a /__packages code path is not local"
+        );
+
+        // No props / no plugins subtree → empty.
+        assert!(local_plugin_pointers(&json!({}), &origins).is_empty());
+        assert!(local_plugin_pointers(&json!({"plugins": {}}), &origins).is_empty());
+    }
+
+    #[test]
+    fn is_local_host_matches_both_spellings_only() {
+        let origins = local_origins();
+        assert!(is_local_host("http://localhost:9022", &origins));
+        assert!(is_local_host("http://127.0.0.1:9022/", &origins)); // trailing slash
+        assert!(!is_local_host("https://plugins.example.com", &origins));
+        assert!(!is_local_host("http://localhost:9999", &origins)); // wrong port
+        assert!(!is_local_host("", &origins));
+    }
+
+    #[test]
+    fn classify_plugin_consent_is_the_reapply_gate() {
+        // Genuine current consent → Installed (the only re-appliable state).
+        let led = ledger_with("H");
+        let s = classify_plugin_consent(true, led.plugins.get("plugin-a"), "H");
+        assert_eq!(s, PluginConsentState::Installed);
+        assert!(s.is_reappliable());
+        // Ledger present but content drifted → DriftedNeedsReconsent.
+        let s = classify_plugin_consent(true, led.plugins.get("plugin-a"), "H2");
+        assert_eq!(s, PluginConsentState::DriftedNeedsReconsent);
+        assert!(!s.is_reappliable());
+        // Lock pin present, NO ledger → AvailableNeedsConsent (cloned vault).
+        let s = classify_plugin_consent(true, None, "H");
+        assert_eq!(s, PluginConsentState::AvailableNeedsConsent);
+        assert!(!s.is_reappliable());
+        // No pin, no ledger → Available (discovered only).
+        let s = classify_plugin_consent(false, None, "H");
+        assert_eq!(s, PluginConsentState::Available);
+        assert!(!s.is_reappliable());
+    }
+
+    fn plugin_lock_entry(pointer: &serde_json::Value) -> LockEntry {
+        let mut plugin_props = std::collections::BTreeMap::new();
+        plugin_props.insert("plugin-a".to_string(), serde_json::to_string(pointer).unwrap());
+        LockEntry {
+            version: "0.0.1".into(),
+            kind: PLUGIN_KIND.into(),
+            content_hash: "H".into(),
+            contract_hash: String::new(),
+            source_git_url: String::new(),
+            file_id: String::new(),
+            name: "E7 Fixture Plugin".into(),
+            installed_at: "2026-07-16T00:00:00Z".into(),
+            library_shared: false,
+            plugin_props,
+            links: Vec::new(),
+        }
+    }
+
+    fn local_pointer() -> serde_json::Value {
+        json!({
+            "pluginId": "plugin-a",
+            "code": format!("/__packages/{PKG}/plugin.js"),
+            "host": "http://localhost:9022",
+            "name": "E7 Fixture Plugin",
+            "permissions": ["content:write"]
+        })
+    }
+
+    /// HAPPY PATH: lock pin + ledger authority + fresh content → re-applied.
+    #[test]
+    fn plan_plugin_reapply_applies_only_ledger_authorized_pins() {
+        let origins = local_origins();
+        let mut lock = Lockfile::default();
+        lock.upsert(PKG, plugin_lock_entry(&local_pointer()));
+
+        // Wiped DB (no props) + ledger authorizes at "H" == live "H" → inserted.
+        let (merged, inserted) =
+            plan_plugin_reapply(&lock, &ledger_with("H"), &live_hashes("H"), &json!({}), &origins);
+        assert_eq!(inserted, 1, "ledger-authorized, content-fresh → re-applied");
+        assert_eq!(merged["data"]["plugin-a"], local_pointer());
+        assert_eq!(merged["ids"], json!(["plugin-a"]));
+
+        // Insert-only: a pointer already in the DB is never overwritten.
+        let mut live = spike_props(true, false);
+        live["plugins"]["data"]["plugin-a"]["permissions"] = json!([]);
+        let (merged, inserted) =
+            plan_plugin_reapply(&lock, &ledger_with("H"), &live_hashes("H"), &live, &origins);
+        assert_eq!(inserted, 0);
+        assert_eq!(merged["data"]["plugin-a"]["permissions"], json!([]));
+    }
+
+    /// THE SECURITY REGRESSION: a CLONED vault carries the lock pin but has NO
+    /// ledger on this machine → NOTHING is re-applied (no consent here).
+    #[test]
+    fn plan_plugin_reapply_seeds_nothing_from_a_cloned_vault_without_ledger() {
+        let origins = local_origins();
+        let mut lock = Lockfile::default();
+        lock.upsert(PKG, plugin_lock_entry(&local_pointer()));
+        // Empty ledger = a vault cloned/pulled onto a fresh machine.
+        let empty_ledger = sync_core::ConsentLedger::default();
+        let (merged, inserted) = plan_plugin_reapply(
+            &lock,
+            &empty_ledger,
+            &live_hashes("H"),
+            &json!({}),
+            &origins,
+        );
+        assert_eq!(inserted, 0, "no ledger authority → nothing auto-registered");
+        assert!(
+            merged["data"].get("plugin-a").is_none(),
+            "the cloned-vault pin must NOT be written to profile props"
+        );
+    }
+
+    /// DRIFT: the ledger authorizes an OLD content hash but the served code
+    /// changed → NOT re-applied (consent was for the old code).
+    #[test]
+    fn plan_plugin_reapply_declines_a_drifted_package() {
+        let origins = local_origins();
+        let mut lock = Lockfile::default();
+        lock.upsert(PKG, plugin_lock_entry(&local_pointer()));
+        // Ledger consented at "H1"; the live served code now hashes to "H2".
+        let (_, inserted) = plan_plugin_reapply(
+            &lock,
+            &ledger_with("H1"),
+            &live_hashes("H2"),
+            &json!({}),
+            &origins,
+        );
+        assert_eq!(inserted, 0, "drift since consent → not re-registered");
+    }
+
+    /// Finding 5 at the plan level: a REMOTE-host pin (even with a ledger entry)
+    /// is never re-applied — only host-local pointers are ours to resurrect.
+    #[test]
+    fn plan_plugin_reapply_ignores_a_non_local_host_pin() {
+        let origins = local_origins();
+        let remote = json!({
+            "pluginId": "plugin-a",
+            "code": format!("/__packages/{PKG}/plugin.js"),
+            "host": "https://evil.example.com",
+            "name": "Spoof",
+            "permissions": ["content:write"]
+        });
+        let mut lock = Lockfile::default();
+        lock.upsert(PKG, plugin_lock_entry(&remote));
+        let (_, inserted) = plan_plugin_reapply(
+            &lock,
+            &ledger_with("H"),
+            &live_hashes("H"),
+            &json!({}),
+            &origins,
+        );
+        assert_eq!(inserted, 0, "non-local host pin is never re-applied");
+    }
+
+    /// The wipe → reboot round trip at the planning level: a captured pin, once
+    /// ledger-authorized, re-applies over empty props to the exact pointer, and
+    /// a second plan is a no-op (idempotent, run-twice discipline).
+    #[test]
+    fn plugin_reapply_is_idempotent_over_the_wipe_round_trip() {
+        let origins = local_origins();
+        let props = spike_props(true, false);
+        let pins = local_plugin_pointers(&props, &origins);
+        let mut lock = Lockfile::default();
+        let pointer: serde_json::Value =
+            serde_json::from_str(&pins[PKG]["plugin-a"]).unwrap();
+        lock.upsert(PKG, plugin_lock_entry(&pointer));
+
+        let (merged, inserted) =
+            plan_plugin_reapply(&lock, &ledger_with("H"), &live_hashes("H"), &json!({}), &origins);
+        assert_eq!(inserted, 1);
+        let restored = json!({ "plugins": merged });
+        assert_eq!(
+            local_plugin_pointers(&restored, &origins),
+            pins,
+            "pin round-trips exactly"
+        );
+        let (_, inserted_again) =
+            plan_plugin_reapply(&lock, &ledger_with("H"), &live_hashes("H"), &restored, &origins);
+        assert_eq!(inserted_again, 0, "second pass is a no-op");
     }
 }

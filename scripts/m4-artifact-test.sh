@@ -33,6 +33,11 @@
 #       N4 palette (g2), N6 new-from-template (g3), and the E4 package gallery
 #       (g4): an offline install + /__packages page + /__api/packages/search
 #       returning the seeded package by id with an exact /#/workspace deep link;
+#       and the E7 plugin-package surface (g5): with a plugin package present,
+#       /__packages/<pkg>/manifest.json + plugin.js serve offline through the
+#       hardened route (dotfile -> 400), /__api/packages/plugins lists it
+#       un-installed (surface-don't-apply), and the DEFAULT CSP header rides
+#       the SPA document (the CSP-GO egress promise ships in the artifact);
 #   (e) SIGTERM -> clean exit, no orphans; then a SIGKILL run -> the watchdog
 #       reaps every child (incl. the exporter node child — the M5 orphan gap).
 #
@@ -559,6 +564,66 @@ sys.exit(1)
     fi
 else
     fail "(g4) could not stage a package source from a g3 template dir (PKG_SRC=$PKG_SRC)"
+fi
+
+# (g5) PACKAGED PLUGIN SERVING (E7): the offline plugin-package surface must ship --------
+# E7's carried-and-pointed-at plugin packages: a git repo of static assets under
+# .penpot-packages/ served at the LOCAL PROXY ORIGIN (/__packages/<pkg>/...),
+# never imported into the design DB. With the proxies still poisoned (env -i,
+# fully offline) the installed .app must: serve the manifest + code, refuse
+# dotfile paths (the hardened route), list the package on the discovery surface
+# with installed=false (surface-don't-apply: nothing registers on its own), and
+# carry the DEFAULT CSP header on the SPA document (the CSP-GO egress promise
+# ships ON in the artifact).
+PLUG_ID="m4plug"
+PLUG_HOME="$DATA_DIR/designs/.penpot-packages/$PLUG_ID"
+mkdir -p "$PLUG_HOME"
+cat >"$PLUG_HOME/manifest.json" <<PLUGMANIFEST
+{
+  "name": "M4 Offline Plugin",
+  "description": "m4-artifact E7 leg: offline plugin-package serving fixture.",
+  "code": "/__packages/$PLUG_ID/plugin.js",
+  "permissions": ["content:read"]
+}
+PLUGMANIFEST
+cat >"$PLUG_HOME/plugin.js" <<'PLUGJS'
+console.log("[M4PLUG] offline plugin fixture evaluating");
+PLUGJS
+PLUG_MANIFEST_RESP="$(curl -sS "$BASE/__packages/$PLUG_ID/manifest.json" 2>/dev/null || true)"
+if echo "$PLUG_MANIFEST_RESP" | grep -q "\"code\": \"/__packages/$PLUG_ID/plugin.js\""; then
+    pass "(g5a) /__packages/$PLUG_ID/manifest.json served OFFLINE through the .app"
+else
+    fail "(g5a) plugin manifest not served offline: $PLUG_MANIFEST_RESP"
+fi
+if curl -sS "$BASE/__packages/$PLUG_ID/plugin.js" 2>/dev/null | grep -q "M4PLUG"; then
+    pass "(g5b) /__packages/$PLUG_ID/plugin.js served OFFLINE through the .app"
+else
+    fail "(g5b) plugin code not served offline"
+fi
+PLUG_GIT_CODE="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/__packages/$PLUG_ID/.git/config" 2>/dev/null || echo 000)"
+if [ "$PLUG_GIT_CODE" = "400" ]; then
+    pass "(g5c) hardened route refuses dotfile paths offline (.git/config -> 400)"
+else
+    fail "(g5c) dotfile path not refused (got $PLUG_GIT_CODE, want 400)"
+fi
+PLUG_LIST_RESP="$(curl -sS "$BASE/__api/packages/plugins" 2>/dev/null || true)"
+if echo "$PLUG_LIST_RESP" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+p = next((p for p in d.get("plugins", []) if p.get("id") == sys.argv[1]), None)
+ok = p and p.get("manifestUrl") == f"/__packages/{sys.argv[1]}/manifest.json" \
+    and p.get("installed") is False and p.get("live") is False
+sys.exit(0 if ok else 1)
+' "$PLUG_ID" 2>/dev/null; then
+    pass "(g5d) /__api/packages/plugins lists '$PLUG_ID' OFFLINE (installed=false, live=false — surface-don't-apply)"
+else
+    fail "(g5d) plugin discovery surface wrong offline: $PLUG_LIST_RESP"
+fi
+M4_CSP_HDR="$(curl -sSI "$BASE/index.html" 2>/dev/null | tr -d '\r' | grep -i '^content-security-policy:' || true)"
+if echo "$M4_CSP_HDR" | grep -q "connect-src 'self' ws://localhost:${PROXY_PORT} ws://127.0.0.1:${PROXY_PORT}"; then
+    pass "(g5e) DEFAULT CSP header ships on the SPA document in the artifact ($M4_CSP_HDR)"
+else
+    fail "(g5e) default CSP header missing/wrong on the packaged SPA document (got: ${M4_CSP_HDR:-none})"
 fi
 
 # (e) SIGTERM: clean exit, no orphans ---------------------------------------------------

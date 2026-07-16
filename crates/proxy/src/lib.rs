@@ -46,6 +46,7 @@
 //!     storage_dir: "/path/to/assets".into(),    // PENPOT_OBJECTS_STORAGE_FS_DIRECTORY
 //!     accel_prefix: "/internal/assets/".into(), // default; = PENPOT_ASSETS_PATH
 //!     exporter_addr: None,                      // default; Some(addr) proxies /api/export
+//!     html_csp: None,                           // default; Some(v) adds a CSP header on text/html
 //! };
 //! let proxy = Proxy::bind(config).await?;      // binds the listener
 //! let addr = proxy.local_addr();               // real port (use port 0 for ephemeral)
@@ -103,6 +104,16 @@ pub struct ProxyConfig {
     /// `/api/export/**` there (the upstream nginx `location /api/export`
     /// equivalent — body streamed, cookies passed through).
     pub exporter_addr: Option<SocketAddr>,
+    /// E7 (CSP-GO): when set, this exact value is added as a
+    /// `Content-Security-Policy` RESPONSE HEADER on every `text/html`
+    /// response the proxy serves (the SPA document, `/__home`, plugin UI
+    /// pages...). Penpot evaluates plugin code in a SES Compartment inside
+    /// the SPA page context, so the SPA DOCUMENT's CSP is what governs plugin
+    /// egress (proven live in the E7 spike: `connect-src 'self'` blocks an
+    /// off-origin `fetch()` while the plugin still loads). A pure proxy-layer
+    /// header — the served bytes are untouched (invariant 3). `None` adds
+    /// nothing (the desktop boot defaults it ON; gates opt out per leg).
+    pub html_csp: Option<String>,
 }
 
 /// Default proxy listen port (see docs/milestones/m1.md port conventions).
@@ -122,6 +133,7 @@ impl ProxyConfig {
             storage_dir: storage_dir.into(),
             accel_prefix: DEFAULT_ACCEL_PREFIX.to_owned(),
             exporter_addr: None,
+            html_csp: None,
         }
     }
 }
@@ -158,7 +170,34 @@ impl Proxy {
             accel_prefix,
             exporter_addr: config.exporter_addr,
         };
-        let router = build_router(state, &config.static_dir).merge(extra);
+        let mut router = build_router(state, &config.static_dir).merge(extra);
+        // E7: add the configured Content-Security-Policy response header on
+        // text/html responses only (SPA document + any served HTML — the
+        // contexts scripts execute in). Header-only — no served byte changes
+        // (invariant 3). Layered AFTER the merge so it also covers the extra
+        // router's pages (/__home, /__packages plugin UI documents...).
+        if let Some(csp) = config.html_csp.clone() {
+            router = router.layer(axum::middleware::map_response(
+                move |mut res: Response| {
+                    let csp = csp.clone();
+                    async move {
+                        let is_html = res
+                            .headers()
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| v.starts_with("text/html"))
+                            .unwrap_or(false);
+                        if is_html {
+                            if let Ok(hv) = HeaderValue::from_str(&csp) {
+                                res.headers_mut()
+                                    .insert(header::CONTENT_SECURITY_POLICY, hv);
+                            }
+                        }
+                        res
+                    }
+                },
+            ));
+        }
         tracing::info!(%local_addr, backend = %config.backend_addr, "proxy bound");
         Ok(Self { listener, router, local_addr })
     }

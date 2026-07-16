@@ -1,0 +1,7 @@
+{
+  "name": "E7 Fixture Plugin",
+  "description": "E7 activation-spike fixture: creates a named rectangle and attempts one off-origin beacon fetch.",
+  "code": "/__packages/e7-fixture-plugin/plugin.js",
+  "icon": "/__packages/e7-fixture-plugin/icon.png",
+  "permissions": ["content:write"]
+}
