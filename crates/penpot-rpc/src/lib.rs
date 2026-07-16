@@ -240,6 +240,31 @@ impl PenpotClient {
         self.rpc("get-profile", &json!({})).await
     }
 
+    /// `get-profile`, raw — the full profile JSON including `props` (the
+    /// server-side per-user property map `update-profile-props` writes to).
+    /// Returns the `props` object, `{}` when the profile carries none. E7:
+    /// the plugin registry lives under `props.plugins.data.<pluginId>`
+    /// (verified live on 2.16.2 in the E7 activation spike).
+    pub async fn get_profile_props(&self) -> Result<serde_json::Value> {
+        let profile: serde_json::Value = self.rpc("get-profile", &json!({})).await?;
+        Ok(profile
+            .get("props")
+            .cloned()
+            .unwrap_or_else(|| json!({})))
+    }
+
+    /// `update-profile-props` — merge the given top-level keys into the
+    /// profile's `props` map (`{props: {...}}`). This is the PUBLIC RPC the
+    /// SPA itself calls when the user installs a plugin through the native
+    /// Plugin Manager (same class as `import-binfile`); E7 re-applies the
+    /// lock-pinned plugin registry pointer through it after a DB wipe.
+    /// Keys not present in `props` are left untouched (server-side merge).
+    pub async fn update_profile_props(&self, props: &serde_json::Value) -> Result<()> {
+        self.rpc_response("update-profile-props", &json!({ "props": props }))
+            .await?;
+        Ok(())
+    }
+
     /// `create-access-token` — mints a personal access token. Works with the
     /// session cookie **and** with an existing access token. `expiration` is
     /// an optional duration string (e.g. `"3600s"`); omit for a non-expiring

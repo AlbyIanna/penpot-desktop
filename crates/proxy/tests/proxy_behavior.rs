@@ -180,6 +180,7 @@ async fn start_stack() -> Stack {
         storage_dir,
         accel_prefix: "/internal/assets/".into(),
         exporter_addr: None,
+        html_csp: None,
     };
     let proxy = Proxy::bind(config).await.unwrap();
     let proxy_addr = proxy.local_addr();
@@ -301,6 +302,7 @@ async fn api_with_dead_backend_is_502_not_hang_or_panic() {
         storage_dir: tmp.path().to_path_buf(),
         accel_prefix: "/internal/assets/".into(),
         exporter_addr: None,
+        html_csp: None,
     };
     let proxy = Proxy::bind(config).await.unwrap();
     let addr = proxy.local_addr();
@@ -312,6 +314,68 @@ async fn api_with_dead_backend_is_502_not_hang_or_panic() {
         .unwrap();
     let resp = client().request(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+// --------------------------------------------------------------------------
+// E7 — Content-Security-Policy response header (html_csp)
+// --------------------------------------------------------------------------
+
+/// With `html_csp` set, the header rides ONLY text/html responses (the SPA
+/// document — the context plugin code executes in), never other content
+/// types, and the served bytes are unchanged (header-only; invariant 3).
+#[tokio::test]
+async fn html_csp_header_rides_html_responses_only() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("index.html"), "<html>spa</html>").unwrap();
+    std::fs::create_dir_all(tmp.path().join("js")).unwrap();
+    std::fs::write(tmp.path().join("js/main.js"), "var x = 1;").unwrap();
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+    drop(dead);
+
+    let csp = "connect-src 'self'";
+    let config = ProxyConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        backend_addr: dead_addr,
+        static_dir: tmp.path().to_path_buf(),
+        storage_dir: tmp.path().to_path_buf(),
+        accel_prefix: "/internal/assets/".into(),
+        exporter_addr: None,
+        html_csp: Some(csp.to_string()),
+    };
+    let proxy = Proxy::bind(config).await.unwrap();
+    let addr = proxy.local_addr();
+    tokio::spawn(async move { proxy.serve().await.unwrap() });
+
+    let fetch = |path: &str| {
+        let uri = format!("http://{addr}{path}");
+        async move {
+            let req = Request::builder().uri(uri).body(Full::new(Bytes::new())).unwrap();
+            let resp = client().request(req).await.unwrap();
+            let (parts, body) = resp.into_parts();
+            let bytes = body.collect().await.unwrap().to_bytes();
+            (parts.status, parts.headers, bytes)
+        }
+    };
+
+    // The SPA document carries the CSP header, bytes unchanged.
+    let (status, headers, body) = fetch("/index.html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        csp,
+        "CSP header must ride the SPA document"
+    );
+    assert_eq!(&body[..], b"<html>spa</html>", "header-only: served bytes unchanged");
+
+    // The SPA fallback (deep route → index.html) is also an html response.
+    let (_, headers, _) = fetch("/some/spa/route").await;
+    assert_eq!(headers.get(header::CONTENT_SECURITY_POLICY).unwrap(), csp);
+
+    // A JS asset does NOT carry it (not a document; nothing executes under it).
+    let (status, headers, _) = fetch("/js/main.js").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get(header::CONTENT_SECURITY_POLICY).is_none());
 }
 
 // --------------------------------------------------------------------------
@@ -477,6 +541,7 @@ async fn serve_with_shutdown_stops_the_listener() {
         storage_dir: tmp.path().to_path_buf(),
         accel_prefix: "/internal/assets/".into(),
         exporter_addr: None,
+        html_csp: None,
     };
     let proxy = Proxy::bind(config).await.unwrap();
     let addr = proxy.local_addr();

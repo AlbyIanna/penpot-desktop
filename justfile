@@ -188,6 +188,28 @@ e5:
 e6:
     bash scripts/e6-library-portability-spike.sh
 
+# E7 plugin packages: staged ACTIVATION spike + THIN-BUILD gate (PLAN3 E7).
+# Activation landed GO (+ CSP-GO), the thin build shipped, and this gate now
+# drives the REAL product routes on a dedicated stack booted with PRODUCT
+# DEFAULTS (enable-plugins + local-origin penpotPluginsWhitelist + the CSP
+# header are default-ON — no plugin env): serves a fixture plugin package at
+# /__packages/<pkg>/ (hardened route, dotfile -> 400), drives Penpot's OWN
+# native Plugin Manager via the bundled-chromium browser leg (install +
+# consent + open), and proves: shape effect (RPC), SPA-bytes-unchanged
+# (invariant 3), the update-profile-props pointer + the product capture pin
+# into lock.json + the local consent LEDGER (re-apply authority, never travels
+# with the vault), delete-DB -> product boot RE-APPLY gated on the ledger +
+# content hash (invariant 1; a cloned lock pin alone auto-registers NOTHING),
+# the /__api/packages/plugins discovery surface (surface-don't-apply), and the
+# CSP-egress probe (header OFF -> beacon observed; product-default ON ->
+# fetch+image beacons blocked by default-src while the plugin still loads =
+# CSP-GO). The offline dmg leg (g5) lives in scripts/m4-artifact-test.sh.
+# DECISION: chained into `just e2e` (build precedent, like E1-E4 — E7 landed
+# product code the ladder must keep honest), unlike the E5/E6 pure-verdict
+# spikes. Needs the bundled browsers (fetch-penpot.sh --with-browsers) + host node.
+e7:
+    bash scripts/e7-plugins-spike.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -197,15 +219,17 @@ routes-gate:
 
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
-# so never run them in parallel. Chains every landed gate (N1–N6, E1–E4).
-# e1-contract is a fast static gate (no stack); e2/e3/e4 boot their own live
-# stacks (dedicated ports) like the m/n suites, safe to chain at the tail.
-# n2-thumbs + e4-gallery need the runtime bundle WITH browsers
-# (`bash scripts/fetch-penpot.sh --with-browsers`); m4-artifact-test.sh stays
-# separate: it needs a dmg build (`bash scripts/build-dmg.sh` first) and carries
-# the E4 offline packaged-gallery leg (g4). e5-tokens-spike.sh (`just e5`) +
-# e6-library-portability-spike.sh (`just e6`) stay out by decision: SPIKE gates
-# with no product code to regress (see their recipe comments).
+# so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7).
+# e1-contract is a fast static gate (no stack); e2/e3/e4/e7 boot their own
+# live stacks (dedicated ports) like the m/n suites, safe to chain at the
+# tail. n2-thumbs + e4-gallery + e7-plugins need the runtime bundle WITH
+# browsers (`bash scripts/fetch-penpot.sh --with-browsers`);
+# m4-artifact-test.sh stays separate: it needs a dmg build
+# (`bash scripts/build-dmg.sh` first) and carries the E4 offline
+# packaged-gallery leg (g4) + the E7 offline plugin-serving leg (g5).
+# e5-tokens-spike.sh + e6-library-portability-spike.sh stay out by decision:
+# pure-verdict SPIKE gates with no product code to regress (see their recipe
+# comments) — e7 is chained because its thin build DID land product code.
 e2e:
     bash scripts/m1-smoke.sh
     bash scripts/m2-invariant.sh
@@ -221,6 +245,7 @@ e2e:
     bash scripts/e2-packages.sh
     bash scripts/e3-library.sh
     bash scripts/e4-gallery.sh
+    bash scripts/e7-plugins-spike.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

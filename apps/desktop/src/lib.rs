@@ -533,8 +533,126 @@ fn extra_router(state: Arc<BootstrapState>, config_js: String) -> Router {
         )
 }
 
-fn render_config_js(flags: &str, public_uri: &str) -> String {
-    format!("var penpotFlags = \"{flags}\";\nvar penpotPublicURI = \"{public_uri}\";\n")
+/// E7 — the frontend-only feature flag enabling Penpot's native plugin
+/// runtime + Plugin Manager. Appended to the config.js `penpotFlags` string
+/// only; the backend `PENPOT_FLAGS` is untouched (verified live: the 2.16.2
+/// CLJS bundle reports `plugins/runtime` among enabled features).
+const PLUGINS_FRONTEND_FLAG: &str = "enable-plugins";
+
+/// Compose the frontend flag string: the supervisor defaults + the plugins
+/// flag (E7 ships plugins enabled), plus any `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS`
+/// tokens appended verbatim.
+fn compose_frontend_flags(extra: Option<&str>) -> String {
+    let mut flags = format!(
+        "{} {}",
+        supervisor::DEFAULT_PENPOT_FLAGS,
+        PLUGINS_FRONTEND_FLAG
+    );
+    if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
+        flags.push(' ');
+        flags.push_str(extra);
+    }
+    flags
+}
+
+/// E7 — the default `penpotPluginsWhitelist`: both spellings of the local
+/// proxy origin. NOTE (verified against the 2.16.2 bundle,
+/// `app.config/plugins-whitelist`): the whitelist only SKIPS the third-party
+/// permissions disclaimer for trusted hosts — it does NOT block installs from
+/// other origins. Real containment = offline + the `/__packages` route +
+/// Penpot's own consent gate + the proxy CSP; the whitelist is cosmetic.
+fn default_plugins_whitelist(proxy_port: u16) -> String {
+    format!("http://localhost:{proxy_port},http://127.0.0.1:{proxy_port}")
+}
+
+/// E7 CSP-GO — the default `Content-Security-Policy` the proxy adds on every
+/// `text/html` response. Finding 2 (adversarial review): a `connect-src`-only
+/// policy fences the fetch/XHR/WebSocket vector but leaves `img-src` /
+/// `media-src` / `form-action` / etc. wide open, so an off-origin
+/// `new Image().src = …` beacon (or a form POST) still exfiltrates. This adds a
+/// `default-src` BASELINE so every fetch-directive that has no explicit rule
+/// falls back to a same-origin fence, then opens back up EXACTLY the vectors
+/// the app needs (empirically tuned live so the SPA + render-wasm + the plugin
+/// SES `Compartment` evaluation all still work):
+///
+/// - `default-src 'self' data: blob:` — the same-origin baseline; `data:`/`blob:`
+///   cover inline/worker-generated resources but carry NO off-origin host, so
+///   exfil via any un-enumerated directive is still fenced.
+/// - `script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:`
+///   — SES `hardenIntrinsics`/`Compartment` needs `eval`/`Function`; render-wasm
+///   needs wasm compilation; workers load from `blob:`.
+/// - `style-src 'self' 'unsafe-inline'` — the SPA injects inline styles.
+/// - `img-src 'self' data: blob:` — icons/thumbnails inline or blob; NO
+///   off-origin host, so the image-beacon exfil vector is fenced (finding 2).
+/// - `font-src 'self' data:`, `media-src 'self' data: blob:`,
+///   `worker-src 'self' blob:`, `child-src 'self' blob:`, `frame-src 'self'`.
+/// - `connect-src 'self' ws://localhost ws://127.0.0.1` — the backend `/api`,
+///   the `/__packages` plugin-code fetch, and the notifications websocket
+///   (explicit `ws://` spellings keep it unambiguous across WKWebView/chromium);
+///   the fetch/XHR exfil vector stays fenced to the local origin.
+/// - `form-action 'self'`, `base-uri 'self'`, `object-src 'none'` — close the
+///   remaining non-connect exfil/injection vectors finding 2 called out.
+///
+/// Header-only — the served SPA bytes are unchanged (invariant 3). This
+/// contains NETWORK EXFILTRATION across the fenced vectors only: a
+/// `content:write` plugin still reads/rewrites the OPEN FILE (the honest E7
+/// promise). NOTE `script-src` deliberately allows eval — a stricter policy
+/// would break the SES Compartment and render-wasm and is out of scope.
+fn default_html_csp(proxy_port: u16) -> String {
+    [
+        "default-src 'self' data: blob:".to_string(),
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:".to_string(),
+        "style-src 'self' 'unsafe-inline'".to_string(),
+        "img-src 'self' data: blob:".to_string(),
+        "font-src 'self' data:".to_string(),
+        "media-src 'self' data: blob:".to_string(),
+        "worker-src 'self' blob:".to_string(),
+        "child-src 'self' blob:".to_string(),
+        "frame-src 'self'".to_string(),
+        format!("connect-src 'self' ws://localhost:{proxy_port} ws://127.0.0.1:{proxy_port}"),
+        "form-action 'self'".to_string(),
+        "base-uri 'self'".to_string(),
+        "object-src 'none'".to_string(),
+    ]
+    .join("; ")
+}
+
+/// Resolve the proxy CSP header value: unset/empty `PENPOT_LOCAL_CSP` → the
+/// default (CSP ON — the shipped promise requires it); the sentinel `off` /
+/// `none` / `0` disables the header entirely (gates use it for the csp-off
+/// egress probe leg — the egress-containment promise does NOT hold there);
+/// any other value is used verbatim.
+fn resolve_html_csp(env_value: Option<&str>, proxy_port: u16) -> Option<String> {
+    match env_value.map(str::trim) {
+        None | Some("") => Some(default_html_csp(proxy_port)),
+        Some(v)
+            if v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("none")
+                || v == "0" =>
+        {
+            None
+        }
+        Some(v) => Some(v.to_string()),
+    }
+}
+
+fn render_config_js(flags: &str, public_uri: &str, plugins_whitelist: Option<&str>) -> String {
+    let mut js = format!("var penpotFlags = \"{flags}\";\nvar penpotPublicURI = \"{public_uri}\";\n");
+    // E7: pin the plugins whitelist to explicit origins (comma-separated
+    // value → JSON array). NOTE (verified against the 2.16.2 bundle): the
+    // frontend uses this set only to SKIP the third-party disclaimer for
+    // trusted hosts — it does NOT block installs from other origins.
+    if let Some(wl) = plugins_whitelist {
+        let origins: Vec<&str> = wl
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if let Ok(arr) = serde_json::to_string(&origins) {
+            js.push_str(&format!("var penpotPluginsWhitelist = {arr};\n"));
+        }
+    }
+    js
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +816,21 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         password: credentials.password.clone(),
         used: AtomicBool::new(false),
     });
-    let config_js = render_config_js(supervisor::DEFAULT_PENPOT_FLAGS, &public_uri);
+    // E7 — plugins ship ENABLED: `enable-plugins` on the FRONTEND flag string
+    // only (config.js; backend PENPOT_FLAGS untouched) and the plugins
+    // whitelist pinned to the local proxy origins by default.
+    // `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS` appends extra frontend flags;
+    // `PENPOT_LOCAL_PLUGINS_WHITELIST` (comma-separated origins) overrides
+    // the whitelist pin.
+    let frontend_flags = compose_frontend_flags(
+        std::env::var("PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS").ok().as_deref(),
+    );
+    let plugins_whitelist = std::env::var("PENPOT_LOCAL_PLUGINS_WHITELIST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_plugins_whitelist(config.proxy_port));
+    let config_js = render_config_js(&frontend_flags, &public_uri, Some(&plugins_whitelist));
 
     // --- vault index (N1: offline full-content search) --------------------
     // Reads only the designs tree + manifest (never the DB); its SQLite db
@@ -755,6 +887,12 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     let packages_state = Arc::new(packages::PackagesState {
         packages_dir,
         vault_root: config.designs_dir.clone(),
+        // The E7 consent ledger lives at the DATA dir root (NOT the vault): it
+        // must survive a DB wipe but must NOT travel with a cloned vault.
+        data_dir: config.data_dir.clone(),
+        // Local-ness of a plugin pointer is decided by host == our proxy origin
+        // (E7 finding 5), independent of any whitelist override.
+        local_origins: packages::local_proxy_origins(config.proxy_port),
         backend_base: readiness.backend_base_url.clone(),
         token: credentials.access_token.clone(),
         team_id: team_id.clone(),
@@ -781,6 +919,14 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         .exporter
         .as_ref()
         .map(|e| ([127, 0, 0, 1], e.port).into());
+    // E7 CSP-GO — the Content-Security-Policy response header on every
+    // text/html response, ON BY DEFAULT (the shipped egress-containment
+    // promise requires it; plugin.js executes in a SES Compartment in the SPA
+    // page context, so the SPA DOCUMENT's CSP is what governs its fetches).
+    // `PENPOT_LOCAL_CSP` overrides the value; `PENPOT_LOCAL_CSP=off` disables
+    // the header (gate probe legs only — the promise does not hold then).
+    proxy_config.html_csp =
+        resolve_html_csp(std::env::var("PENPOT_LOCAL_CSP").ok().as_deref(), config.proxy_port);
 
     let bound = proxy::Proxy::bind_with_router(proxy_config, extra)
         .await
@@ -811,6 +957,12 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
             // the binfile — re-derive it once its endpoints are live. Idempotent;
             // a vault with no links exits after one cheap pass.
             packages::spawn_relink_reconcile(packages_state.clone());
+            // E7 plugin reconcile: re-apply lock-pinned plugin registry
+            // pointers after a DB wipe (insert-only, via the public
+            // update-profile-props), then keep lock.json capturing what the
+            // USER installs/uninstalls through Penpot's native Plugin Manager
+            // (recording consent, never granting it).
+            packages::spawn_plugin_reconcile(packages_state.clone());
             Some(handle)
         }
         _ => {
@@ -911,11 +1063,78 @@ mod tests {
 
     #[test]
     fn config_js_renders_both_globals() {
-        let js = render_config_js("enable-access-tokens", "http://localhost:8686");
+        let js = render_config_js("enable-access-tokens", "http://localhost:8686", None);
         assert_eq!(
             js,
             "var penpotFlags = \"enable-access-tokens\";\nvar penpotPublicURI = \"http://localhost:8686\";\n"
         );
+    }
+
+    #[test]
+    fn frontend_flags_include_plugins_by_default_and_append_extras() {
+        let flags = compose_frontend_flags(None);
+        assert!(flags.starts_with(supervisor::DEFAULT_PENPOT_FLAGS));
+        assert!(flags.ends_with(" enable-plugins"));
+        let flags = compose_frontend_flags(Some("  enable-foo enable-bar "));
+        assert!(flags.contains("enable-plugins"));
+        assert!(flags.ends_with(" enable-foo enable-bar"));
+        // Empty extra is a no-op, not a trailing space.
+        assert_eq!(compose_frontend_flags(Some("  ")), compose_frontend_flags(None));
+    }
+
+    #[test]
+    fn plugins_whitelist_defaults_to_both_local_origin_spellings() {
+        assert_eq!(
+            default_plugins_whitelist(9022),
+            "http://localhost:9022,http://127.0.0.1:9022"
+        );
+    }
+
+    #[test]
+    fn html_csp_defaults_on_overrides_and_off_sentinel() {
+        // Default ON (CSP-GO): a default-src baseline (finding 2) PLUS the
+        // connect-src fence to the local origin.
+        let def = resolve_html_csp(None, 9022).unwrap();
+        assert!(
+            def.contains("default-src 'self' data: blob:"),
+            "default-src baseline fences non-connect exfil vectors"
+        );
+        assert!(
+            def.contains("connect-src 'self' ws://localhost:9022 ws://127.0.0.1:9022"),
+            "connect-src still fenced to the local origin"
+        );
+        // The image-beacon exfil vector is fenced: img-src carries no off-origin host.
+        assert!(def.contains("img-src 'self' data: blob:"));
+        // Non-connect vectors finding 2 called out are closed.
+        assert!(def.contains("form-action 'self'"));
+        assert!(def.contains("object-src 'none'"));
+        // SES + render-wasm still work: script-src allows eval + wasm.
+        assert!(def.contains("'unsafe-eval'") && def.contains("'wasm-unsafe-eval'"));
+        // Empty env value falls back to the default (never header-less by accident).
+        assert_eq!(resolve_html_csp(Some("  "), 8686), Some(default_html_csp(8686)));
+        // Explicit value wins verbatim.
+        assert_eq!(
+            resolve_html_csp(Some("connect-src 'self'"), 9022).as_deref(),
+            Some("connect-src 'self'")
+        );
+        // The off sentinel disables the header (gate probe legs).
+        assert_eq!(resolve_html_csp(Some("off"), 9022), None);
+        assert_eq!(resolve_html_csp(Some("OFF"), 9022), None);
+        assert_eq!(resolve_html_csp(Some("none"), 9022), None);
+        assert_eq!(resolve_html_csp(Some("0"), 9022), None);
+    }
+
+    #[test]
+    fn config_js_renders_plugins_whitelist() {
+        let js = render_config_js(
+            "enable-access-tokens enable-plugins",
+            "http://localhost:9022",
+            Some("http://localhost:9022, http://127.0.0.1:9022"),
+        );
+        assert!(js.contains("var penpotFlags = \"enable-access-tokens enable-plugins\";"));
+        assert!(js.contains(
+            "var penpotPluginsWhitelist = [\"http://localhost:9022\",\"http://127.0.0.1:9022\"];"
+        ));
     }
 
     #[test]
