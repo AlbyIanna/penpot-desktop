@@ -5,25 +5,30 @@
 //! not patch, inject into, or drive Penpot's SPA, so invariant 3 holds.
 //!
 //! Two different policies apply to two different route classes (D1 decision,
-//! `.superpowers/sdd/task-6-report.md`):
-//!   * `#/auth/*` — cancelled UNCONDITIONALLY, no env var required. There is
-//!     no second account to log into or register in a single-user offline
-//!     app, so these routes are always closed. This is safe for the real
-//!     login path: `/__bootstrap` (`apps/desktop/src/lib.rs::bootstrap_login`)
-//!     logs in server-side via RPC and 302s straight to `/__home`, never
-//!     through an `#/auth/...` fragment in the webview — so unconditionally
-//!     cancelling `#/auth` cannot cancel login itself. (This supersedes the
-//!     original D0 WARNING that D2 must verify this before enabling it; D1
-//!     verified it by inspection of the bootstrap route above.)
-//!   * `#/dashboard`, `#/settings` — measurement-only by default, exactly as
-//!     D0 shipped them; still gated behind `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`.
-//!     Their native replacement does not exist yet (D2/D3 build it), so
-//!     closing them now would remove the only way to browse files.
+//! `.superpowers/sdd/task-6-report.md`; updated by D2):
+//!   * `#/auth/*`, `#/dashboard` — cancelled UNCONDITIONALLY, no env var
+//!     required. `#/auth` is closed because there is no second account to
+//!     log into or register in a single-user offline app; this is safe for
+//!     the real login path: `/__bootstrap`
+//!     (`apps/desktop/src/lib.rs::bootstrap_login`) logs in server-side via
+//!     RPC and 302s straight to `/__home`, never through an `#/auth/...`
+//!     fragment in the webview — so unconditionally cancelling `#/auth`
+//!     cannot cancel login itself. (This supersedes the original D0 WARNING
+//!     that D2 must verify this before enabling it; D1 verified it by
+//!     inspection of the bootstrap route above.) `#/dashboard` joined this
+//!     class in D2: its replacement, `/__home` with create/rename/duplicate/
+//!     move/delete, shipped earlier in this milestone, so the surface can
+//!     close by default.
+//!   * `#/settings` — still measurement-only by default, exactly as D0
+//!     shipped it; gated behind `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`. Its
+//!     native replacement (D4's Preferences) does not exist yet, so closing
+//!     it now would remove the only way to reach account/workspace settings
+//!     — the same mistake D1 already avoided once.
 //!
 //! Env switches:
 //!   * `PENPOT_LOCAL_NAVWATCH_LOG=<path>`  — append observations as JSONL.
-//!   * `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`  — cancel `#/dashboard`/`#/settings`
-//!     too, on top of the always-on `#/auth` cancellation above.
+//!   * `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`  — cancel `#/settings` too, on top
+//!     of the always-on `#/auth`/`#/dashboard` cancellation above.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -38,13 +43,16 @@ pub const HOME_PATH: &str = "/__home";
 
 /// Hash routes cancelled UNCONDITIONALLY, no env var required — see the
 /// module doc comment above for why this is safe for the real login path.
-const ALWAYS_CANCELLED_PREFIX: &str = "#/auth";
+/// `#/dashboard` joined this class in D2: its replacement (`/__home` with
+/// create/rename/duplicate/move/delete) shipped earlier in this milestone.
+const ALWAYS_CANCELLED_PREFIXES: [&str; 2] = ["#/auth", "#/dashboard"];
 
 /// Hash routes cancelled ONLY when `PENPOT_LOCAL_NAVWATCH_REDIRECT=1` — their
 /// native replacement doesn't exist yet, so they stay open (measurement-only)
 /// by default. Do NOT add to this list without a native replacement shipping
 /// alongside — closing these is what removes the only way to browse files.
-const GATED_WEB_ROUTE_PREFIXES: [&str; 2] = ["#/dashboard", "#/settings"];
+/// `#/settings`'s replacement is D4's native Preferences.
+const GATED_WEB_ROUTE_PREFIXES: [&str; 1] = ["#/settings"];
 
 /// What the navigation handler should do with a URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,9 +81,9 @@ pub fn decide(url: &str, redirect_enabled: bool) -> Decision {
     };
     let frag = format!("#{frag}");
 
-    // `#/auth/*` is closed unconditionally — this class doesn't wait on the
-    // redirect env var at all.
-    if matches_prefix(&frag, ALWAYS_CANCELLED_PREFIX) {
+    // `#/auth/*` and `#/dashboard` are closed unconditionally — this class
+    // doesn't wait on the redirect env var at all.
+    if ALWAYS_CANCELLED_PREFIXES.iter().any(|p| matches_prefix(&frag, p)) {
         return Decision::CancelAndRedirect(HOME_PATH.to_string());
     }
 
@@ -163,14 +171,13 @@ mod tests {
         }
     }
 
-    /// `#/dashboard` and `#/settings` are UNCHANGED from D0: allowed by
-    /// default (no native replacement exists yet — D2/D3 build it), cancelled
-    /// only when the env var opts in.
+    /// `#/settings` is UNCHANGED from D0: allowed by default (its native
+    /// replacement, D4's Preferences, does not exist yet), cancelled only
+    /// when the env var opts in. `#/dashboard` moved to the unconditional
+    /// class in D2 — see `dashboard_is_cancelled_even_with_redirect_disabled`.
     #[test]
-    fn dashboard_and_settings_are_allowed_with_redirect_disabled() {
+    fn settings_is_allowed_with_redirect_disabled() {
         for u in [
-            "http://localhost:9034/#/dashboard",
-            "http://localhost:9034/#/dashboard/team/abc",
             "http://localhost:9034/#/settings",
             "http://localhost:9034/#/settings/profile",
         ] {
@@ -180,6 +187,8 @@ mod tests {
 
     #[test]
     fn dashboard_and_settings_redirect_to_home_when_enabled() {
+        // `#/dashboard` redirects unconditionally as of D2, so this also
+        // holds with the env var on; `#/settings` still needs it enabled.
         for u in [
             "http://localhost:9034/#/dashboard",
             "http://localhost:9034/#/dashboard/team/abc",
@@ -212,11 +221,43 @@ mod tests {
     }
 
     #[test]
-    fn redirect_disabled_still_allows_dashboard_and_settings() {
-        // Default production behaviour for the gated class: observe only,
-        // change nothing. (#/auth is covered separately above — it is NOT
-        // part of "everything" any more.)
-        assert_eq!(decide("http://localhost:9034/#/dashboard", false), Decision::Allow);
+    fn dashboard_is_cancelled_even_with_redirect_disabled() {
+        // D2: the replacement (/__home with create/rename/move/delete) now
+        // exists, so the dashboard closes by default like the auth family.
+        for url in [
+            "http://localhost:9048/#/dashboard",
+            "http://localhost:9048/#/dashboard/recent?team-id=abc",
+            "http://localhost:9048/#/dashboard/fonts?team-id=abc",
+        ] {
+            match decide(url, false) {
+                Decision::CancelAndRedirect(to) => assert!(to.ends_with(HOME_PATH), "{url} -> {to}"),
+                other => panic!("{url} was not cancelled with redirect disabled: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn settings_is_unchanged_by_d2() {
+        // Its replacement is D4's native Preferences. Closing a surface before
+        // its replacement exists is exactly the mistake D1 avoided.
+        assert!(matches!(decide("http://localhost:9048/#/settings/profile", false), Decision::Allow));
+        assert!(matches!(
+            decide("http://localhost:9048/#/settings/profile", true),
+            Decision::CancelAndRedirect(_)
+        ));
+    }
+
+    #[test]
+    fn dashboard_prefix_boundary_still_holds() {
+        // "#/dashboardx" must not be treated as the dashboard.
+        assert!(matches!(decide("http://localhost:9048/#/dashboardx", false), Decision::Allow));
+    }
+
+    #[test]
+    fn redirect_disabled_still_allows_settings() {
+        // Default production behaviour for the still-gated class: observe
+        // only, change nothing. (#/auth and #/dashboard are covered
+        // separately above — they are NOT part of the gated class any more.)
         assert_eq!(decide("http://localhost:9034/#/settings", false), Decision::Allow);
     }
 

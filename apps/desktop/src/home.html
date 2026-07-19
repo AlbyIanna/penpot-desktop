@@ -1,8 +1,12 @@
 <!--
   N3 lighttable home — the vault's front door. Plain HTML + vanilla JS, no
   framework, served same-origin at /__home (auth cookie already set by
-  /__bootstrap). Card clicks deep-link into the SPA at /#/workspace?…; the
-  escape hatch drops to the upstream dashboard at /#/dashboard/recent.
+  /__bootstrap). Card clicks deep-link into the SPA at /#/workspace?….
+
+  D2: the escape hatch to the upstream dashboard (/#/dashboard/recent) is
+  gone — navwatch.rs now cancels #/dashboard unconditionally and redirects
+  back here, so a visible link the navigation policy would silently cancel
+  is worse than no link at all. This page is the only front door now.
 
   N4 (grid fix + Peek): the board grid refreshes by keyed DIFF/PATCH — never
   `innerHTML=""` on the interval or on filter — so scroll position AND the
@@ -56,11 +60,6 @@
     padding: 5px 11px; border-radius: 7px; background: var(--bg); white-space: nowrap; cursor: pointer;
   }
   button.bar:hover { border-color: var(--accent); }
-  a.escape {
-    text-decoration: none; color: var(--accent); border: 1px solid var(--border);
-    padding: 5px 11px; border-radius: 7px; background: var(--bg); white-space: nowrap;
-  }
-  a.escape:hover { border-color: var(--accent); }
 
   .card-actions { display: flex; gap: 6px; padding: 6px 8px 8px; flex-wrap: wrap; }
   .card-action {
@@ -176,7 +175,6 @@
       <button class="bar" id="checkpoint-btn" title="One labeled git commit of the vault">Checkpoint now</button>
       <button class="bar" id="new-project" type="button">New project</button>
       <button class="bar" id="new-file" type="button">New file</button>
-      <a class="escape" id="escape-hatch" href="/#/dashboard/recent">Open dashboard ↗</a>
     </div>
   </header>
 
