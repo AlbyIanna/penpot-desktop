@@ -314,9 +314,16 @@ case "$LOGIN_V" in
         fail "(b/effect) loginForm is INCONCLUSIVE ($LOGIN_V) — the page did not render, so absence proves nothing; this is an INFRASTRUCTURE FAILURE, not a real negative finding" ;;
 esac
 
-# --- (navwatch) THE REGISTRATION CLOSURE — proven by policy, not DOM-probed -
-# registration=present above is only tolerable if navwatch::decide() really
-# does cancel+redirect the #/auth family in the webview — UNCONDITIONALLY,
+# --- (navwatch) THE REGISTRATION CLOSURE — defence in depth ----------------
+# The (b/effect) leg above measures the DOM: the signup form no longer renders,
+# because disable-login-with-password removed the password-based register form
+# as well (verified visually — only a heading and a "Login here" link remain).
+# That is a happy side effect of a flag we added for another reason, so it is
+# exactly the kind of thing an upstream release could take back without notice.
+# The backend signup RPC also stays live and always will: our own single-user
+# provisioning calls it, and that path runs on every DB wipe (the core
+# invariant). So the surface is closed a second time, in the webview, by
+# navwatch::decide() cancelling+redirecting the #/auth family — UNCONDITIONALLY,
 # with no env var required (D1 hardening: the policy used to be dormant by
 # default, since only PENPOT_LOCAL_NAVWATCH_REDIRECT=1 enabled it and nothing
 # in the shipped product ever sets that var — see .superpowers/sdd/task-6-report.md
@@ -341,9 +348,12 @@ if [ "$NAVWATCH_RC" -eq 0 ] &&
     echo "     NOTE: no test is literally named \"register\" — decide()'s boundary-checked prefix"
     echo "     match on the #/auth family (exact match OR a \"/\" subpath) is the SAME code path for"
     echo "     #/auth/login and #/auth/register, and auth_family_is_cancelled_even_with_redirect_disabled"
-    echo "     exercises that family with the env var OFF — the shipped product's actual default. That"
-    echo "     is what makes registration=present (asserted above) a tolerated outcome rather than a"
-    echo "     silent hole, and it no longer depends on an env var the product never sets."
+    echo "     exercises that family with the env var OFF — the shipped product's actual default."
+    echo "     This is the SECOND closure of the registration surface, not the only one: the DOM"
+    echo "     check above already found the form gone. It is kept because that removal is a side"
+    echo "     effect of disable-login-with-password (upstream could take it back), and because the"
+    echo "     backend signup RPC stays live by necessity — our own provisioning calls it on every"
+    echo "     DB wipe. The route is closed in the webview regardless of what the SPA renders."
 else
     fail "(navwatch) cargo test -p penpot-desktop navwatch::tests:: did not confirm the unconditional #/auth redirect policy (rc=$NAVWATCH_RC) — see $NAVWATCH_LOG"
 fi
