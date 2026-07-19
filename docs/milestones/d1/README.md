@@ -42,8 +42,19 @@ unconditionally**. See "The dormant policy" below.
 |---|---|
 | ![dashboard before](img/before-dashboard.png) | ![dashboard after](img/after-dashboard.png) |
 
-The "Libraries & Templates" carousel is gone. Those thumbnails were fetched from penpot.app —
-a *visible* violation of the offline promise, sitting on the first screen after login.
+The "Libraries & Templates" carousel is gone.
+
+An earlier draft of this document claimed those thumbnails were fetched from penpot.app, and
+called the carousel a visible violation of the offline promise. **That was wrong, and
+measuring it is what caught it.** With the section force-enabled, every single request the
+dashboard made went to `localhost:9046` — 20 of 20. The thumbnails ship inside the frontend
+bundle (`runtime/frontend/images/thumbnails/template-*.jpg`), so rendering the carousel
+causes no egress at all.
+
+It is still removed, for the honest reason rather than the dramatic one: the section
+advertises content that lives on penpot.app. Clicking "Add" would fetch a `.penpot` file over
+the network, and offering a gallery of things that cannot be installed offline is a broken
+promise in the UI even when it is silent on the wire.
 
 | Before | After |
 |---|---|
@@ -106,6 +117,26 @@ These are the lessons that actually cost time, encoded so they cannot recur:
    sample actually happened — the gate requires a non-zero count of *loopback* connections
    and a non-zero request count first. An empty measurement and a clean measurement look
    identical unless you check.
+
+### The negative control — proving the gate can fail
+
+A gate that has only ever been run against a passing system has not been shown to work. Every
+D1 run had the flags already on, so `templatesSection` had only ever been observed as `gone` —
+which is exactly what a detector that always answers "gone" would produce.
+
+So the flags were re-enabled at runtime (`PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS` is appended last,
+so `enable-…` overrides the baked-in `disable-…`) and the observer re-run against the same
+stack:
+
+| Surface | Flags on (shipped) | Flags re-enabled |
+|---|---|---|
+| `templatesSection` | `gone` | **`present`** |
+| `loginForm` | `gone` | **`present`** |
+| `registration` | `gone` | **`present`** |
+
+All three verdicts flip. The detectors discriminate, and a regression in any of these flags
+would turn the gate red rather than sail through it. This experiment is cheap to repeat and
+worth repeating whenever a surface check is added.
 
 ## Two findings worth recording
 
