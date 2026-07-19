@@ -12,6 +12,16 @@
 //! in the DB and gets re-exported, delete-then-trash looks like a wiped DB and
 //! gets re-imported.
 //!
+//! "Paused" here means [`sync_daemon::SyncControl::pause_and_wait_idle`], not
+//! the bare flag flip — a poll cycle or startup reconciliation already in
+//! flight when we ask to pause keeps writing to disk/DB until it finishes,
+//! flag or no flag, so the delete route waits for the daemon's own ack that
+//! it is genuinely idle before touching anything (a timeout is a hard error,
+//! never a silent proceed). The whole guarded operation additionally runs in
+//! a spawned task the request handler merely awaits, so a client disconnect
+//! can't cut the pause/trash sequence short — see `delete_file`'s and
+//! `PauseGuard`'s doc comments for both.
+//!
 //! Names are validated by [`valid_name`], not sanitised: a name is rejected
 //! outright rather than silently rewritten, so the name on screen always
 //! matches the name the daemon later writes to disk. That guarantee is
@@ -304,12 +314,30 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// between panics. `Drop` is the only one of the three that a plain
 /// `pause(); ...; resume();` pair cannot give you — an early `?` return
 /// already skips a bare trailing `resume()`, and a panic skips it too.
+///
+/// Construction goes through `pause_and_wait_idle`, not the bare `pause()`
+/// flag flip: flipping the flag only stops FUTURE daemon work, it does not
+/// wait for a poll cycle or startup reconciliation that is already
+/// mid-flight (and mid-write) at the moment we call it. Without that wait
+/// the daemon could still be exporting a file to disk between our RPC
+/// delete and the trash move — exactly the unprotected midpoint this whole
+/// module exists to prevent. A timeout is therefore surfaced to the caller
+/// as an error (see `delete_file`), never treated as "probably paused now".
 struct PauseGuard(sync_daemon::SyncControl);
 
 impl PauseGuard {
-    fn new(sync: sync_daemon::SyncControl) -> Self {
-        sync.pause();
-        PauseGuard(sync)
+    async fn new(sync: sync_daemon::SyncControl) -> Result<Self, sync_daemon::PauseAckError> {
+        match sync.pause_and_wait_idle().await {
+            Ok(()) => Ok(PauseGuard(sync)),
+            Err(e) => {
+                // pause_and_wait_idle already flipped the flag before it hit
+                // the timeout; release it ourselves since no guard exists to
+                // do it in `Drop` — otherwise a timed-out attempt would leave
+                // the daemon paused forever.
+                sync.resume();
+                Err(e)
+            }
+        }
     }
 }
 
@@ -327,24 +355,56 @@ fn sync_not_ready() -> Response {
         .into_response()
 }
 
+fn pause_not_acknowledged(e: sync_daemon::PauseAckError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": format!("sync daemon did not confirm it stopped touching the vault: {e}; nothing was deleted")
+        })),
+    )
+        .into_response()
+}
+
+/// What can go wrong inside the guarded delete task spawned by `delete_file`
+/// (see its doc comment for why the work is spawned rather than run inline).
+enum DeleteError {
+    /// The daemon never confirmed it was idle — see `PauseGuard::new`.
+    /// Nothing was touched: no RPC delete, no trash move.
+    PauseNotAcknowledged(sync_daemon::PauseAckError),
+    /// The RPC delete or the trash move itself failed — see `delete_inner`.
+    Delete(String),
+}
+
 async fn delete_file(State(st): State<Arc<ManageState>>, Json(req): Json<DeleteReq>) -> Response {
     let Some(client) = st.client() else { return no_token() };
 
     // See the `sync` field doc on `ManageState`: reject rather than skip the
     // pause or block forever.
-    let Some(sync) = st.sync.get() else { return sync_not_ready() };
+    let Some(sync) = st.sync.get().cloned() else { return sync_not_ready() };
 
-    // Pause the daemon for the whole two-step operation. Either order of
-    // (RPC delete, trash) exposes a state the daemon would "repair" — see the
-    // module docs — so it must not observe the midpoint at all. `_pause`'s
-    // `Drop` releases it on every exit path below, including `?`-early-return
-    // and panics.
-    let _pause = PauseGuard::new(sync.clone());
-    let result = delete_inner(&st, &client, &req.file_id).await;
+    // The guarded operation (pause-and-wait-idle → RPC delete → trash move →
+    // resume) runs in a DETACHED task, and this handler awaits its
+    // `JoinHandle` rather than running the work inline: axum drops a
+    // handler's future outright if the client disconnects mid-request, but
+    // a spawned task keeps running regardless of who is (or isn't) still
+    // awaiting it. Run inline, a disconnect could resume the daemon while
+    // `trash_file`'s `spawn_blocking` (itself uncancellable) is still moving
+    // the directory, or land between the RPC delete and the trash move with
+    // no guard left to protect it — the file would be gone from the DB but
+    // still on disk, and the next reconciliation would resurrect it as a
+    // "new" file.
+    let st_for_task = st.clone();
+    let file_id = req.file_id.clone();
+    let task: tokio::task::JoinHandle<Result<String, DeleteError>> = tokio::spawn(async move {
+        let _pause = PauseGuard::new(sync).await.map_err(DeleteError::PauseNotAcknowledged)?;
+        delete_inner(&st_for_task, &client, &file_id).await.map_err(DeleteError::Delete)
+    });
 
-    match result {
-        Ok(rel) => Json(json!({ "ok": true, "trashedPath": rel })).into_response(),
-        Err(e) => upstream_error(e),
+    match task.await {
+        Ok(Ok(rel)) => Json(json!({ "ok": true, "trashedPath": rel })).into_response(),
+        Ok(Err(DeleteError::PauseNotAcknowledged(e))) => pause_not_acknowledged(e),
+        Ok(Err(DeleteError::Delete(e))) => upstream_error(e),
+        Err(join_err) => upstream_error(format!("delete task failed unexpectedly: {join_err}")),
     }
 }
 
@@ -499,31 +559,45 @@ mod tests {
     /// genuine `sync_daemon::SyncControl`, not a test double — mirrors
     /// `status.rs`'s `offline_daemon()` helper. The backend URL is
     /// unroutable, so the engine just retries reconciliation in the
-    /// background; the control handle works regardless.
-    fn offline_sync_control() -> (sync_daemon::SyncDaemonHandle, sync_daemon::SyncControl) {
-        let root = std::env::temp_dir().join(format!(
-            "penpot-desktop-manage-test-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    /// background; the control handle works regardless. The `TempDir` is
+    /// returned so the caller can keep it alive for the test's duration —
+    /// dropping it cleans the directory up (it previously leaked a
+    /// `std::env::temp_dir()` subdirectory on every test run).
+    fn offline_sync_control() -> (tempfile::TempDir, sync_daemon::SyncDaemonHandle, sync_daemon::SyncControl) {
+        let tmp = tempfile::tempdir().expect("create temp dir for the offline sync daemon fixture");
         let client = penpot_rpc::PenpotClient::new("http://127.0.0.1:9");
-        let handle = sync_daemon::spawn(client, sync_daemon::SyncConfig::new(root, "team"));
+        let handle = sync_daemon::spawn(client, sync_daemon::SyncConfig::new(tmp.path(), "team"));
         let control = handle.control();
-        (handle, control)
+        (tmp, handle, control)
     }
 
     #[tokio::test]
     async fn pause_guard_resumes_on_normal_drop() {
-        let (daemon, control) = offline_sync_control();
+        let (_tmp, daemon, control) = offline_sync_control();
         assert!(!control.is_paused());
         {
-            let _guard = super::PauseGuard::new(control.clone());
+            // The offline daemon's startup loop hits its `if
+            // *pause_rx.borrow()` check (and acks) before it ever tries the
+            // network — see the scheduling note on
+            // `pause_guard_resumes_even_when_the_guarded_work_panics` below —
+            // so this resolves promptly rather than hitting the real
+            // `pause_and_wait_idle` timeout.
+            let _guard = super::PauseGuard::new(control.clone())
+                .await
+                .expect("offline daemon acks pause before touching the network");
             assert!(control.is_paused(), "guard construction must pause");
         }
         assert!(!control.is_paused(), "guard drop must resume");
+        // NOT `daemon.stop().await`: resuming just above unblocks the
+        // daemon's startup reconciliation, which immediately retries against
+        // the unroutable backend for real — `stop()`'s shutdown signal is
+        // only checked between retry attempts (`with_retry`'s backoff sleep
+        // isn't selected against it), so awaiting a graceful stop here would
+        // block this test for the retry budget's full ~90s worst case
+        // instead of the sub-second run it is today. `drop` mirrors
+        // `status.rs`'s `offline_daemon()` helper: the leaked background
+        // task is harmless (it only ever talks to 127.0.0.1:9) and dies with
+        // the test process.
         drop(daemon);
     }
 
@@ -533,16 +607,46 @@ mod tests {
         // pause/.../resume pair: it must release the pause even when the
         // code in between never reaches the resume call, e.g. because it
         // panics (mirrors a bug in delete_inner, not just a returned Err).
-        // `catch_unwind` only unwinds the current call stack — the runtime
-        // underneath this test is unaffected either way.
-        let (daemon, control) = offline_sync_control();
+        //
+        // `PauseGuard::new` is async (it awaits `pause_and_wait_idle`), so a
+        // plain `std::panic::catch_unwind` around it can no longer stand in
+        // for the guarantee we actually need: `delete_file` now runs the
+        // whole guarded operation inside `tokio::spawn` (see its doc
+        // comment), and that IS the real panic boundary in production —
+        // tokio catches a panicking task's unwind internally, which runs
+        // `Drop` for everything on that task's stack exactly like
+        // `catch_unwind` would. Mirroring that here tests the actual
+        // mechanism instead of a synthetic stand-in for it.
+        //
+        // Scheduling note: `#[tokio::test]` defaults to the single-threaded
+        // (current-thread) runtime, which never interleaves tasks WITHIN one
+        // poll — but it also doesn't guarantee poll ORDER between two tasks
+        // that are both already queued (the daemon task from
+        // `offline_sync_control`, spawned first, and the guard task spawned
+        // below). If the daemon happened to get its first poll before the
+        // guard task ever calls `pause()`, it would race into the
+        // unroutable RPC and not check the flag again until that call times
+        // out — well past `PauseGuard::new`'s timeout. So `pause()` is
+        // called directly, HERE, synchronously, before spawning anything:
+        // that runs as part of this task's current poll, guaranteed to
+        // land before either the daemon's or the guard task's first poll.
+        let (_tmp, daemon, control) = offline_sync_control();
+        control.pause();
         let control_for_panic = control.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = super::PauseGuard::new(control_for_panic);
+        let task = tokio::spawn(async move {
+            let _guard = super::PauseGuard::new(control_for_panic)
+                .await
+                .expect("daemon is already paused above; the ack should be immediate");
             panic!("simulated failure inside the guarded delete operation");
-        }));
+        });
+        let result = task.await;
         assert!(result.is_err(), "the panic must have actually happened");
+        assert!(result.unwrap_err().is_panic(), "must be a panic, not e.g. a cancellation");
         assert!(!control.is_paused(), "Drop must run and resume even after a panic");
+        // See the comment on `drop(daemon)` in the test above: resuming here
+        // sends the daemon into a real (slow) retry storm against the
+        // unroutable backend, so a graceful `stop().await` would make this
+        // test take on the order of a minute instead of milliseconds.
         drop(daemon);
     }
 }

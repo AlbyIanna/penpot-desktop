@@ -44,7 +44,12 @@
 //!   [`SyncStatusSnapshot`] (last sync time, per-file [`FileState`], paused,
 //!   last error) — see [`SyncDaemonHandle::status`]; [`SyncControl`]
 //!   (from [`SyncDaemonHandle::control`]) pauses/resumes — paused = nothing
-//!   is touched on disk or in the DB; resume rescans the root.
+//!   is touched on disk or in the DB; resume reloads the manifest from disk
+//!   (something may have rewritten it out of band while paused — e.g. D2
+//!   delete's `trash_file`) and rescans the root.
+//!   [`SyncControl::pause_and_wait_idle`] additionally blocks until the
+//!   engine loop confirms no operation is mid-flight — the plain flag alone
+//!   only stops *future* work.
 //! - **Resilience**: every RPC failure is retried with backoff (the backend
 //!   crash-respawn window is ~30–60 s); a failed poll cycle is skipped and
 //!   NEVER interpreted as "file deleted". Reconciliation is idempotent.
@@ -71,7 +76,7 @@ use penpot_rpc::PenpotClient;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-pub use status::{FileState, SyncControl, SyncStatusSnapshot};
+pub use status::{FileState, PauseAckError, SyncControl, SyncStatusSnapshot};
 
 /// Sync daemon configuration.
 #[derive(Debug, Clone)]
@@ -158,8 +163,16 @@ pub fn spawn(client: PenpotClient, config: SyncConfig) -> SyncDaemonHandle {
     let (shutdown, rx) = watch::channel(false);
     let (hub, status_rx) = status::StatusHub::new();
     let (pause_tx, pause_rx) = watch::channel(false);
-    let control = SyncControl::new(Arc::new(pause_tx), hub.clone());
-    let task = tokio::spawn(engine::run(client, config, rx, hub, pause_rx));
+    // Idle-ack channel for `SyncControl::pause_and_wait_idle` (see
+    // `status.rs`): the engine sends on this whenever it returns to the top
+    // of its loop with the pause flag observed true. `Sender::subscribe()`
+    // works even with zero current receivers, so there is no need to keep
+    // the paired `Receiver` this constructor discards — callers create their
+    // own via `subscribe()` inside `pause_and_wait_idle`.
+    let (idle_tx, _idle_rx) = watch::channel(());
+    let idle_tx = Arc::new(idle_tx);
+    let control = SyncControl::new(Arc::new(pause_tx), idle_tx.clone(), hub.clone());
+    let task = tokio::spawn(engine::run(client, config, rx, hub, pause_rx, idle_tx));
     SyncDaemonHandle {
         shutdown,
         task,
