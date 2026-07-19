@@ -155,6 +155,23 @@
   }
   #strip .paused { color: var(--pending); font-weight: 600; }
   #strip .spacer { margin-left: auto; }
+
+  /* D2: tiny picker dialog — replaces window.prompt("...project id?") with a
+     <select> over the real project list. Not a modal framework: one overlay,
+     one purpose, same plain-DOM idiom as #peek. */
+  #project-picker {
+    position: fixed; inset: 0; z-index: 25; background: rgba(8,10,13,.5);
+    display: none; align-items: center; justify-content: center;
+  }
+  #project-picker.open { display: flex; }
+  #project-picker .dialog {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px; min-width: 280px; box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  #project-picker .dialog-title { font-weight: 600; }
+  #project-picker select { width: 100%; }
+  #project-picker .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 </style>
 </head>
 <body>
@@ -195,6 +212,18 @@
     <div class="hint">← → flip boards · Esc close · Enter open</div>
   </div>
 
+  <!-- D2: project picker dialog (Move to project / etc.) -->
+  <div id="project-picker" aria-hidden="true">
+    <div class="dialog">
+      <div class="dialog-title" id="picker-title">Choose a project</div>
+      <select id="picker-select"></select>
+      <div class="dialog-actions">
+        <button class="card-action" type="button" id="picker-cancel">Cancel</button>
+        <button class="card-action" type="button" id="picker-ok">OK</button>
+      </div>
+    </div>
+  </div>
+
   <div id="strip"><span class="line">Loading activity…</span></div>
 
 <script>
@@ -218,6 +247,21 @@
   var cardMap = new Map();
   var shownBoards = [];       // the currently-visible boards, in order
   var focusedId = null;       // boardId of the persistent focused card
+
+  // D2: the project <select>'s option list is now populated from
+  // /__api/vault/manage/projects (authoritative — reads the DB, includes
+  // projects with zero files) instead of from the board-derived list the
+  // /__api/vault/boards response carries. That board-derived list is
+  // disk-only by design (crates/vault-index): a project the user just
+  // created has no synced files yet, therefore no folder on disk, therefore
+  // it never appeared in the old picker. `projectsList` is [{id, name}],
+  // kept only for the picker + the "Move" dialog; `lastProjectIdsKey` lets
+  // loadProjects() skip rebuilding the <select> DOM (and so leave the user's
+  // current selection untouched) when the id set hasn't actually changed —
+  // this runs on every 5s poll, and a control that resets itself every poll
+  // is unusable.
+  var projectsList = [];
+  var lastProjectIdsKey = null;
 
   function placeholderSvg() {
     return '<span class="placeholder">' +
@@ -390,27 +434,77 @@
     }
   }
 
+  // `/__api/vault/boards?project=` filters by project NAME (it matches
+  // against the manifest's project_name — see vault-index's boards.rs), not
+  // id. The picker's <select> is keyed by id now (see loadProjects below),
+  // so resolve the selected id back to a name here rather than changing the
+  // boards route's filter contract.
+  function selectedProjectName() {
+    var id = projectSel.value;
+    if (!id) return null;
+    for (var i = 0; i < projectsList.length; i++) {
+      if (projectsList[i].id === id) return projectsList[i].name;
+    }
+    return null;
+  }
+
   function loadBoards() {
     var params = new URLSearchParams();
-    if (projectSel.value) params.set("project", projectSel.value);
+    var name = selectedProjectName();
+    if (name) params.set("project", name);
     params.set("sort", sortSel.value);
     fetch("/__api/vault/boards?" + params.toString())
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (data) {
         allBoards = data.boards || [];
-        var cur = projectSel.value;
-        projectSel.innerHTML = '<option value="">All projects</option>';
-        (data.projects || []).forEach(function (p) {
-          var o = document.createElement("option");
-          o.value = p; o.textContent = p;
-          if (p === cur) o.selected = true;
-          projectSel.appendChild(o);
-        });
+        // NOTE: data.projects (board-derived project names) is deliberately
+        // ignored here — the picker's option list now comes from
+        // loadProjects()/manage/projects, the authoritative source. Keeping
+        // this response's own board-derived filtering behaviour (the
+        // `project` query param above) intact is the point; only where the
+        // <select>'s OPTIONS come from changed.
         render();
       })
       .catch(function () {
         countEl.textContent = "index warming up…";
         setTimeout(loadBoards, 1500);
+      });
+  }
+
+  // `GET /__api/vault/manage/projects` — the authoritative project list
+  // (reads the Penpot DB directly, so it includes a project the instant it's
+  // created, before any file syncs to disk). Rebuilds the <select> options
+  // only when the id set actually changed (lastProjectIdsKey), and otherwise
+  // leaves the control alone — repopulating on every 5s poll must not reset
+  // whatever the user currently has selected. Pass `selectId` to force that
+  // project selected once the fetch lands (used right after "New project" so
+  // "New file" works immediately, without waiting for anything to sync).
+  function loadProjects(selectId) {
+    return fetch("/__api/vault/manage/projects")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        projectsList = (data.projects || []).slice().sort(function (a, b) {
+          return a.name.localeCompare(b.name);
+        });
+        var key = projectsList.map(function (p) { return p.id; }).join(" ");
+        var cur = projectSel.value;
+        if (key !== lastProjectIdsKey) {
+          lastProjectIdsKey = key;
+          projectSel.innerHTML = '<option value="">All projects</option>';
+          projectsList.forEach(function (p) {
+            var o = document.createElement("option");
+            o.value = p.id; o.textContent = p.name;
+            projectSel.appendChild(o);
+          });
+        }
+        var target = selectId || cur;
+        if (target && projectsList.some(function (p) { return p.id === target; })) {
+          projectSel.value = target;
+        }
+      })
+      .catch(function () {
+        // Transient failure (e.g. token not issued yet during provisioning).
+        // Leave the picker as-is; the 5s poll below retries.
       });
   }
 
@@ -487,6 +581,12 @@
   peek.addEventListener("click", function (e) { if (e.target === peek) closePeek(); });
 
   document.addEventListener("keydown", function (e) {
+    // The project picker dialog is modal when open (defined further down;
+    // `picker` is a hoisted `var` so this closure sees it once assigned).
+    if (picker.classList.contains("open")) {
+      if (e.key === "Escape") { e.preventDefault(); closePicker(null); }
+      return;
+    }
     // Peek is modal when open.
     if (peek.classList.contains("open")) {
       if (e.key === "Escape") { e.preventDefault(); closePeek(); }
@@ -671,17 +771,47 @@
     return data;
   }
 
-  // The project <select> is keyed by project NAME (it doubles as the
-  // /__api/vault/boards ?project= filter, which matches by name). The manage
-  // API needs the project's real id, which isn't in that dropdown — but it
-  // IS on every loaded board card now, so resolve it from there instead of
-  // asking the daemon for a lookup the caller can already answer.
-  function projectIdForName(name) {
-    for (var i = 0; i < allBoards.length; i++) {
-      if (allBoards[i].project === name) return allBoards[i].projectId;
-    }
-    return null;
+  // D2: a small picker dialog over `projectsList`, replacing the raw
+  // "Target project id?" window.prompt with an actual list of projects —
+  // asking a human to type a UUID is not a real workflow. Promise-based so
+  // the one grid click handler below can `await` it like any other step;
+  // resolves the chosen project id, or null on cancel / empty list.
+  var picker = document.getElementById("project-picker");
+  var pickerTitle = document.getElementById("picker-title");
+  var pickerSelect = document.getElementById("picker-select");
+  var pickerOk = document.getElementById("picker-ok");
+  var pickerCancel = document.getElementById("picker-cancel");
+  var pickerResolve = null;
+
+  function closePicker(result) {
+    picker.classList.remove("open");
+    picker.setAttribute("aria-hidden", "true");
+    var resolve = pickerResolve;
+    pickerResolve = null;
+    if (resolve) resolve(result);
   }
+
+  function chooseProject(title, excludeProjectId) {
+    return new Promise(function (resolve) {
+      var options = projectsList.filter(function (p) { return p.id !== excludeProjectId; });
+      if (!options.length) { resolve(null); return; }
+      pickerTitle.textContent = title;
+      pickerSelect.innerHTML = "";
+      options.forEach(function (p) {
+        var o = document.createElement("option");
+        o.value = p.id; o.textContent = p.name;
+        pickerSelect.appendChild(o);
+      });
+      pickerResolve = resolve;
+      picker.classList.add("open");
+      picker.setAttribute("aria-hidden", "false");
+      pickerSelect.focus();
+    });
+  }
+
+  pickerOk.addEventListener("click", function () { closePicker(pickerSelect.value || null); });
+  pickerCancel.addEventListener("click", function () { closePicker(null); });
+  picker.addEventListener("click", function (e) { if (e.target === picker) closePicker(null); });
 
   // One delegated listener: cards are recycled by the keyed patch path, so
   // per-card handlers would leak and could fire against a stale file id.
@@ -705,7 +835,11 @@
           fileId: fileId, name: copyName, projectId: btn.getAttribute("data-project-id"),
         });
       } else if (action === "move") {
-        var targetProjectId = window.prompt("Target project id?");
+        if (!projectsList.length) {
+          setStripMessage("Projects not loaded yet — try again in a moment.");
+          return;
+        }
+        var targetProjectId = await chooseProject("Move to which project?", btn.getAttribute("data-project-id"));
         if (!targetProjectId) return;
         await post("/__api/vault/manage/move", { fileIds: [fileId], projectId: targetProjectId });
       } else if (action === "delete") {
@@ -726,19 +860,22 @@
   newProjectBtn.addEventListener("click", async function () {
     var name = window.prompt("Project name?");
     if (!name) return;
-    try { await post("/__api/vault/manage/project", { name: name }); loadBoards(); }
+    try {
+      var res = await post("/__api/vault/manage/project", { name: name });
+      // The create response already carries the new project's id — use it to
+      // both refresh the picker from the authoritative endpoint AND select
+      // the new project, so "New file" works immediately without waiting for
+      // anything to sync to disk first (the bug this route exists to fix).
+      await loadProjects(res.projectId);
+      loadBoards();
+    }
     catch (e) { setStripMessage("Could not create the project: " + e.message); }
   });
 
   newFileBtn.addEventListener("click", async function () {
-    var projectName = projectSel.value;
-    if (!projectName) {
-      setStripMessage("Pick a project first, then New file.");
-      return;
-    }
-    var projectId = projectIdForName(projectName);
+    var projectId = projectSel.value;
     if (!projectId) {
-      setStripMessage("That project has no synced boards yet — try again shortly.");
+      setStripMessage("Pick a project first, then New file.");
       return;
     }
     var name = window.prompt("File name?");
@@ -751,12 +888,17 @@
   sortSel.addEventListener("change", loadBoards);
   filterInput.addEventListener("input", render);
 
+  loadProjects();
   loadBoards();
   pollStrip();
   setInterval(pollStrip, 1200);
   // Refresh the grid periodically so card thumbnails/recency reflect syncs.
   // This now diff/patches (scroll + focus preserved) instead of rebuilding.
-  setInterval(loadBoards, 5000);
+  // loadProjects() rides along so a project created/deleted elsewhere (or
+  // whose deletedAt just landed) eventually shows up here too — it only
+  // touches the <select>'s DOM when the id set actually changed, so this
+  // does not reset the user's current selection every 5s.
+  setInterval(function () { loadProjects(); loadBoards(); }, 5000);
 })();
 </script>
 </body>

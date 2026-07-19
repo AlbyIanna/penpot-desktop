@@ -41,11 +41,11 @@ use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use http::StatusCode;
-use penpot_rpc::{Auth, PenpotClient};
-use serde::Deserialize;
+use penpot_rpc::{Auth, PenpotClient, ProjectInfo};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// Longest name we accept. Must match the sync daemon's own cap
@@ -178,6 +178,56 @@ async fn new_project(State(st): State<Arc<ManageState>>, Json(req): Json<NewProj
     let Some(client) = st.client() else { return no_token() };
     match client.create_project(&st.team_id, &name).await {
         Ok(p) => Json(json!({ "projectId": p.id, "name": name })).into_response(),
+        Err(e) => upstream_error(e),
+    }
+}
+
+/// Minimal shape the `/__home` project picker needs: id (what every mutation
+/// route takes) plus name (what the human reads). Deliberately smaller than
+/// [`ProjectInfo`] — the picker has no use for `teamId`/timestamps, and a
+/// narrower response shape is one less thing to keep in sync with the RPC
+/// wire type.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSummary {
+    pub id: String,
+    pub name: String,
+}
+
+/// Drop soft-deleted projects and map to the picker's minimal shape.
+///
+/// `delete-project` is a SOFT delete (see [`ProjectInfo::deleted_at`]): the
+/// project keeps appearing in `get-projects` with `deletedAt` set for roughly
+/// a week. Shipping those to the picker would let a user "create a file" in a
+/// project that is on its way out — so this is the one required filter, not
+/// an optional nicety. Pulled out as a pure function over the RPC type so the
+/// filtering rule is unit-testable without a live server.
+pub fn active_project_summaries(projects: &[ProjectInfo]) -> Vec<ProjectSummary> {
+    projects
+        .iter()
+        .filter(|p| p.deleted_at.is_none())
+        .map(|p| ProjectSummary { id: p.id.clone(), name: p.name.clone() })
+        .collect()
+}
+
+/// `GET /__api/vault/manage/projects` — the authoritative project list for
+/// the `/__home` picker.
+///
+/// D2 closed off the upstream dashboard entirely, and the picker used to be
+/// populated from the vault-index's board-derived project list
+/// (`crates/vault-index/src/boards.rs`'s `BoardListing.projects`), which is
+/// disk-only by design: it only knows about a project once one of its files
+/// has synced to a folder on disk. A project the user just created has no
+/// files yet, therefore no folder, therefore never appears — so "New
+/// project" followed immediately by "New file" was a dead end with no other
+/// route out (the dashboard escape hatch is gone). This route reads the
+/// Penpot DB directly instead, which is authoritative and includes empty
+/// projects the instant they exist. The vault index itself stays disk-only —
+/// this lives in `manage.rs`, not `vault-index`, on purpose.
+async fn list_projects(State(st): State<Arc<ManageState>>) -> Response {
+    let Some(client) = st.client() else { return no_token() };
+    match client.get_projects(&st.team_id).await {
+        Ok(projects) => Json(json!({ "projects": active_project_summaries(&projects) })).into_response(),
         Err(e) => upstream_error(e),
     }
 }
@@ -442,6 +492,7 @@ async fn delete_inner(
 pub fn router(state: Arc<ManageState>) -> Router {
     Router::new()
         .route("/__api/vault/manage/project", post(new_project))
+        .route("/__api/vault/manage/projects", get(list_projects))
         .route("/__api/vault/manage/file", post(new_file))
         .route("/__api/vault/manage/rename", post(rename))
         .route("/__api/vault/manage/move", post(move_files))
@@ -530,6 +581,53 @@ mod tests {
         // 2.16.2 (E3). Pin the pair we send so a well-meaning edit to
         // "include everything" fails here instead of at runtime.
         assert_eq!(DUPLICATE_EXPORT_FLAGS, (false, true));
+    }
+
+    fn project(id: &str, name: &str, deleted_at: Option<&str>) -> ProjectInfo {
+        ProjectInfo {
+            id: id.to_string(),
+            team_id: "team-1".to_string(),
+            name: name.to_string(),
+            is_default: false,
+            created_at: None,
+            modified_at: None,
+            deleted_at: deleted_at.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn active_project_summaries_drops_soft_deleted_projects() {
+        // `delete-project` is a soft delete: the project keeps appearing in
+        // `get-projects` with `deletedAt` set for ~7 days (see the doc
+        // comment on `ProjectInfo::deleted_at`). Shipping it to the picker
+        // would be its own bug — the user could "create a file" in a project
+        // that's on its way out.
+        let projects = vec![
+            project("p-alive", "Alive Project", None),
+            project("p-dead", "Dead Project", Some("2026-07-12T00:00:00Z")),
+        ];
+        let summaries = active_project_summaries(&projects);
+        assert_eq!(
+            summaries,
+            vec![ProjectSummary { id: "p-alive".to_string(), name: "Alive Project".to_string() }]
+        );
+    }
+
+    #[test]
+    fn active_project_summaries_keeps_all_when_none_are_deleted() {
+        let projects = vec![
+            project("p1", "One", None),
+            project("p2", "Two", None),
+        ];
+        let summaries = active_project_summaries(&projects);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, "p1");
+        assert_eq!(summaries[1].id, "p2");
+    }
+
+    #[test]
+    fn active_project_summaries_empty_input_yields_empty_output() {
+        assert!(active_project_summaries(&[]).is_empty());
     }
 
     #[test]
