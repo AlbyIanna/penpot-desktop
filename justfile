@@ -234,6 +234,22 @@ d0:
 d1:
     bash scripts/d1-offline.sh
 
+# D2 front-door gate (PLAN4 milestone D2). Drives the full project/file
+# lifecycle (create/rename/duplicate/move/delete) through
+# /__api/vault/manage/* only, asserts the folder tree reflects every
+# operation (polled, never on the first read), and asserts a deleted file
+# STAYS deleted across a full restart of the stack — the load-bearing check,
+# because that is exactly where the core invariant (disk resurrects anything
+# missing from the DB) and the delete verb collide. Also asserts `/dashboard`
+# is never loaded in the whole session (D0's navwatch mechanism, REQUIRES A
+# GUI SESSION like d0 — not CI-headless) and discharges D0's deferred
+# caveat: D0 only ever measured a seeded canary with no workspace open; this
+# opens a real file, lets it fully render, attempts a #/dashboard
+# navigation, and hashes the vault tree before/after. Dedicated ports
+# 9048/6510/5583/6526. Chained into `just e2e` — D2 lands product code.
+d2:
+    bash scripts/d2-home.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -244,12 +260,14 @@ routes-gate:
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
 # so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7,
-# D1). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1 boot their
-# own live stacks (dedicated ports) like the m/n suites, safe to chain at the
-# tail. n2-thumbs + e4-gallery + e7-plugins need the runtime bundle WITH
-# browsers (`bash scripts/fetch-penpot.sh --with-browsers`); d1-offline needs
-# the same bundled browsers (its behavioural surface checks drive a headless
-# browser too).
+# D1, D2). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2
+# boot their own live stacks (dedicated ports) like the m/n suites, safe to
+# chain at the tail. n2-thumbs + e4-gallery + e7-plugins need the runtime
+# bundle WITH browsers (`bash scripts/fetch-penpot.sh --with-browsers`);
+# d1-offline and d2-home need the same bundled browsers (their behavioural
+# checks drive a headless browser too). d2-home ALSO needs a GUI session for
+# its navwatch leg (same operational constraint as d0 — not CI-headless) —
+# unlike d0, d2 stays in the chain because it lands product code.
 # m4-artifact-test.sh stays separate: it needs a dmg build
 # (`bash scripts/build-dmg.sh` first) and carries the E4 offline
 # packaged-gallery leg (g4) + the E7 offline plugin-serving leg (g5).
@@ -276,6 +294,7 @@ e2e:
     bash scripts/e4-gallery.sh
     bash scripts/e7-plugins-spike.sh
     bash scripts/d1-offline.sh
+    bash scripts/d2-home.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).
