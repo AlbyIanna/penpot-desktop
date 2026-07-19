@@ -202,16 +202,41 @@ probe_case() {
     python3 "$NAVPROBE_PY" observe "$log" "$case"
 }
 
+# Proof-of-life gate shared by all three probe_case legs below. Every
+# successful launch records an initial-load observation line before anything
+# else happens (verified live: {"source":"on_navigation","url":"tauri://
+# localhost"}). If that baseline is absent, the probe never ran — a crash or
+# a timed-out boot — and the "observed" field for that case is NOT a real
+# measurement (d0_navprobe.py's observe treats a missing/empty log the same
+# as a genuine "not observed", which is exactly the ambiguity this check
+# exists to break). A case that didn't run must fail LOUDLY, distinctly from
+# a genuine negative finding, and must not contribute a verdict.
+require_probe_ran() {
+    local label="$1" json="$2"
+    local ran
+    ran=$(echo "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ran"))' 2>/dev/null || echo "ERROR")
+    if [ "$ran" = "True" ]; then
+        return 0
+    fi
+    fail "($label) PROBE DID NOT RUN — no baseline observation in the navwatch log (app crash or boot timeout, not a measurement); this is an infra failure, not a NO-GO finding"
+    return 1
+}
+
 # (a) CONTROL: a full document navigation MUST be observed. If this fails the
 #     harness itself is broken and every other result is meaningless.
 echo "-- case: full (control)"
 FULL=$(probe_case full "$FIRST_BOOT_TIMEOUT")
 echo "     full: $FULL"
-FULL_OBSERVED=$(echo "$FULL" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("observed"))' 2>/dev/null || echo "ERROR")
-if [ "$FULL_OBSERVED" = "True" ]; then
-    pass "(control) a full document navigation is observed by on_navigation"
+FULL_RAN=$(echo "$FULL" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ran"))' 2>/dev/null || echo "ERROR")
+if require_probe_ran "control" "$FULL"; then
+    FULL_OBSERVED=$(echo "$FULL" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("observed"))' 2>/dev/null || echo "ERROR")
+    if [ "$FULL_OBSERVED" = "True" ]; then
+        pass "(control) a full document navigation is observed by on_navigation"
+    else
+        fail "(control) full navigation NOT observed ($FULL_OBSERVED) — harness is broken, results below are meaningless"
+    fi
 else
-    fail "(control) full navigation NOT observed ($FULL_OBSERVED) — harness is broken, results below are meaningless"
+    FULL_OBSERVED="ERROR"
 fi
 
 # (b) THE CENTRAL QUESTION: is a same-document HASH change observed? Both
@@ -220,24 +245,35 @@ fi
 echo "-- case: hash (central)"
 HASH=$(probe_case hash "$REBOOT_TIMEOUT")
 echo "     hash: $HASH"
-HASH_OBSERVED=$(echo "$HASH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("observed"))' 2>/dev/null || echo "ERROR")
-if [ "$HASH_OBSERVED" = "True" ] || [ "$HASH_OBSERVED" = "False" ]; then
-    pass "(central) conclusive measurement obtained: same-document hash change observed=$HASH_OBSERVED"
-    if [ "$HASH_OBSERVED" = "True" ]; then
-        echo "     -> DATA: hash change IS observed; redirect would be possible (Task 7)"
+HASH_RAN=$(echo "$HASH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ran"))' 2>/dev/null || echo "ERROR")
+if require_probe_ran "central" "$HASH"; then
+    HASH_OBSERVED=$(echo "$HASH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("observed"))' 2>/dev/null || echo "ERROR")
+    if [ "$HASH_OBSERVED" = "True" ] || [ "$HASH_OBSERVED" = "False" ]; then
+        pass "(central) conclusive measurement obtained: same-document hash change observed=$HASH_OBSERVED"
+        if [ "$HASH_OBSERVED" = "True" ]; then
+            echo "     -> DATA: hash change IS observed; redirect would be possible (Task 7)"
+        else
+            echo "     -> DATA: hash change is NOT observed; ceiling is 'not the default' (NO-GO is legitimate)"
+        fi
     else
-        echo "     -> DATA: hash change is NOT observed; ceiling is 'not the default' (NO-GO is legitimate)"
+        fail "(central) INCONCLUSIVE — no definite true/false reading ($HASH_OBSERVED) despite proof-of-life; unexpected d0_navprobe.py output"
     fi
 else
-    fail "(central) INCONCLUSIVE — no definite true/false reading ($HASH_OBSERVED); probe page likely never loaded"
+    HASH_OBSERVED="ERROR"
 fi
 
 # (c) pushState (expected NOT observed on most engines — recorded, not
-#     asserted; the brief only wants this echoed as data).
+#     asserted; the brief only wants this echoed as data). Proof-of-life is
+#     still required: a crashed/timed-out boot must not be recorded as data.
 echo "-- case: pushstate (recorded, not asserted)"
 PUSH=$(probe_case pushstate "$REBOOT_TIMEOUT")
 echo "     pushstate: $PUSH"
-PUSH_OBSERVED=$(echo "$PUSH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("observed"))' 2>/dev/null || echo "ERROR")
+PUSH_RAN=$(echo "$PUSH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ran"))' 2>/dev/null || echo "ERROR")
+if require_probe_ran "pushstate" "$PUSH"; then
+    PUSH_OBSERVED=$(echo "$PUSH" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("observed"))' 2>/dev/null || echo "ERROR")
+else
+    PUSH_OBSERVED="ERROR"
+fi
 
 # (d) REALITY CHECK: does Penpot actually navigate via anchor hrefs? This leg
 #     only needs a normally reachable stack for the bundled offline chromium
@@ -286,7 +322,12 @@ fi
 # redirectWorks / workspaceIntact are Task 7's job (gated on hashObserved =
 # True); this task writes them as null so the shape matches the plan's
 # interface even though the measurement hasn't run yet.
-python3 - "$FINDINGS" "$FULL_OBSERVED" "$HASH_OBSERVED" "$PUSH_OBSERVED" "$USES_ANCHOR" "$PENPOT" <<'PY'
+#
+# probeRan.{full,hash,pushstate} records proof-of-life (baseline navwatch
+# observation seen) separately from the observed measurement itself, so a
+# reader of findings.json can tell "the probe ran and measured X" apart from
+# "the probe never ran" — the latter must never be read as a measurement.
+python3 - "$FINDINGS" "$FULL_OBSERVED" "$HASH_OBSERVED" "$PUSH_OBSERVED" "$USES_ANCHOR" "$PENPOT" "$FULL_RAN" "$HASH_RAN" "$PUSH_RAN" <<'PY'
 import json, sys
 
 def to_bool_or_none(s):
@@ -296,7 +337,7 @@ def to_bool_or_none(s):
         return False
     return None
 
-path, full_o, hash_o, push_o, anchor_o, penpot_raw = sys.argv[1:7]
+path, full_o, hash_o, push_o, anchor_o, penpot_raw, full_r, hash_r, push_r = sys.argv[1:10]
 try:
     penpot_json = json.loads(penpot_raw)
 except Exception:
@@ -314,6 +355,11 @@ findings = {
     "hashObserved": hash_observed,
     "pushstateObserved": to_bool_or_none(push_o),
     "usesAnchorHref": to_bool_or_none(anchor_o),
+    "probeRan": {
+        "full": to_bool_or_none(full_r),
+        "hash": to_bool_or_none(hash_r),
+        "pushstate": to_bool_or_none(push_r),
+    },
     "redirectWorks": None,
     "workspaceIntact": None,
     "verdict": verdict,
@@ -321,6 +367,7 @@ findings = {
         "redirectWorks": "not measured by task 6 — task 7 runs only if hashObserved is True",
         "workspaceIntact": "not measured by task 6 — task 7 runs only if hashObserved is True",
         "usesAnchorHrefCaveat": "d0_penpot_nav.cjs uses a fixed 4s post-load wait; a slower SPA render reads as a false negative here",
+        "probeRan": "proof-of-life per case (baseline navwatch observation seen); if false for a case, that case's *Observed field is null (infra failure, not a measurement) and its FAIL was already reported above",
     },
     "penpotNavRaw": penpot_json,
 }
