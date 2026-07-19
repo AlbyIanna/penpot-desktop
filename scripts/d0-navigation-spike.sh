@@ -17,7 +17,8 @@
 # result that lowers PLAN4 chapter 4's ceiling; it still passes the gate. The
 # GO/NO-GO verdict is written to findings.json as DATA, not asserted as a
 # direction. This task (6) does NOT compute `redirectWorks`/`workspaceIntact`
-# (Task 7, gated on hashObserved=True) — both are written as null here.
+# — Task 7 (below, legs (e)/(f)) fills them in when hashObserved is True;
+# they stay null otherwise (nothing to redirect).
 #
 # REQUIRES A GUI SESSION — it launches the real Tauri binary (penpot-desktop,
 # not headless) so `on_navigation` can be attached to a real window. Not
@@ -117,6 +118,40 @@ echo "   ports: proxy=$PROXY_PORT backend=$BACKEND_PORT pg=$POSTGRES_PORT valkey
 echo "   data:  $DATA_DIR"
 echo "   vault: $VAULT"
 echo "   work:  $WORK_DIR"
+
+# --- Task 7 setup: seed a vault canary up front -------------------------------
+# Deterministic recursive hash over every *.penpot dir under VAULT: dir names
+# (sorted) plus every contained file's path+content hash (sorted), folded
+# into one final digest. Same file set, same traversal order, both times —
+# this is what "byte-identical on disk" is checked against in leg (f) below.
+vault_hash() {
+    (
+        cd "$VAULT" || exit 1
+        {
+            find . -type d -name '*.penpot' | LC_ALL=C sort
+            find . -type f -path '*.penpot/*' -print0 \
+                | LC_ALL=C sort -z \
+                | xargs -0 shasum -a 256 2>/dev/null
+        } | shasum -a 256 | cut -d' ' -f1
+    )
+}
+
+# Seed a canary design directory into the vault up front, before ANY app
+# boot. This D0 gate never creates real Penpot content through the normal
+# RPC/UI path (no control surface is wired to the GUI binary — see the
+# reality-check comment below), so without a seeded file leg (f)'s integrity
+# check would only ever compare "nothing" to "nothing". Seeding it here,
+# ahead of the (a)-(d) legs' boots, gives the sync daemon's ordinary
+# reconciliation (every boot reconciles from the tree — control.rs) room to
+# touch/normalize it once and converge *before* the redirect leg's own boot.
+# HASH_BEFORE is taken later, right before leg (e), i.e. AFTER that
+# stabilization — so a back-to-back HASH_BEFORE/HASH_AFTER around the single
+# redirect-leg boot isolates just that boot's effect and can't conflate it
+# with the ordinary first-time reconciliation of a newly-seeded file.
+SEED_DIR="$VAULT/d0-integrity-canary.penpot"
+mkdir -p "$SEED_DIR/pages"
+printf '%s\n' '{"seed":"d0-integrity-canary","note":"must be byte-identical after the mid-session redirect"}' >"$SEED_DIR/manifest.json"
+printf '%s\n' '{"objects":{}}' >"$SEED_DIR/pages/page1.json"
 
 # --- pre-flight --------------------------------------------------------------
 [ -f "$NAVPROBE_PY" ] || { fail "probe runner missing: $NAVPROBE_PY"; exit 1; }
@@ -318,16 +353,95 @@ else
     fail "(reality-check) d0_penpot_nav.cjs did not complete successfully: $PENPOT"
 fi
 
+# (e) REDIRECT + (f) INTEGRITY (Task 7). Gated on hashObserved=True — with no
+# same-document hash change observed there is nothing to redirect, and
+# testing it would be meaningless (see CONTROLLER DECISION above). Mirrors
+# Task 6's own null-writing for these two findings.json fields.
+REDIRECT_WORKS="None"
+WORKSPACE_INTACT="None"
+REDIR_RAN="None"
+if [ "$HASH_OBSERVED" = "True" ]; then
+    # HASH_BEFORE is taken now — after the (a)-(d) boots above have already
+    # run against this same VAULT and had their chance to reconcile/stabilize
+    # the seeded canary — so it reflects steady state, not a first-touch.
+    HASH_BEFORE="$(vault_hash)"
+
+    # (e) REDIRECT: with the policy enabled, a #/dashboard navigation must be
+    #     cancelled and land on /__home instead. Proof-of-life first — an app
+    #     that never booted must FAIL LOUDLY as an infra failure, not be
+    #     recorded as "redirect didn't work" (same discipline as (a)-(c)).
+    echo "-- case: redirect (policy enabled)"
+    REDIR_LOG="$WORK_DIR/nav-redirect.jsonl"
+    REDIR_APPLOG="$WORK_DIR/app-redirect.log"
+    : >"$REDIR_LOG"
+    env PENPOT_LOCAL_DATA_DIR="$DATA_DIR" \
+        PENPOT_LOCAL_DESIGNS_DIR="$VAULT" \
+        PENPOT_LOCAL_PROXY_PORT="$PROXY_PORT" \
+        PENPOT_LOCAL_BACKEND_PORT="$BACKEND_PORT" \
+        PENPOT_LOCAL_POSTGRES_PORT="$POSTGRES_PORT" \
+        PENPOT_LOCAL_VALKEY_PORT="$VALKEY_PORT" \
+        PENPOT_LOCAL_NAVWATCH_LOG="$REDIR_LOG" \
+        PENPOT_LOCAL_NAVWATCH_REDIRECT=1 \
+        PENPOT_LOCAL_START_URL="${BASE}/__navprobe?run=hash" \
+        "$APP_BIN" >"$REDIR_APPLOG" 2>&1 &
+    APP_PID=$!
+    if wait_for_log_line "$REDIR_LOG" "/__navprobe?run=hash" "$REBOOT_TIMEOUT"; then
+        sleep "$SETTLE_SECS"
+    else
+        echo "   -- boot/nav log tail --" >&2; tail -25 "$REDIR_APPLOG" >&2 || true
+    fi
+    stop_app
+    REDIRECT_JSON=$(python3 "$NAVPROBE_PY" observe "$REDIR_LOG" hash)
+    echo "     redirect: $REDIRECT_JSON"
+    if require_probe_ran "redirect" "$REDIRECT_JSON"; then
+        REDIR_RAN="True"
+        if grep -q '__home' "$REDIR_LOG"; then
+            REDIRECT_WORKS="True"
+            pass "(e/redirect) a #/dashboard navigation was cancelled by the policy and landed on /__home"
+        else
+            REDIRECT_WORKS="False"
+            fail "(e/redirect) redirect policy enabled but /__home was never reached"
+        fi
+    else
+        REDIR_RAN="False"
+    fi
+
+    # (f) INTEGRITY: the vault must be byte-identical across the mid-session
+    #     cancel+redirect — folder-is-truth is this project's P0 (CLAUDE.md)
+    #     and a navigation trick must not dent it. Gated on the redirect
+    #     leg's own proof-of-life: if that app never booted, the vault was
+    #     never touched either way and HASH_AFTER == HASH_BEFORE would be a
+    #     vacuous pass, not a real measurement — so this must fail loudly
+    #     too rather than silently record a (meaningless) true.
+    if [ "$REDIR_RAN" = "True" ]; then
+        HASH_AFTER="$(vault_hash)"
+        if [ "$HASH_AFTER" = "$HASH_BEFORE" ]; then
+            WORKSPACE_INTACT="True"
+            pass "(f/integrity) vault tree byte-identical across the mid-session redirect"
+        else
+            WORKSPACE_INTACT="False"
+            fail "(f/integrity) vault tree CHANGED across the redirect (before=$HASH_BEFORE after=$HASH_AFTER)"
+        fi
+    else
+        WORKSPACE_INTACT="None"
+        fail "(f/integrity) SKIPPED — the redirect leg (e) never ran (no proof-of-life), so before/after is not a real measurement; this is an infra failure carried over from (e), not a passing (or failing) result"
+    fi
+else
+    echo "-- skipping redirect + integrity legs: hashObserved != True (nothing to redirect, see CONTROLLER DECISION above)"
+fi
+
 # --- findings.json -----------------------------------------------------------
-# redirectWorks / workspaceIntact are Task 7's job (gated on hashObserved =
-# True); this task writes them as null so the shape matches the plan's
-# interface even though the measurement hasn't run yet.
+# redirectWorks / workspaceIntact (Task 7, legs (e)/(f) above) are real
+# measurements when hashObserved is True; they stay null when there was
+# nothing to redirect, or when the redirect leg itself never got proof of
+# life (an infra failure, not a "false" measurement — see (f) above).
 #
-# probeRan.{full,hash,pushstate} records proof-of-life (baseline navwatch
-# observation seen) separately from the observed measurement itself, so a
-# reader of findings.json can tell "the probe ran and measured X" apart from
-# "the probe never ran" — the latter must never be read as a measurement.
-python3 - "$FINDINGS" "$FULL_OBSERVED" "$HASH_OBSERVED" "$PUSH_OBSERVED" "$USES_ANCHOR" "$PENPOT" "$FULL_RAN" "$HASH_RAN" "$PUSH_RAN" <<'PY'
+# probeRan.{full,hash,pushstate,redirect} records proof-of-life (baseline
+# navwatch observation seen) separately from the observed measurement
+# itself, so a reader of findings.json can tell "the probe ran and measured
+# X" apart from "the probe never ran" — the latter must never be read as a
+# measurement.
+python3 - "$FINDINGS" "$FULL_OBSERVED" "$HASH_OBSERVED" "$PUSH_OBSERVED" "$USES_ANCHOR" "$PENPOT" "$FULL_RAN" "$HASH_RAN" "$PUSH_RAN" "$REDIRECT_WORKS" "$WORKSPACE_INTACT" "$REDIR_RAN" <<'PY'
 import json, sys
 
 def to_bool_or_none(s):
@@ -337,7 +451,7 @@ def to_bool_or_none(s):
         return False
     return None
 
-path, full_o, hash_o, push_o, anchor_o, penpot_raw, full_r, hash_r, push_r = sys.argv[1:10]
+path, full_o, hash_o, push_o, anchor_o, penpot_raw, full_r, hash_r, push_r, redirect_o, workspace_o, redirect_r = sys.argv[1:13]
 try:
     penpot_json = json.loads(penpot_raw)
 except Exception:
@@ -359,13 +473,12 @@ findings = {
         "full": to_bool_or_none(full_r),
         "hash": to_bool_or_none(hash_r),
         "pushstate": to_bool_or_none(push_r),
+        "redirect": to_bool_or_none(redirect_r),
     },
-    "redirectWorks": None,
-    "workspaceIntact": None,
+    "redirectWorks": to_bool_or_none(redirect_o),
+    "workspaceIntact": to_bool_or_none(workspace_o),
     "verdict": verdict,
     "notes": {
-        "redirectWorks": "not measured by task 6 — task 7 runs only if hashObserved is True",
-        "workspaceIntact": "not measured by task 6 — task 7 runs only if hashObserved is True",
         "usesAnchorHrefCaveat": "d0_penpot_nav.cjs uses a fixed 4s post-load wait; a slower SPA render reads as a false negative here",
         "probeRan": "proof-of-life per case (baseline navwatch observation seen); if false for a case, that case's *Observed field is null (infra failure, not a measurement) and its FAIL was already reported above",
     },
