@@ -14,7 +14,7 @@
 //! scanner already skips (daemon walk, FS watcher, vault index), so trashed
 //! files are inert without any new exclusion logic.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -54,6 +54,22 @@ pub fn trash_file(vault_root: &Path, file_id: &str, stamp: &str) -> Result<Trash
         .ok_or_else(|| anyhow!("file id {file_id} is not in the manifest"))?;
     let rel = entry.path.clone();
 
+    // The manifest is a plain JSON file living in the user's own folder tree
+    // (the conflict rule assumes the user can hand-edit things on disk), and
+    // `trash_file` is the only thing standing between that field and a
+    // filesystem move. Every writer today goes through `sanitize_component`
+    // in `crates/sync-daemon/src/paths.rs`, but this function must not rely
+    // on that discipline: `vault_root.join(rel)` with an absolute `rel`
+    // discards `vault_root` entirely, and a `..`-laden `rel` walks out of
+    // it. Reject before any filesystem work (and before touching the
+    // manifest) so a bad entry can neither move anything nor half-complete
+    // by dropping its own entry.
+    if !is_safe_vault_rel(&rel) {
+        return Err(anyhow!(
+            "manifest entry for {file_id} has an unsafe path, refusing to trash it: {rel:?}"
+        ));
+    }
+
     let src = vault_root.join(&rel);
     let dest = unique_dest(vault_root, &rel, stamp)?;
 
@@ -71,8 +87,30 @@ pub fn trash_file(vault_root: &Path, file_id: &str, stamp: &str) -> Result<Trash
     Ok(TrashOutcome { trashed_path: dest, former_rel_path: rel })
 }
 
+/// True iff `rel` is a safe within-vault relative path: not empty, not
+/// absolute, and with no `.`/`..`/prefix components, so `vault_root.join`
+/// can never be tricked into leaving the vault. Mirrors
+/// `apps/desktop/src/home.rs::is_safe_vault_rel` (kept as a private copy
+/// here rather than a shared dependency — `sync-core` must not depend on
+/// `apps/desktop`).
+fn is_safe_vault_rel(rel: &str) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    let p = Path::new(rel);
+    p.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// `<vault>/.trash/<stamp>-<basename>` , suffixed if that already exists so a
 /// second delete of the same name in the same second cannot clobber the first.
+///
+/// The exists-check-then-rename below is not atomic: two concurrent
+/// `trash_file` calls picking the same stamp+name could both observe the
+/// slot as free before either renames into it. That's a safe failure mode,
+/// not a data-loss one — `std::fs::rename` never merges a directory into an
+/// existing one, so the loser's `rename` simply errors instead of silently
+/// clobbering the winner's trashed copy. Do not "fix" this with a scheme
+/// that could overwrite instead of failing.
 fn unique_dest(vault_root: &Path, rel: &str, stamp: &str) -> Result<PathBuf> {
     let base = Path::new(rel)
         .file_name()
@@ -185,5 +223,119 @@ mod tests {
         trash_file(root, "f1", "20260719-120000").unwrap();
         let m = Manifest::load(root).unwrap().unwrap();
         assert!(!m.files.contains_key("f1"));
+    }
+
+    // -- manifest path validation: the manifest is a plain JSON file living
+    // in the user's own folder tree (see the conflict rule), so a corrupted
+    // or hand-edited entry must not be able to make trash_file touch
+    // anything outside the vault. These must fail against the unfixed code:
+    // `vault_root.join(rel)` with an absolute `rel` discards `vault_root`
+    // entirely, and a `..`-laden `rel` walks out of it.
+
+    #[test]
+    fn absolute_manifest_path_is_rejected_and_outside_dir_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A real directory *outside* the vault that an unvalidated absolute
+        // path could resolve to and move.
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), b"do not move me").unwrap();
+
+        let mut m = Manifest::default();
+        m.files.insert(
+            "f1".to_string(),
+            ManifestEntry {
+                path: victim.to_string_lossy().to_string(), // absolute path
+                project_id: "p1".into(),
+                project_name: "Proj".into(),
+                revn: 1,
+                db_modified_at: String::new(),
+                last_synced_hash: "h".into(),
+                last_synced_at: "2026-07-19T00:00:00Z".into(),
+            },
+        );
+        m.save(root).unwrap();
+
+        let err = trash_file(root, "f1", "20260719-120000")
+            .expect_err("absolute manifest path must be rejected");
+        assert!(
+            err.to_string().contains(&victim.to_string_lossy().to_string())
+                || err.to_string().to_lowercase().contains("absolute"),
+            "error should name the offending path: {err}"
+        );
+
+        // The outside directory must still exist, untouched.
+        assert!(victim.exists(), "directory outside the vault was moved/removed");
+        assert!(victim.join("keep.txt").exists());
+
+        // A rejected delete must not half-complete: the manifest entry
+        // survives.
+        let m2 = Manifest::load(root).unwrap().unwrap();
+        assert!(
+            m2.files.contains_key("f1"),
+            "manifest entry was dropped despite the trash being rejected"
+        );
+    }
+
+    #[test]
+    fn dotdot_manifest_path_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A sibling directory next to the vault root that `..` could escape
+        // into.
+        std::fs::create_dir_all(root.join("../escaped-victim")).ok();
+
+        seed(root, "f1", "Proj/hello.penpot");
+        // Overwrite with a `..`-laden path.
+        let mut m = Manifest::load(root).unwrap().unwrap();
+        m.files.get_mut("f1").unwrap().path = "../escaped-victim".to_string();
+        m.save(root).unwrap();
+
+        let err = trash_file(root, "f1", "20260719-120000")
+            .expect_err("a `..`-laden manifest path must be rejected");
+        assert!(
+            err.to_string().contains("..") || err.to_string().to_lowercase().contains("parent"),
+            "error should name the offending path: {err}"
+        );
+
+        let m2 = Manifest::load(root).unwrap().unwrap();
+        assert!(
+            m2.files.contains_key("f1"),
+            "manifest entry was dropped despite the trash being rejected"
+        );
+
+        std::fs::remove_dir_all(root.join("../escaped-victim")).ok();
+    }
+
+    #[test]
+    fn empty_manifest_path_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut m = Manifest::default();
+        m.files.insert(
+            "f1".to_string(),
+            ManifestEntry {
+                path: String::new(),
+                project_id: "p1".into(),
+                project_name: "Proj".into(),
+                revn: 1,
+                db_modified_at: String::new(),
+                last_synced_hash: "h".into(),
+                last_synced_at: "2026-07-19T00:00:00Z".into(),
+            },
+        );
+        m.save(root).unwrap();
+
+        let err = trash_file(root, "f1", "20260719-120000")
+            .expect_err("an empty manifest path must be rejected");
+        assert!(!err.to_string().is_empty());
+
+        let m2 = Manifest::load(root).unwrap().unwrap();
+        assert!(
+            m2.files.contains_key("f1"),
+            "manifest entry was dropped despite the trash being rejected"
+        );
     }
 }
