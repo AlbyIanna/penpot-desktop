@@ -19,6 +19,12 @@ pub const PENPOT_DIR_SUFFIX: &str = ".penpot";
 /// auto-deleted — the user resolves and removes them manually.
 pub const CONFLICT_MARKER: &str = ".conflict-";
 
+// Source of truth for the on-disk component length cap. `apps/desktop`'s
+// `manage::valid_name` mirrors this value in its own `MAX_NAME_LEN` (it
+// can't reference this constant directly — it isn't `pub`) so that names
+// accepted by the API can never exceed what this sanitiser would truncate
+// on disk. If this value changes, update `MAX_NAME_LEN` in
+// `apps/desktop/src/manage.rs` to match.
 const MAX_COMPONENT_CHARS: usize = 100;
 
 /// Is this directory name a conflict copy (ends with `.penpot` AND contains

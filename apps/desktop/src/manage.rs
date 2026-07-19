@@ -6,6 +6,14 @@
 //! normal poll. Delete is different (it must also touch the vault) and is a
 //! later task — deliberately not implemented here.
 //!
+//! Names are validated by [`valid_name`], not sanitised: a name is rejected
+//! outright rather than silently rewritten, so the name on screen always
+//! matches the name the daemon later writes to disk. That guarantee is
+//! enforced by round-tripping every candidate name through the daemon's own
+//! `sync_daemon::paths::sanitize_component` — the same function that turns
+//! a project/file name into a directory name on export — and rejecting
+//! anything it would change.
+//!
 //! Route shape and registration follow `packages.rs` (the E2/E7 precedent):
 //! a `pub fn router(Arc<State>)` merged into the proxy's extra router in
 //! `lib.rs::boot`, JSON in / JSON out, blocking work in `spawn_blocking`
@@ -24,9 +32,13 @@ use penpot_rpc::{Auth, PenpotClient};
 use serde::Deserialize;
 use serde_json::json;
 
-/// Longest name we accept. Penpot itself is more permissive; this is about
-/// keeping the derived on-disk directory name sane across filesystems.
-const MAX_NAME_LEN: usize = 200;
+/// Longest name we accept. Must match the sync daemon's own cap
+/// (`MAX_COMPONENT_CHARS` in `crates/sync-daemon/src/paths.rs`) — that
+/// constant is not `pub`, so this is a second number that has to be kept in
+/// sync by hand. If the daemon's cap changes, update this one too; the
+/// round-trip check below (`sanitize_component(&name) != name`) will start
+/// failing tests here if the two ever drift.
+const MAX_NAME_LEN: usize = 100;
 
 pub struct ManageState {
     pub backend_base: String,
@@ -50,9 +62,16 @@ impl ManageState {
 /// Validate a user-supplied project/file name.
 ///
 /// This name becomes a DIRECTORY NAME in the user's folder tree once the
-/// daemon exports it, so separators and traversal segments are rejected here
-/// rather than sanitised — silently rewriting what the user typed would make
-/// the name on screen disagree with the name on disk.
+/// daemon exports it, so names are rejected here rather than sanitised —
+/// silently rewriting what the user typed would make the name on screen
+/// disagree with the name on disk. The explicit checks below give clear,
+/// specific error messages for the common cases (empty, separators,
+/// traversal, control characters); the final check is the backstop that
+/// actually guarantees the invariant: it re-runs the name through
+/// `sync_daemon::paths::sanitize_component` — the exact function the daemon
+/// uses when it materialises the directory — and rejects anything that
+/// isn't already a fixed point of it. That keeps this function honest by
+/// construction instead of duplicating the daemon's rewrite rules.
 pub fn valid_name(raw: &str) -> Result<String, String> {
     let name = raw.trim();
     if name.is_empty() {
@@ -69,6 +88,9 @@ pub fn valid_name(raw: &str) -> Result<String, String> {
     }
     if name.chars().any(|c| c.is_control()) {
         return Err("name must not contain control characters".into());
+    }
+    if sync_daemon::paths::sanitize_component(name) != name {
+        return Err("name contains characters that cannot be used in a folder name".into());
     }
     Ok(name.to_string())
 }
@@ -212,5 +234,38 @@ mod tests {
     fn valid_name_rejects_control_characters_and_nul() {
         assert!(valid_name("a\nb").is_err());
         assert!(valid_name("a\0b").is_err());
+    }
+
+    #[test]
+    fn valid_name_rejects_names_the_daemon_would_rewrite() {
+        // Colon is rewritten to '-' by sanitize_component on disk.
+        assert!(valid_name("Client: Q1").is_err(), "accepted a name containing ':'");
+        // Leading dots are stripped by sanitize_component on disk.
+        assert!(valid_name("...urgent").is_err(), "accepted a name with leading dots");
+        // sanitize_component caps at MAX_COMPONENT_CHARS (100); anything
+        // longer is silently truncated on disk.
+        let too_long = "x".repeat(150);
+        assert!(valid_name(&too_long).is_err(), "accepted a 150-char name");
+    }
+
+    #[test]
+    fn valid_name_still_accepts_ordinary_names() {
+        assert!(valid_name("Homepage").is_ok());
+        assert!(valid_name("Client X — v2").is_ok());
+    }
+
+    #[test]
+    fn valid_name_accepted_names_survive_daemon_sanitisation_unchanged() {
+        // Anything valid_name accepts must round-trip through the daemon's
+        // own sanitiser unchanged — that is the actual guarantee this
+        // module claims to provide.
+        for n in ["Homepage", "Client X — v2", "Q1 Report", "日本語のファイル名", "a-b_c.d"] {
+            let accepted = valid_name(n).unwrap();
+            assert_eq!(
+                sync_daemon::paths::sanitize_component(&accepted),
+                accepted,
+                "accepted name {accepted:?} does not survive sanitize_component unchanged"
+            );
+        }
     }
 }
