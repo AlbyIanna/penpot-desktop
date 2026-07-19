@@ -68,14 +68,60 @@ function isLoopback(u) {
 // to load has no signup form either — so "no form found" would report the
 // surface as GONE and turn the gate green while the flag did nothing.
 //
-// Instead of a fixed sleep followed by a single check, this polls the same
-// predicate (>20 elements under <body>) so a fast, healthy render doesn't
-// waste the whole budget, while a page that never settles still gets the
-// full generous window before we give up. It requires two consecutive
-// positive polls ~500ms apart before trusting the signal, since Penpot's
-// login-card placeholder is itself "rendered" by a bare element-count check
-// — the point of the generous window is to wait it out, not just detect any
-// DOM.
+// A bare ">20 elements under <body>" count is NOT proof of render: Penpot's
+// login-card placeholder — shown while the SPA resolves the session — is
+// itself a large SVG with far more than 20 nodes, so a generic element-count
+// check is satisfied by the very placeholder this proof exists to wait out.
+// That let templatesSection get measured against the placeholder, find no
+// "templates" text on it, and report "gone" — a vacuous PASS of the one leg
+// that must fail when the flag stops working (Task 6 finding 1).
+//
+// So this polls for a ROUTE-IDENTIFYING marker instead: a CSS class emitted
+// only by the top-level component of the specific route under test (the
+// auth pages' shared "auth-content" wrapper; the dashboard's top-level
+// "dashboard" wrapper, which contains the sidebar/projects grid). Penpot's
+// placeholder never carries these classes, so satisfying this check is proof
+// that route — not just "some DOM" — actually rendered. If the marker never
+// appears within the budget, this returns false and the caller reports
+// "inconclusive": a generic "the DOM has nodes" signal must never be
+// sufficient to conclude a surface is absent.
+async function waitForMarker(page, selector, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      if (await page.$(selector)) return true;
+    } catch {
+      // Mid-navigation query errors are expected while the route swaps out
+      // — keep polling rather than treating this as "marker absent".
+    }
+    await page.waitForTimeout(500);
+  }
+  try {
+    return (await page.$(selector)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+// Route-identifying markers, one per surface under test. Verified (Task 6
+// finding 1) against the actual bundled build: main-auth.js emits
+// `className:"main_ui_auth__auth-content"` on the shared wrapper rendered by
+// every `#/auth/*` sub-route (login, register, recovery); main-dashboard.js
+// emits `className:"main_ui_dashboard__dashboard"` on the top-level wrapper
+// that contains the sidebar and the projects grid. Both are literal
+// CSS-module class names with no build-time hash suffix, and neither is
+// present on the transient login-card placeholder.
+const AUTH_PAGE_MARKER = ".main_ui_auth__auth-content";
+const DASHBOARD_MARKER = ".main_ui_dashboard__dashboard";
+
+// A fixed sleep followed by a single generic check "silently lies" (see
+// docs/milestones/d1/baseline.md) — this polls the same generic predicate
+// (>20 elements under <body>) so a fast render doesn't waste the whole
+// budget. It is ONLY used before the one-shot `/__bootstrap` navigation
+// below, where no gone/present/inconclusive verdict is derived from the
+// result — it exists solely to give auto-login a generous, signal-driven
+// head start before navigating onward. Every verdict-bearing check below
+// uses waitForMarker(), never this.
 async function waitForStableRender(page, timeoutMs) {
   const start = Date.now();
   let prevOk = false;
@@ -167,7 +213,7 @@ async function main() {
     // treat "inconclusive" as a LOUD FAILURE, never as success.
     await page.goto(`${BASE}/#/auth/register`, { waitUntil: "domcontentloaded" });
     let registration;
-    if (!(await waitForStableRender(page, SETTLE))) {
+    if (!(await waitForMarker(page, AUTH_PAGE_MARKER, SETTLE))) {
       registration = "inconclusive";
     } else {
       const pw = await page.$$eval(
@@ -182,7 +228,7 @@ async function main() {
     // authenticated SPA redirect to its own team-scoped dashboard route.
     await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
     let templatesSection;
-    if (!(await waitForStableRender(page, SETTLE))) {
+    if (!(await waitForMarker(page, DASHBOARD_MARKER, SETTLE))) {
       templatesSection = "inconclusive";
     } else {
       const hasTemplates = await page.$$eval("*", (els) =>
@@ -200,7 +246,7 @@ async function main() {
     // above, not a second mechanism.
     await page.goto(`${BASE}/#/auth/login`, { waitUntil: "domcontentloaded" });
     let loginForm;
-    if (!(await waitForStableRender(page, SETTLE))) {
+    if (!(await waitForMarker(page, AUTH_PAGE_MARKER, SETTLE))) {
       loginForm = "inconclusive";
     } else {
       const pw = await page.$$eval("input[type='password']", (e) => e.length);

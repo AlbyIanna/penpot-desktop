@@ -13,7 +13,19 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "0:0:0:0:0:0:0:1", "localhost", "*", ""}
 
 # lsof NAME column looks like: 127.0.0.1:6508->127.0.0.1:54321 (ESTABLISHED)
 #                          or  [::1]:5581 (LISTEN)
-PEER_RE = re.compile(r"->\[?([^\]\s]+?)\]?:(\d+)")
+#                          or  ->[::1]:54321 (ESTABLISHED)         (IPv6 peer)
+#                          or  ->[2001:db8::1]:443 (ESTABLISHED)   (IPv6 peer)
+# The peer's own host:port pair is always the bit AFTER "->". A bracketed
+# IPv6 literal ("[::1]:54321") must be matched as one alternative (group 1,
+# the address WITHOUT the brackets) so the brackets are never absorbed into
+# the host string — a naive `\[?...\]?:` (non-greedy, brackets each
+# optional independently) matches the LAST ":" in the address as the
+# host/port separator instead of the outer "]:", so "->[::1]:54321" parsed
+# as host=":", port=1: a genuine loopback IPv6 connection reported as
+# non-loopback (spurious FAIL, never a false clean, but a latent flake now
+# that this gate is chained into `just e2e` — Task 6 finding 2). The
+# unbracketed alternative (group 2) covers plain hostnames/IPv4 as before.
+PEER_RE = re.compile(r"->(?:\[([^\]]+)\]|([^\s:]+)):(\d+)")
 
 # A dotted-quad IPv4 literal in 127.0.0.0/8, e.g. "127.0.0.1" or "127.1.2.3".
 # Each octet must be a real 0-255 value with no extra characters, so this
@@ -38,7 +50,10 @@ def parse(text):
         m = PEER_RE.search(line)
         if not m:
             continue
-        host, port = m.group(1), m.group(2)
+        # group(1) is the bracketed-IPv6 alternative, group(2) the plain
+        # hostname/IPv4 alternative — exactly one of the two matched.
+        host = m.group(1) if m.group(1) is not None else m.group(2)
+        port = m.group(3)
         entry = {"host": host, "port": int(port)}
         conns.append(entry)
         if not _host_is_loopback(host):
@@ -56,6 +71,21 @@ def _selftest():
     assert len(out["connections"]) == 2, out
     assert out["nonLoopback"] == [{"host": "142.250.1.1", "port": 443}], out
     assert parse("")["nonLoopback"] == []
+
+    # IPv6 peers, bracketed (Task 6 finding 2): a bracketed IPv6 loopback
+    # peer must parse to host="::1" (brackets stripped) and be classified
+    # loopback, not swallowed into a bogus host=":" port=1 by a naive
+    # optional-bracket regex. A bracketed EXTERNAL IPv6 peer must parse to
+    # the full address and be classified non-loopback.
+    ipv6_sample = "\n".join([
+        "java 123 u IPv6 TCP [::1]:6508->[::1]:54321 (ESTABLISHED)",
+        "penpot 789 u IPv6 TCP [::1]:53346->[2001:db8::1]:443 (ESTABLISHED)",
+    ])
+    ipv6_out = parse(ipv6_sample)
+    assert {"host": "::1", "port": 54321} in ipv6_out["connections"], ipv6_out
+    assert {"host": "2001:db8::1", "port": 443} in ipv6_out["connections"], ipv6_out
+    assert {"host": "::1", "port": 54321} not in ipv6_out["nonLoopback"], ipv6_out
+    assert {"host": "2001:db8::1", "port": 443} in ipv6_out["nonLoopback"], ipv6_out
 
     # Positive cases: genuine loopback literals/names must be classified
     # loopback (safe, excluded from nonLoopback).

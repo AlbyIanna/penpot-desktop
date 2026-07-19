@@ -343,7 +343,8 @@ if [ "$NAVWATCH_RC" -eq 0 ] &&
     grep -q "test navwatch::tests::auth_family_is_cancelled_even_with_redirect_disabled ... ok" "$NAVWATCH_LOG" &&
     grep -q "test navwatch::tests::auth_family_is_cancelled_with_redirect_enabled_too ... ok" "$NAVWATCH_LOG" &&
     grep -q "test navwatch::tests::dashboard_and_settings_are_allowed_with_redirect_disabled ... ok" "$NAVWATCH_LOG" &&
-    grep -q "test navwatch::tests::prefix_match_still_redirects_exact_and_subpath ... ok" "$NAVWATCH_LOG"; then
+    grep -q "test navwatch::tests::prefix_match_still_redirects_exact_and_subpath ... ok" "$NAVWATCH_LOG" &&
+    grep -q "test navwatch::tests::prefix_match_has_boundary_check ... ok" "$NAVWATCH_LOG"; then
     pass "(navwatch) navwatch::decide cancels-and-redirects the #/auth family UNCONDITIONALLY (no env var), while #/dashboard and #/settings stay open by default as measurement-only"
     echo "     NOTE: no test is literally named \"register\" — decide()'s boundary-checked prefix"
     echo "     match on the #/auth family (exact match OR a \"/\" subpath) is the SAME code path for"

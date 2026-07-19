@@ -14,7 +14,14 @@ const PW = process.env.PLAYWRIGHT_MODULE ||
 const { chromium } = require(PW);
 
 const VIEWPORT = { width: 1280, height: 800 };
-const SETTLE_MS = Number(process.env.SHOTS_SETTLE_MS || 3500);
+// Both docs/milestones/d1/README.md and baseline.md tell readers to
+// re-capture with `SETTLE_MS=15000` — but this used to read ONLY
+// `SHOTS_SETTLE_MS`, so the documented command silently re-captured at the
+// 3.5s default baseline.md itself documents as producing WRONG screenshots
+// (the dashboard renders as Penpot's login-card placeholder at 3.5s). Accept
+// SETTLE_MS (checked first, so it wins when both are set) and keep
+// SHOTS_SETTLE_MS working for anything already relying on it (Task 6 finding 4).
+const SETTLE_MS = Number(process.env.SETTLE_MS || process.env.SHOTS_SETTLE_MS || 3500);
 
 (async () => {
   const [base, outDir, ...pairs] = process.argv.slice(2);

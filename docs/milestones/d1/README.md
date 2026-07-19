@@ -29,7 +29,7 @@ defence-in-depth we cannot test.
 | Flag | Why | Verified effect |
 |---|---|---|
 | `disable-dashboard-templates-section` | Links to cloud-hosted content | Carousel gone |
-| `disable-google-fonts-provider` | A live network dependency | Removed as an egress source |
+| `disable-google-fonts-provider` | A live network dependency | NOT behaviourally verified in D1 — its surface is the workspace font picker, and the gate never opens a workspace (see "Known limits" below) |
 | `disable-login-with-password` | No second account to log into | Login form has no fields |
 | `disable-registration` | Nobody to register | Removes the login-page link — and, via the flag above, the signup form too |
 
@@ -91,10 +91,17 @@ These are the lessons that actually cost time, encoded so they cannot recur:
    to load has no signup form either; reporting that as `gone` would turn the gate green
    while the flag did nothing. `inconclusive` fails loudly, worded as an infrastructure
    failure rather than a real finding.
-2. **Effect, not setting.** Every flag is asserted twice: the token is present in the served
-   `config.js`, *and* the behavioural consequence is observed. Upstream can rename a flag,
-   and a set-but-ignored flag would leave a naive gate permanently green while the experience
-   silently degrades.
+2. **Effect, not setting — for the flags we can actually check.** All four flags are asserted
+   for presence in the served `config.js`, but that alone is never trusted: a renamed or
+   silently-ignored upstream flag would still be "served" while the surface came back. Only
+   **two of the four** — `disable-dashboard-templates-section` and `disable-login-with-password`
+   — get the second, behavioural assertion: the SPA is observed and the surface is required to
+   be actually gone, not just flagged. `disable-registration` is also observed behaviourally,
+   but the accepted outcome there is `present` (see "Two findings worth recording" below), so
+   that observation is not a removal check. `disable-google-fonts-provider` has **no**
+   behavioural check at all in D1 — its surface is the workspace font picker, and this gate
+   never opens a workspace (see "Known limits"). So this lesson closes the "set but ignored"
+   risk for two of the four flags, not all four.
 3. **No vacuous passes.** "Zero non-loopback connections" is only trusted after confirming a
    sample actually happened — the gate requires a non-zero count of *loopback* connections
    and a non-zero request count first. An empty measurement and a clean measurement look
