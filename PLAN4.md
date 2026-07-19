@@ -78,7 +78,12 @@ Every milestone lands one `scripts/d<N>-*.sh` gate (run-twice idempotent, dedica
 `just e2e` (as E1–E4 and E7 were); a **pure-verdict spike** that lands no product code is not (as E5
 and E6 were) — the ladder has nothing of its to regress. So D1–D6 chain; D0 does not.
 
-### D0 — SPIKE: navigation control (gates the chapter's ambition)
+### D0 — SPIKE: navigation control (gates the chapter's ambition) — ✅ DONE (verdict GO)
+Shipped in the D0 navigation-spike PR. `on_navigation` does observe hash-only changes, a
+`#/dashboard` navigation was cancelled and landed on `/__home`, and the vault tree was
+byte-identical across the redirect. Caveat carried forward: that integrity check ran with **no
+workspace open** (it hashed a seeded canary), so D2 must re-assert it with a real file open.
+
 Goal: determine whether the webview can observe and redirect SPA **hash** navigation without touching
 the SPA. Probe Tauri v2 navigation events on hash-only changes and the fallbacks (URL polling, custom
 protocol). Hard constraint: the observation mechanism must itself be invariant-clean — injecting JS to
@@ -88,7 +93,28 @@ with a GO/NO-GO. On GO: a live capture showing a `#/dashboard` navigation landin
 instead, and evidence that redirecting mid-session leaves the workspace intact. On NO-GO: the ceiling
 is documented honestly ("not the default, one click away") and D6 scopes down accordingly. Green twice.
 
-### D1 — Offline & config hardening (+ the "before" baseline)
+### D1 — Offline & config hardening (+ the "before" baseline) — ✅ DONE
+Shipped in the D1 offline-hardening PR; write-up in `docs/milestones/d1/README.md`. Gate
+`just d1` green three times (17/0), chained into `just e2e`. Negative control run: re-enabling
+the flags flips every surface verdict `gone → present`, so the gate demonstrably can fail.
+
+**Two deviations from the exit criteria below, deliberate and recorded:**
+
+1. **No `env -i` + poisoned-proxy harness.** Egress is measured by two observers instead — the
+   SPA's own Chromium request log and an `lsof -nP -i` sample of the supervised process tree,
+   with a loopback predicate hardened against prefix-match bypasses (`127.0.0.1.evil.com`).
+   This is weaker in one specific way, stated in the gate's output: the socket check is a
+   single sample, not a proof of absence. A connection that opens and closes between polls
+   could be missed. A poisoned-proxy harness would catch attempts rather than established
+   connections; worth revisiting in D6's residue audit.
+2. **"The corresponding surfaces are absent" is not true for all four flags.** The registration
+   route and the account settings page survive. Registration cannot be closed backend-side —
+   our own provisioning calls that RPC on every DB wipe, the core invariant — so it is closed
+   by the navigation policy instead, and `#/auth/*` is now cancelled unconditionally (D0 had
+   shipped that policy dormant). Settings has no flag at all; it is D2's problem.
+   `disable-google-fonts-provider` is served but **not** behaviourally verified, because its
+   surface is the workspace font picker and this gate never opens a workspace.
+
 Goal: set every Penpot flag that deletes a cloud surface, then make the offline promise a test. Audit
 `login-with-password` against the `/__bootstrap` auto-login path before disabling it. Build
 `scripts/shots.sh` (below) and capture the **before** baseline — today's launch-into-dashboard,
