@@ -1354,8 +1354,56 @@ impl Engine {
     // Export pipeline (DB → disk), shared by poll loop and reconciliation
     // ------------------------------------------------------------------
 
+    /// D2: follow a DB rename/move on disk. Thin wrapper around
+    /// [`paths::relocate_tracked_file`] (the actual decision + fs move,
+    /// unit-tested directly in `paths.rs`) that persists the manifest on
+    /// success and logs every outcome. Errors are swallowed on purpose: a
+    /// relocation is a best-effort courtesy — if it fails the file simply
+    /// stays at its old (still valid, still synced) path and export
+    /// continues normally; the next poll tries again.
+    fn relocate_file_if_needed(&mut self, db: &DbFileState, project_dir: &str) {
+        let result = paths::relocate_tracked_file(
+            &mut self.manifest,
+            &self.cfg.sync_root,
+            &db.id,
+            project_dir,
+            &db.name,
+        );
+        match result {
+            Ok(paths::RelocationOutcome::NotNeeded) => {}
+            Ok(paths::RelocationOutcome::Moved { from, to }) => {
+                match self.manifest.save(&self.cfg.sync_root) {
+                    Ok(()) => tracing::info!(file = %db.id, from = %from, to = %to, "relocated on disk to follow a DB rename/move"),
+                    Err(e) => tracing::error!(file = %db.id, error = %e, "relocated on disk but failed to persist the manifest; will retry next poll"),
+                }
+            }
+            Ok(paths::RelocationOutcome::Retargeted { to }) => {
+                match self.manifest.save(&self.cfg.sync_root) {
+                    Ok(()) => tracing::debug!(file = %db.id, to = %to, "no on-disk copy yet; manifest path retargeted to the new location"),
+                    Err(e) => tracing::error!(file = %db.id, error = %e, "retargeted manifest path but failed to persist it; will retry next poll"),
+                }
+            }
+            Ok(paths::RelocationOutcome::SkippedLocalChanges) => {
+                tracing::debug!(file = %db.id, "skipping relocation: on-disk tree has local changes (or is unreadable) since last sync; the conflict guard will handle it at the old path");
+            }
+            Ok(paths::RelocationOutcome::SkippedDestinationTaken) => {
+                tracing::warn!(file = %db.id, "skipping relocation: destination path is already taken; will retry next poll");
+            }
+            Err(e) => {
+                tracing::error!(file = %db.id, error = %e, "relocation failed; file stays at its old path");
+            }
+        }
+    }
+
     async fn export_file(&mut self, db: &DbFileState) -> anyhow::Result<ExportOutcome> {
         let project_dir = paths::project_dir_name(&self.manifest, &db.project_id, &db.project_name);
+        // D2: rename/move are first-class verbs — if this tracked file's
+        // current name/project imply a different path than its manifest
+        // entry, follow it on disk BEFORE allocating/exporting, so the rest
+        // of this function (and the conflict guard below) already operates
+        // on the new location. A no-op for untracked files and for the
+        // common "nothing changed" case.
+        self.relocate_file_if_needed(db, &project_dir);
         let rel = paths::allocate_file_path(
             &self.manifest,
             &self.cfg.sync_root,
