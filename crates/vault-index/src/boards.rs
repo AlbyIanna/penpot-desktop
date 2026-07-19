@@ -60,6 +60,10 @@ impl Sort {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMeta {
     pub project: String,
+    /// The project's real Penpot id (UUID), distinct from its display name —
+    /// carried through to `BoardCard.project_id` so the home page can pass a
+    /// real `projectId` to `/__api/vault/manage/duplicate` without a lookup.
+    pub project_id: String,
     pub rel_path: String,
     /// RFC 3339 UTC `lastSyncedAt` — the recency key.
     pub last_synced_at: String,
@@ -74,6 +78,8 @@ pub struct BoardCard {
     pub board_id: String,
     pub name: String,
     pub project: String,
+    /// The project's real Penpot id — see `FileMeta::project_id`.
+    pub project_id: String,
     pub rel_path: String,
     pub last_synced_at: String,
     /// The exact verified `/#/workspace?team-id&file-id&page-id` deep link.
@@ -168,6 +174,7 @@ pub fn assemble_cards(
                 board_id: row.board_id.clone(),
                 name: row.name.clone(),
                 project: m.project.clone(),
+                project_id: m.project_id.clone(),
                 rel_path: m.rel_path.clone(),
                 last_synced_at: m.last_synced_at.clone(),
             })
@@ -268,6 +275,9 @@ mod tests {
     fn meta(project: &str, rel: &str, at: &str) -> FileMeta {
         FileMeta {
             project: project.into(),
+            // Tests don't assert on the id itself; reusing the name keeps
+            // every existing call site unchanged.
+            project_id: format!("{project}-id"),
             rel_path: rel.into(),
             last_synced_at: at.into(),
         }
@@ -325,6 +335,9 @@ mod tests {
         let footer = listing.boards.iter().find(|c| c.board_id == "bB").unwrap();
         assert_eq!(hero.thumb.as_deref(), Some("/__api/vault/thumb?rel=P%2Fa.penpot&board=bA&fmt=png"));
         assert_eq!(footer.thumb, None);
+        // The card carries the project's real id, not just its display name —
+        // the home page needs it for the duplicate verb's `projectId`.
+        assert_eq!(hero.project_id, "Proj-id");
     }
 
     #[test]

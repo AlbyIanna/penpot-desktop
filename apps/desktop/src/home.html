@@ -62,6 +62,14 @@
   }
   a.escape:hover { border-color: var(--accent); }
 
+  .card-actions { display: flex; gap: 6px; padding: 6px 8px 8px; flex-wrap: wrap; }
+  .card-action {
+    font: inherit; font-size: 12px; padding: 2px 8px; cursor: pointer;
+    color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .card-action:hover { border-color: var(--accent); }
+
   main { padding: 18px; }
   #grid {
     display: grid; gap: 16px;
@@ -166,6 +174,8 @@
       </label>
       <input type="search" id="filter" placeholder="Filter by name…" />
       <button class="bar" id="checkpoint-btn" title="One labeled git commit of the vault">Checkpoint now</button>
+      <button class="bar" id="new-project" type="button">New project</button>
+      <button class="bar" id="new-file" type="button">New file</button>
       <a class="escape" id="escape-hatch" href="/#/dashboard/recent">Open dashboard ↗</a>
     </div>
   </header>
@@ -200,6 +210,8 @@
   var filterInput = document.getElementById("filter");
   var stripEl = document.getElementById("strip");
   var checkpointBtn = document.getElementById("checkpoint-btn");
+  var newProjectBtn = document.getElementById("new-project");
+  var newFileBtn = document.getElementById("new-file");
 
   var allBoards = [];
   // Keyed card cache: boardId -> { el, data, imgSrc }. THE grid-fix substrate:
@@ -229,6 +241,31 @@
     }
   }
 
+  // Every button below carries data-file-id (+ data-project-id for actions
+  // that need it) so the ONE delegated grid listener always acts on the
+  // right board, never a stale one left over from a recycled card.
+  function cardActionsEl(b) {
+    var actions = document.createElement("div");
+    actions.className = "card-actions";
+    [
+      ["rename", "Rename"],
+      ["duplicate", "Duplicate"],
+      ["move", "Move to project"],
+      ["delete", "Move to trash"],
+    ].forEach(function (pair) {
+      var btn = document.createElement("button");
+      btn.className = "card-action";
+      btn.type = "button";
+      btn.setAttribute("data-action", pair[0]);
+      btn.setAttribute("data-file-id", b.fileId);
+      btn.setAttribute("data-project-id", b.projectId);
+      btn.title = pair[1];
+      btn.textContent = pair[1];
+      actions.appendChild(btn);
+    });
+    return actions;
+  }
+
   function cardEl(b) {
     var a = document.createElement("a");
     a.className = "board-card";
@@ -256,6 +293,7 @@
 
     a.appendChild(thumb);
     a.appendChild(meta);
+    a.appendChild(cardActionsEl(b));
 
     a.addEventListener("focus", function () { focusedId = b.boardId; });
     return a;
@@ -282,12 +320,24 @@
       thumb.innerHTML = "";
       fillThumb(thumb, b);
     }
+    // Cards are recycled by the keyed diff (reused DOM node, same boardId
+    // slot). If the owning file or project ever changed under that slot, a
+    // stale data-file-id/data-project-id left on the action buttons would
+    // fire the next click against the wrong file — refresh them too.
+    if (!prev || prev.fileId !== b.fileId || prev.projectId !== b.projectId) {
+      var actionBtns = el.querySelectorAll(".card-action");
+      for (var i = 0; i < actionBtns.length; i++) {
+        actionBtns[i].setAttribute("data-file-id", b.fileId);
+        actionBtns[i].setAttribute("data-project-id", b.projectId);
+      }
+    }
     el.__data = b;
   }
 
   function dataChanged(a, b) {
     return !a || a.name !== b.name || a.project !== b.project ||
-      a.deepLink !== b.deepLink || a.thumb !== b.thumb;
+      a.deepLink !== b.deepLink || a.thumb !== b.thumb ||
+      a.fileId !== b.fileId || a.projectId !== b.projectId;
   }
 
   // Keyed diff/patch reconciliation. Never clears the grid; reuses nodes so
@@ -489,8 +539,33 @@
     return b;
   }
 
+  // Short-lived message shown in the strip (e.g. a failed create/rename/
+  // duplicate/move/delete). No such helper existed before this — reused
+  // rather than alert(), and cleared automatically once it expires or a
+  // newer message replaces it.
+  var tempMsg = null;         // { text: string, until: epoch-ms } | null
+  var lastStripModel = null;  // last model from pollStrip, so a message can
+                               // repaint the strip immediately without
+                               // waiting for the next poll tick.
+
+  function setStripMessage(text) {
+    tempMsg = { text: text, until: Date.now() + 5000 };
+    renderStrip(lastStripModel || { rows: [] });
+  }
+
   function renderStrip(m) {
     stripEl.innerHTML = "";
+    if (tempMsg) {
+      if (Date.now() > tempMsg.until) {
+        tempMsg = null;
+      } else {
+        var tm = document.createElement("span");
+        tm.className = "line";
+        tm.id = "strip-message";
+        tm.textContent = tempMsg.text;
+        stripEl.appendChild(tm);
+      }
+    }
     var conflicts = (m.rows || []).filter(function (r) { return r.isConflict; });
     conflicts.forEach(function (r) {
       var box = document.createElement("span");
@@ -565,7 +640,7 @@
   function pollStrip() {
     fetch("/__api/vault/strip")
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
-      .then(renderStrip)
+      .then(function (m) { lastStripModel = m; renderStrip(m); })
       .catch(function () { /* keep last render */ });
   }
 
@@ -584,6 +659,94 @@
         checkpointBtn.textContent = "Checkpoint failed";
         setTimeout(function () { checkpointBtn.textContent = prev; checkpointBtn.disabled = false; }, 3500);
       });
+  });
+
+  // ---- D2: create / rename / duplicate / move / delete -------------------
+  async function post(path, body) {
+    var res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    return data;
+  }
+
+  // The project <select> is keyed by project NAME (it doubles as the
+  // /__api/vault/boards ?project= filter, which matches by name). The manage
+  // API needs the project's real id, which isn't in that dropdown — but it
+  // IS on every loaded board card now, so resolve it from there instead of
+  // asking the daemon for a lookup the caller can already answer.
+  function projectIdForName(name) {
+    for (var i = 0; i < allBoards.length; i++) {
+      if (allBoards[i].project === name) return allBoards[i].projectId;
+    }
+    return null;
+  }
+
+  // One delegated listener: cards are recycled by the keyed patch path, so
+  // per-card handlers would leak and could fire against a stale file id.
+  grid.addEventListener("click", async function (ev) {
+    var btn = ev.target.closest(".card-action");
+    if (!btn) return;
+    ev.preventDefault();           // the card itself is an <a>; don't navigate
+    ev.stopPropagation();
+    var fileId = btn.getAttribute("data-file-id");
+    var action = btn.getAttribute("data-action");
+    if (!fileId) return;
+    try {
+      if (action === "rename") {
+        var newName = window.prompt("New name?");
+        if (!newName) return;
+        await post("/__api/vault/manage/rename", { kind: "file", id: fileId, name: newName });
+      } else if (action === "duplicate") {
+        var copyName = window.prompt("Name for the copy?");
+        if (!copyName) return;
+        await post("/__api/vault/manage/duplicate", {
+          fileId: fileId, name: copyName, projectId: btn.getAttribute("data-project-id"),
+        });
+      } else if (action === "move") {
+        var targetProjectId = window.prompt("Target project id?");
+        if (!targetProjectId) return;
+        await post("/__api/vault/manage/move", { fileIds: [fileId], projectId: targetProjectId });
+      } else if (action === "delete") {
+        if (!window.confirm("Move this file to the vault trash?")) return;
+        await post("/__api/vault/manage/delete", { fileId: fileId });
+      }
+      // No optimistic update: the daemon polls on its own cadence and the
+      // vault index lags one poll further behind that, so loadBoards() here
+      // will often still show the pre-action state. That's expected — the
+      // existing 5s interval below converges once the daemon and index catch
+      // up.
+      loadBoards();
+    } catch (e) {
+      setStripMessage("Action failed: " + e.message);
+    }
+  });
+
+  newProjectBtn.addEventListener("click", async function () {
+    var name = window.prompt("Project name?");
+    if (!name) return;
+    try { await post("/__api/vault/manage/project", { name: name }); loadBoards(); }
+    catch (e) { setStripMessage("Could not create the project: " + e.message); }
+  });
+
+  newFileBtn.addEventListener("click", async function () {
+    var projectName = projectSel.value;
+    if (!projectName) {
+      setStripMessage("Pick a project first, then New file.");
+      return;
+    }
+    var projectId = projectIdForName(projectName);
+    if (!projectId) {
+      setStripMessage("That project has no synced boards yet — try again shortly.");
+      return;
+    }
+    var name = window.prompt("File name?");
+    if (!name) return;
+    try { await post("/__api/vault/manage/file", { projectId: projectId, name: name }); loadBoards(); }
+    catch (e) { setStripMessage("Could not create the file: " + e.message); }
   });
 
   projectSel.addEventListener("change", loadBoards);

@@ -97,6 +97,7 @@ async fn list_palette(
                     id.clone(),
                     FileMeta {
                         project: e.project_name.clone(),
+                        project_id: e.project_id.clone(),
                         rel_path: e.path.clone(),
                         last_synced_at: e.last_synced_at.clone(),
                     },
@@ -174,6 +175,7 @@ async fn list_boards(
                     id.clone(),
                     FileMeta {
                         project: e.project_name.clone(),
+                        project_id: e.project_id.clone(),
                         rel_path: e.path.clone(),
                         last_synced_at: e.last_synced_at.clone(),
                     },

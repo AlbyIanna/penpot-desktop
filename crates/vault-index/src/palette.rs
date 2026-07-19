@@ -300,6 +300,7 @@ mod tests {
     fn meta(project: &str, rel: &str) -> FileMeta {
         FileMeta {
             project: project.into(),
+            project_id: format!("{project}-id"),
             rel_path: rel.into(),
             last_synced_at: "2026-07-14T00:00:00Z".into(),
         }
