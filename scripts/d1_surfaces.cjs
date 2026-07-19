@@ -10,9 +10,6 @@
  */
 const path = require("path");
 const REPO = process.env.REPO_ROOT || process.cwd();
-const PW = process.env.PLAYWRIGHT_MODULE ||
-  path.join(REPO, "runtime/exporter/node_modules/playwright");
-const { chromium } = require(PW);
 
 const BASE = process.env.BASE || "http://localhost:9046";
 // Default bumped from a naive 3.5s to a generous >=12s: a short settle
@@ -23,13 +20,45 @@ const BASE = process.env.BASE || "http://localhost:9046";
 // surfaces "gone" and turn the gate green for the wrong reason.
 const SETTLE = Number(process.env.SHOTS_SETTLE_MS || 12000);
 
-function isLoopback(u) {
-  try {
-    const h = new URL(u).hostname;
-    return h === "localhost" || h === "127.0.0.1" || h === "::1" || h.startsWith("127.");
-  } catch {
-    return true; // data:, blob:, about: — never leave the machine
+// Non-network URL schemes (in-memory data, never touch a socket). These are
+// deliberately excluded from egress reporting BY NAME — not left to fall
+// through the loopback predicate and happen to land on the safe side.
+const NON_NETWORK_SCHEMES = new Set(["data:", "blob:", "about:"]);
+
+function isNonNetworkUrl(u) {
+  for (const scheme of NON_NETWORK_SCHEMES) {
+    if (u.startsWith(scheme)) return true;
   }
+  return false;
+}
+
+// A dotted-quad IPv4 literal in 127.0.0.0/8, e.g. "127.0.0.1" or "127.1.2.3".
+// Each octet must be a real 0-255 value with no extra characters — this must
+// NOT match a hostname that merely starts with "127." (e.g.
+// "127.0.0.1.evil.com" has a trailing label; "1270.0.0.1" has no dots after
+// the "127").
+const IPV4_127_RE =
+  /^127\.(25[0-5]|2[0-4]\d|1?\d{1,2})\.(25[0-5]|2[0-4]\d|1?\d{1,2})\.(25[0-5]|2[0-4]\d|1?\d{1,2})$/;
+
+function isLoopback(u) {
+  // Non-network schemes are handled explicitly by the caller — this
+  // predicate only ever answers the network-loopback question.
+  let h;
+  try {
+    h = new URL(u).hostname;
+  } catch {
+    // "Could not parse" must never mean "safe". A malformed URL (e.g.
+    // "http://1270.0.0.1/steal") is surfaced as non-loopback so it shows up
+    // in the evidence rather than silently vanishing.
+    return false;
+  }
+  if (h === "localhost") return true;
+  // IPv6 loopback: Node's URL().hostname keeps the brackets for IPv6
+  // literals (e.g. "[::1]"), so match both the bracketed and bare forms,
+  // plus the fully expanded form.
+  if (h === "::1" || h === "[::1]" || h === "0:0:0:0:0:0:0:1" ||
+      h === "[0:0:0:0:0:0:0:1]") return true;
+  return IPV4_127_RE.test(h);
 }
 
 // PROOF-OF-RENDER, waited for rather than assumed.
@@ -69,7 +98,58 @@ async function waitForStableRender(page, timeoutMs) {
   }
 }
 
-(async () => {
+// Self-check for isLoopback that needs neither a browser nor a live stack.
+// Run as: node scripts/d1_surfaces.cjs selftest
+function _selftest() {
+  const cases = [
+    // [url, expectedLoopback]
+    ["http://127.0.0.1/", true],
+    ["http://127.1.2.3/", true],
+    ["http://localhost/", true],
+    ["http://[::1]/", true],
+    ["http://127.0.0.1.evil.com/steal", false],
+    ["http://127.evil.com/", false],
+    ["http://1270.0.0.1/", false],
+    ["http://12.7.0.0.1/", false],
+    ["http://example.com/", false],
+    ["http://0.0.0.0/", false],
+    ["http://169.254.169.254/", false],
+    ["not a url at all", false],
+  ];
+  let failed = 0;
+  for (const [url, expected] of cases) {
+    const got = isLoopback(url);
+    if (got !== expected) {
+      failed++;
+      console.error(`FAIL isLoopback(${JSON.stringify(url)}) = ${got}, expected ${expected}`);
+    }
+  }
+  // data:/blob:/about: are excluded by name, not by isLoopback().
+  const nonNetworkCases = ["data:text/plain,hi", "blob:http://x/y", "about:blank"];
+  for (const url of nonNetworkCases) {
+    if (!isNonNetworkUrl(url)) {
+      failed++;
+      console.error(`FAIL isNonNetworkUrl(${JSON.stringify(url)}) = false, expected true`);
+    }
+  }
+  if (failed > 0) {
+    console.error(`selftest FAILED: ${failed} case(s)`);
+    process.exit(1);
+  }
+  console.log("selftest OK");
+  process.exit(0);
+}
+
+if (process.argv[2] === "selftest") {
+  _selftest();
+} else {
+  main();
+}
+
+async function main() {
+  const PW = process.env.PLAYWRIGHT_MODULE ||
+    path.join(REPO, "runtime/exporter/node_modules/playwright");
+  const { chromium } = require(PW);
   const browser = await chromium.launch({ headless: true });
   const requests = [];
   try {
@@ -112,7 +192,8 @@ async function waitForStableRender(page, timeoutMs) {
       templatesSection = hasTemplates ? "present" : "gone";
     }
 
-    const nonLoopbackRequests = [...new Set(requests.filter((u) => !isLoopback(u)))];
+    const nonLoopbackRequests = [...new Set(
+      requests.filter((u) => !isNonNetworkUrl(u) && !isLoopback(u)))];
     console.log(JSON.stringify({
       ok: true,
       requests: [...new Set(requests)].length,
@@ -127,4 +208,4 @@ async function waitForStableRender(page, timeoutMs) {
   } finally {
     await browser.close();
   }
-})();
+}
