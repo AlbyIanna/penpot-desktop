@@ -9,10 +9,19 @@
 //! app's `/__api/vault/thumb` route serves; otherwise `thumb` is `null` and
 //! the page shows N2's degraded placeholder.
 //!
+//! **D2 gap fix:** a file created through `/__home`'s front door has a page
+//! but no board — `db::all_boards` never yields a row for it, so it used to
+//! be invisible (and, since the per-card action buttons are the only way to
+//! rename/duplicate/move/delete a file, unreachable too). `assemble_cards`
+//! now emits a placeholder [`BoardCard`] (`kind = CardKind::File`) for every
+//! manifest entry that has zero indexed board rows, straight from the
+//! manifest + a cheap disk peek at the file's own page ids — never the
+//! Penpot DB (this crate stays disk-only).
+//!
 //! All of this is derived, read-only state (invariant 1): nothing here writes,
 //! and everything is rebuilt from disk alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -69,12 +78,32 @@ pub struct FileMeta {
     pub last_synced_at: String,
 }
 
+/// Distinguishes a real board card from the D2-gap-fix placeholder card for a
+/// file that has zero indexed boards yet. Carried explicitly (rather than
+/// left for the page to guess from `boardId`'s synthetic `file:` prefix or a
+/// null `thumb`) so the home page can render — and gate behavior like
+/// Peek's "Present" — off one unambiguous field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CardKind {
+    Board,
+    File,
+}
+
 /// One lighttable card, serialized camelCase for the HTTP API.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BoardCard {
+    pub kind: CardKind,
     pub file_id: String,
+    /// Empty when `kind == File` and no page id could be read off disk (see
+    /// [`first_page_id`]) — the deep link then omits `page-id` rather than
+    /// carrying a guessed/invalid one.
     pub page_id: String,
+    /// The board's real id for `kind == Board`; a synthetic `file:<fileId>`
+    /// key for `kind == File` (there is no board to key on, but the page's
+    /// keyed diff/patch grid still needs one stable, globally-unique id per
+    /// card).
     pub board_id: String,
     pub name: String,
     pub project: String,
@@ -85,7 +114,8 @@ pub struct BoardCard {
     /// The exact verified `/#/workspace?team-id&file-id&page-id` deep link.
     pub deep_link: String,
     /// Thumbnail URL served by `/__api/vault/thumb`, or `null` when no render
-    /// exists yet (the page renders N2's degraded placeholder).
+    /// exists yet (the page renders N2's degraded placeholder) — always
+    /// `null` for `kind == File` (there is no board to render).
     pub thumb: Option<String>,
 }
 
@@ -127,31 +157,34 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// Pure assembly: join board rows with per-file metadata, resolve each card's
-/// thumbnail via `thumb_for(owner_id, board_id) -> Option<thumb_url>`, filter
-/// by project, and sort. Deterministic for a given index — a rebuilt index
-/// yields a byte-identical listing.
+/// thumbnail via `thumb_for(owner_id, board_id) -> Option<thumb_url>`, fill in
+/// a placeholder card for every manifest entry with zero indexed boards via
+/// `first_page_id(owner_id) -> Option<page_id>`, filter by project, and sort.
+/// Deterministic for a given index — a rebuilt index yields a byte-identical
+/// listing.
 ///
 /// `thumb_for` returns `Some(url)` iff a render exists for that board; the
 /// HTTP layer supplies a closure backed by the exports-state stem map + disk.
+/// `first_page_id` returns the page id to deep-link a boardless file's
+/// placeholder card into (see [`first_page_id`] the disk-facing helper of the
+/// same name); the HTTP layer supplies a closure backed by that function.
 pub fn assemble_cards(
     rows: &[BoardRow],
     meta: &BTreeMap<String, FileMeta>,
     team_id: &str,
     thumb_for: impl Fn(&str, &str) -> Option<String>,
+    first_page_id: impl Fn(&str) -> Option<String>,
     project_filter: Option<&str>,
     sort: Sort,
 ) -> BoardListing {
-    // Distinct projects across ALL boards (independent of the active filter,
-    // so the control always shows every project).
-    let mut projects: Vec<String> = Vec::new();
-    for row in rows {
-        if let Some(m) = meta.get(&row.owner_id) {
-            if !projects.contains(&m.project) {
-                projects.push(m.project.clone());
-            }
-        }
-    }
+    // Distinct projects across the WHOLE manifest — not just files that have
+    // an indexed board — so the filter control (and the D2 project picker
+    // parity it backs) offers a project the instant one of its files exists
+    // on disk, even before that file has a single board. This was the same
+    // bug in a different guise: `"projects":[]` despite tracked files.
+    let mut projects: Vec<String> = meta.values().map(|m| m.project.clone()).collect();
     projects.sort();
+    projects.dedup();
 
     let mut cards: Vec<BoardCard> = rows
         .iter()
@@ -163,6 +196,7 @@ pub fn assemble_cards(
                 }
             }
             Some(BoardCard {
+                kind: CardKind::Board,
                 deep_link: workspace_deep_link(
                     team_id,
                     &row.file_id,
@@ -180,6 +214,40 @@ pub fn assemble_cards(
             })
         })
         .collect();
+
+    // Requirement 1 (the D2 gap fix): every manifest entry appears, even with
+    // zero indexed boards. Every owner already covered by a board card above
+    // is skipped here — this never duplicates, and a file that later gains a
+    // board simply stops qualifying for this loop on the next listing.
+    let owners_with_boards: BTreeSet<&str> = rows.iter().map(|r| r.owner_id.as_str()).collect();
+    for (owner_id, m) in meta {
+        if owners_with_boards.contains(owner_id.as_str()) {
+            continue;
+        }
+        if let Some(f) = project_filter {
+            if m.project != f {
+                continue;
+            }
+        }
+        let page_id = first_page_id(owner_id).unwrap_or_default();
+        cards.push(BoardCard {
+            kind: CardKind::File,
+            deep_link: workspace_deep_link(
+                team_id,
+                owner_id,
+                (!page_id.is_empty()).then_some(page_id.as_str()),
+            ),
+            thumb: None,
+            file_id: owner_id.clone(),
+            page_id,
+            board_id: file_card_key(owner_id),
+            name: file_display_name(&m.rel_path),
+            project: m.project.clone(),
+            project_id: m.project_id.clone(),
+            rel_path: m.rel_path.clone(),
+            last_synced_at: m.last_synced_at.clone(),
+        });
+    }
 
     match sort {
         // Newest first; ties broken by (rel_path, board_id) for determinism.
@@ -200,6 +268,20 @@ pub fn assemble_cards(
     }
 
     BoardListing { count: cards.len(), projects, boards: cards }
+}
+
+/// The synthetic, globally-unique `board_id` a placeholder file card carries.
+/// Never collides with a real board uuid (those never contain `:`).
+fn file_card_key(file_id: &str) -> String {
+    format!("file:{file_id}")
+}
+
+/// The `.penpot` basename (without the extension) — the file's display name
+/// on its placeholder card, since a boardless file has no board name to show
+/// (mirrors `palette.rs`'s helper of the same purpose).
+fn file_display_name(rel_path: &str) -> String {
+    let base = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    base.strip_suffix(PENPOT_DIR_SUFFIX).unwrap_or(base).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +321,34 @@ pub fn load_stem_map(vault_root: &Path, penpot_rel: &str) -> BTreeMap<String, St
         .into_iter()
         .map(|b| (b.object_id, b.file_stem))
         .collect()
+}
+
+/// The lexicographically-first page id under a file's own `files/<file-id>/
+/// pages/` dir (each page's normalized JSON is named `<page-id>.json` there —
+/// see `crates/vault-index/src/extract.rs`'s module docs for the verified
+/// tree layout). Backs a placeholder file card's deep link.
+///
+/// This crate is disk-only by design and never parses `files/<file-id>.json`'s
+/// `data.pages` (the array that carries Penpot's actual page ORDER) — UUIDs
+/// have no natural order of their own, but the case this exists for (a file
+/// just created through `/__home`) has exactly one page, so "lexicographically
+/// first" only ever matters as a deterministic tiebreak, never a real ordering
+/// choice. `None` when the dir doesn't exist, is empty, or can't be read — the
+/// caller (`assemble_cards`) must treat that as genuinely unknown and omit
+/// `page-id` from the deep link rather than guess one.
+pub fn first_page_id(vault_root: &Path, penpot_rel: &str, file_id: &str) -> Option<String> {
+    let pages_dir = vault_root.join(penpot_rel).join("files").join(file_id).join("pages");
+    let mut ids: Vec<String> = std::fs::read_dir(&pages_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| {
+            let name = e.file_name();
+            name.to_str().and_then(|n| n.strip_suffix(".json")).map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids.into_iter().next()
 }
 
 /// Resolve the on-disk path of a board's thumbnail (`<stem>.<ext>` inside the
@@ -317,6 +427,7 @@ mod tests {
             &m,
             "team-7",
             |_owner, board| (board == "bA").then(|| thumb_url("P/a.penpot", board)),
+            |_owner| None,
             None,
             Sort::Name,
         );
@@ -349,7 +460,7 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("f1".to_string(), meta("Alpha", "A/one.penpot", "2026-07-14T10:00:00Z"));
         m.insert("f2".to_string(), meta("Beta", "B/two.penpot", "2026-07-14T11:00:00Z"));
-        let listing = assemble_cards(&rows, &m, "t", |_, _| None, Some("Beta"), Sort::Recency);
+        let listing = assemble_cards(&rows, &m, "t", |_, _| None, |_| None, Some("Beta"), Sort::Recency);
         assert_eq!(listing.count, 1);
         assert_eq!(listing.boards[0].project, "Beta");
         // The control still offers both projects.
@@ -366,7 +477,7 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("f1".to_string(), meta("P", "A/a.penpot", "2026-07-14T09:00:00Z"));
         m.insert("f2".to_string(), meta("P", "B/b.penpot", "2026-07-14T12:00:00Z"));
-        let listing = assemble_cards(&rows, &m, "t", |_, _| None, None, Sort::Recency);
+        let listing = assemble_cards(&rows, &m, "t", |_, _| None, |_| None, None, Sort::Recency);
         // f2 (12:00) boards first, tie broken by board_id (by < bz), then f1.
         assert_eq!(
             listing
@@ -383,8 +494,144 @@ mod tests {
         // A board whose owner vanished from the manifest (stale index row mid
         // sync): no meta → not listed (never point at a nonexistent file).
         let rows = vec![row("ghost", "ghost", "p", "b", "N", "X/x.penpot")];
-        let listing = assemble_cards(&rows, &BTreeMap::new(), "t", |_, _| None, None, Sort::Recency);
+        let listing =
+            assemble_cards(&rows, &BTreeMap::new(), "t", |_, _| None, |_| None, None, Sort::Recency);
         assert_eq!(listing.count, 0);
+    }
+
+    /// The D2 gap fix, the core assertion: a manifest entry with zero indexed
+    /// boards still produces a card (kind = File), carries the project id the
+    /// duplicate verb needs, and a synthetic-but-unique board_id.
+    #[test]
+    fn file_with_no_boards_gets_a_placeholder_card() {
+        let m: BTreeMap<String, FileMeta> =
+            [("f1".to_string(), meta("Client Redesign", "Client Redesign/Homepage.penpot", "2026-07-19T10:00:00Z"))]
+                .into_iter()
+                .collect();
+        let listing = assemble_cards(&[], &m, "team-7", |_, _| None, |owner| {
+            assert_eq!(owner, "f1");
+            Some("page-1".to_string())
+        }, None, Sort::Recency);
+        assert_eq!(listing.count, 1);
+        let card = &listing.boards[0];
+        assert_eq!(card.kind, CardKind::File);
+        assert_eq!(card.file_id, "f1");
+        assert_eq!(card.name, "Homepage");
+        assert_eq!(card.project, "Client Redesign");
+        assert_eq!(card.project_id, "Client Redesign-id");
+        assert_eq!(card.thumb, None);
+        assert_eq!(card.board_id, "file:f1");
+        assert_eq!(
+            card.deep_link,
+            "/#/workspace?team-id=team-7&file-id=f1&page-id=page-1"
+        );
+    }
+
+    /// When `first_page_id` genuinely can't determine a page (empty/missing
+    /// pages dir), the card still appears — its deep link just omits
+    /// `page-id` (an established, working shape elsewhere in this crate)
+    /// rather than carrying a guessed one.
+    #[test]
+    fn file_with_no_boards_and_no_page_id_still_gets_a_card() {
+        let m: BTreeMap<String, FileMeta> =
+            [("f1".to_string(), meta("P", "P/new.penpot", "2026-07-19T10:00:00Z"))].into_iter().collect();
+        let listing = assemble_cards(&[], &m, "team-7", |_, _| None, |_| None, None, Sort::Recency);
+        assert_eq!(listing.count, 1);
+        let card = &listing.boards[0];
+        assert_eq!(card.kind, CardKind::File);
+        assert_eq!(card.page_id, "");
+        assert_eq!(card.deep_link, "/#/workspace?team-id=team-7&file-id=f1");
+    }
+
+    /// A file WITH boards must keep producing exactly its board card(s) —
+    /// never an extra placeholder file card alongside them.
+    #[test]
+    fn file_with_boards_is_not_also_given_a_placeholder_card() {
+        let rows = vec![
+            row("f1", "f1", "p1", "bA", "Hero", "P/a.penpot"),
+            row("f1", "f1", "p1", "bB", "Footer", "P/a.penpot"),
+        ];
+        let m: BTreeMap<String, FileMeta> =
+            [("f1".to_string(), meta("Proj", "P/a.penpot", "2026-07-14T10:00:00Z"))].into_iter().collect();
+        let listing = assemble_cards(&rows, &m, "t", |_, _| None, |_| panic!("must not be called"), None, Sort::Recency);
+        assert_eq!(listing.count, 2, "no extra placeholder card for a file that already has boards");
+        assert!(listing.boards.iter().all(|c| c.kind == CardKind::Board));
+    }
+
+    /// A mix: one file with boards, one without — the boardless file still
+    /// gets exactly one card, the other keeps its board cards, none dropped
+    /// or duplicated.
+    #[test]
+    fn mixed_manifest_yields_board_cards_and_one_placeholder_each() {
+        let rows = vec![row("f1", "f1", "p1", "b1", "Cover", "A/one.penpot")];
+        let m: BTreeMap<String, FileMeta> = [
+            ("f1".to_string(), meta("Alpha", "A/one.penpot", "2026-07-14T10:00:00Z")),
+            ("f2".to_string(), meta("Alpha", "A/two.penpot", "2026-07-14T11:00:00Z")),
+        ]
+        .into_iter()
+        .collect();
+        let listing = assemble_cards(&rows, &m, "t", |_, _| None, |_| None, None, Sort::Recency);
+        assert_eq!(listing.count, 2);
+        let board = listing.boards.iter().find(|c| c.file_id == "f1").unwrap();
+        assert_eq!(board.kind, CardKind::Board);
+        assert_eq!(board.board_id, "b1");
+        let placeholder = listing.boards.iter().find(|c| c.file_id == "f2").unwrap();
+        assert_eq!(placeholder.kind, CardKind::File);
+        assert_eq!(placeholder.board_id, "file:f2");
+    }
+
+    /// Requirement 3: `projects` must include a project whose files have no
+    /// boards at all — the exact shape of the observed bug (`"projects":[]`
+    /// despite tracked files) in the project-listing half of the payload.
+    #[test]
+    fn projects_include_a_project_whose_files_have_no_boards() {
+        let m: BTreeMap<String, FileMeta> =
+            [("f1".to_string(), meta("Client Redesign", "Client Redesign/Homepage.penpot", "2026-07-19T10:00:00Z"))]
+                .into_iter()
+                .collect();
+        let listing = assemble_cards(&[], &m, "t", |_, _| None, |_| None, None, Sort::Recency);
+        assert_eq!(listing.projects, vec!["Client Redesign".to_string()]);
+    }
+
+    /// The project filter applies to placeholder cards the same as board
+    /// cards.
+    #[test]
+    fn project_filter_applies_to_placeholder_cards_too() {
+        let m: BTreeMap<String, FileMeta> = [
+            ("f1".to_string(), meta("Alpha", "A/one.penpot", "2026-07-14T10:00:00Z")),
+            ("f2".to_string(), meta("Beta", "B/two.penpot", "2026-07-14T11:00:00Z")),
+        ]
+        .into_iter()
+        .collect();
+        let listing = assemble_cards(&[], &m, "t", |_, _| None, |_| None, Some("Beta"), Sort::Recency);
+        assert_eq!(listing.count, 1);
+        assert_eq!(listing.boards[0].file_id, "f2");
+    }
+
+    #[test]
+    fn first_page_id_reads_the_lexicographically_first_page_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pages = root.join("P/a.penpot/files/f1/pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        std::fs::write(pages.join("page-2.json"), b"{}").unwrap();
+        std::fs::write(pages.join("page-1.json"), b"{}").unwrap();
+        // A stray non-.json entry must be ignored, not chosen.
+        std::fs::write(pages.join("notes.txt"), b"x").unwrap();
+        assert_eq!(first_page_id(root, "P/a.penpot", "f1").as_deref(), Some("page-1"));
+    }
+
+    #[test]
+    fn first_page_id_missing_dir_is_none_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(first_page_id(tmp.path(), "P/a.penpot", "f1"), None);
+    }
+
+    #[test]
+    fn first_page_id_empty_dir_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("P/a.penpot/files/f1/pages")).unwrap();
+        assert_eq!(first_page_id(tmp.path(), "P/a.penpot", "f1"), None);
     }
 
     #[test]

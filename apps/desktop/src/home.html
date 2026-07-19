@@ -14,6 +14,16 @@
   arrow keys move a persistent focus between cards; Space opens a full-size
   preview served from the board's .exports; arrows flip through siblings; Esc
   closes; "Present" opens the upstream viewer (/#/view?…).
+
+  D2 gap fix: a file created through this page's "New file" has a page but no
+  board yet, so `/__api/vault/boards` now carries a placeholder card for it
+  (`kind: "file"`) alongside the real board cards — otherwise a file the user
+  just created here would be invisible and its rename/duplicate/move/delete
+  buttons (the only way to reach those verbs since the dashboard closed)
+  unreachable. Placeholder cards carry the SAME `data-file-id`/
+  `data-project-id` action-button contract as a board card; they're keyed by
+  a synthetic `"file:"`-prefixed id (never colliding with a real board uuid)
+  so the keyed diff/patch grid below needs no separate code path for them.
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -88,6 +98,10 @@
     aspect-ratio: 4 / 3; background: var(--placeholder); position: relative;
     display: flex; align-items: center; justify-content: center; overflow: hidden;
   }
+  /* D2 gap fix: a file-without-boards card is subtly distinct — same card
+     shape, same CSS-variable vocabulary, just a dashed thumb edge instead of
+     a solid one, so it reads as "not yet a board" rather than "broken". */
+  a.board-card.file-card .thumb { border-bottom: 1px dashed var(--border); }
   .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .thumb .placeholder {
     color: var(--muted); font-size: 12px; text-align: center; padding: 8px;
@@ -124,6 +138,7 @@
     background: transparent; border-radius: 7px; padding: 4px 10px;
   }
   #peek .peekbar button.present { border-color: var(--accent); color: #fff; }
+  #peek .peekbar button:disabled { opacity: .4; cursor: not-allowed; }
   #peek .hint { margin-top: 10px; color: #8a94a0; font-size: 12px; }
 
   /* activity / conflict strip */
@@ -197,7 +212,7 @@
 
   <main>
     <div id="grid"></div>
-    <div class="empty" id="empty" hidden>No boards in this vault yet. Create one from the dashboard, then it appears here.</div>
+    <div class="empty" id="empty" hidden>Your vault is empty. Click "New project" above, then "New file" to create your first one — it appears here right away.</div>
   </main>
 
   <!-- Peek overlay (N4 pillar 5) -->
@@ -270,6 +285,16 @@
       '<circle cx="8.5" cy="8.5" r="1.5"/></svg><span>No preview yet</span></span>';
   }
 
+  // D2 gap fix: a distinct placeholder for a file that has no boards yet at
+  // all (vs. a board that simply hasn't been rendered yet) — a plain-file
+  // icon instead of the board-grid one, same muted styling.
+  function fileCardPlaceholderSvg() {
+    return '<span class="placeholder">' +
+      '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">' +
+      '<path d="M6 2h9l4 4v16H6z"/><path d="M15 2v4h4"/>' +
+      '</svg><span>No boards yet</span></span>';
+  }
+
   function fillThumb(thumb, b) {
     if (b.thumb) {
       var img = document.createElement("img");
@@ -279,8 +304,22 @@
       img.onerror = function () { thumb.innerHTML = placeholderSvg(); };
       thumb.appendChild(img);
     } else {
-      thumb.innerHTML = placeholderSvg();
+      thumb.innerHTML = b.kind === "file" ? fileCardPlaceholderSvg() : placeholderSvg();
     }
+  }
+
+  // Card subtitle: project name, plus an explicit "page not found yet" note
+  // for the rare placeholder card whose deep link had to omit page-id (see
+  // vault-index's `boards::first_page_id` — it never guesses one). Making
+  // this visible is the point: a card that silently linked to a page-less
+  // URL would look broken with no explanation.
+  function subText(b) {
+    var extra = (b.kind === "file" && !b.pageId) ? " · page not found yet" : "";
+    return b.project + extra;
+  }
+
+  function fallbackName(b) {
+    return b.kind === "file" ? "(untitled file)" : "(unnamed board)";
   }
 
   // Every button below carries data-file-id (+ data-project-id for actions
@@ -310,13 +349,14 @@
 
   function cardEl(b) {
     var a = document.createElement("a");
-    a.className = "board-card";
+    a.className = "board-card" + (b.kind === "file" ? " file-card" : "");
     a.href = b.deepLink;
     a.tabIndex = 0;
     a.setAttribute("data-deeplink", b.deepLink);
     a.setAttribute("data-board-id", b.boardId);
     a.setAttribute("data-project", b.project);
     a.setAttribute("data-name", b.name);
+    a.setAttribute("data-kind", b.kind);
 
     var thumb = document.createElement("div");
     thumb.className = "thumb";
@@ -326,10 +366,10 @@
     meta.className = "meta";
     var bn = document.createElement("div");
     bn.className = "bname";
-    bn.textContent = b.name || "(unnamed board)";
+    bn.textContent = b.name || fallbackName(b);
     var bs = document.createElement("div");
     bs.className = "bsub";
-    bs.textContent = b.project;
+    bs.textContent = subText(b);
     meta.appendChild(bn);
     meta.appendChild(bs);
 
@@ -343,6 +383,9 @@
 
   // Update a reused card's mutable bits in place (name, project, deep link,
   // thumbnail) without recreating the node — preserves focus + scroll.
+  // `kind` is NOT patched here: it is intrinsic to the card's key (boardId
+  // for a board, "file:"+fileId for a placeholder) and never changes for a
+  // given key across refreshes.
   function patchCard(el, b, prev) {
     if (!prev || prev.deepLink !== b.deepLink) {
       el.href = b.deepLink;
@@ -350,11 +393,11 @@
     }
     if (!prev || prev.name !== b.name) {
       el.setAttribute("data-name", b.name);
-      el.querySelector(".bname").textContent = b.name || "(unnamed board)";
+      el.querySelector(".bname").textContent = b.name || fallbackName(b);
     }
-    if (!prev || prev.project !== b.project) {
+    if (!prev || prev.project !== b.project || prev.pageId !== b.pageId) {
       el.setAttribute("data-project", b.project);
-      el.querySelector(".bsub").textContent = b.project;
+      el.querySelector(".bsub").textContent = subText(b);
     }
     // Only rebuild the thumbnail if its URL actually changed (avoid flicker).
     if (!prev || prev.thumb !== b.thumb) {
@@ -379,7 +422,8 @@
   function dataChanged(a, b) {
     return !a || a.name !== b.name || a.project !== b.project ||
       a.deepLink !== b.deepLink || a.thumb !== b.thumb ||
-      a.fileId !== b.fileId || a.projectId !== b.projectId;
+      a.fileId !== b.fileId || a.projectId !== b.projectId ||
+      a.pageId !== b.pageId;
   }
 
   // Keyed diff/patch reconciliation. Never clears the grid; reuses nodes so
@@ -422,7 +466,10 @@
       prevEl = entry.el;
     });
 
-    countEl.textContent = shownBoards.length + (shownBoards.length === 1 ? " board" : " boards");
+    // "items" not "boards": the grid now mixes real board cards with D2 gap-
+    // fix placeholder cards for boardless files, so a literal board count
+    // would undercount what's actually shown.
+    countEl.textContent = shownBoards.length + (shownBoards.length === 1 ? " item" : " items");
     emptyEl.hidden = shownBoards.length !== 0;
 
     // Restore focus to the tracked card if it is still shown (moves via
@@ -544,7 +591,7 @@
     if (i < 0 || i >= shownBoards.length) return;
     peekIndex = i;
     var b = shownBoards[i];
-    peekName.textContent = b.name || "(unnamed board)";
+    peekName.textContent = b.name || fallbackName(b);
     peekSub.textContent = b.project + (b.relPath ? " · " + b.relPath : "");
     peekFrame.innerHTML = "";
     if (b.thumb) {
@@ -555,10 +602,18 @@
         peekFrame.innerHTML = '<div class="placeholder">No render yet for this board.<br>It will appear once the exporter renders it.</div>';
       };
       peekFrame.appendChild(img);
+    } else if (b.kind === "file") {
+      peekFrame.innerHTML = '<div class="placeholder">This file has no boards yet.<br>Add one in the editor to get a preview here.</div>';
     } else {
       peekFrame.innerHTML = '<div class="placeholder">No render yet for this board.<br>It will appear once the exporter renders it.</div>';
     }
-    peekPresent.onclick = function () { window.location.assign(presentLink(b)); };
+    // There is no board/frame to present for a boardless placeholder card —
+    // disable rather than build a "presentLink" that 404s silently.
+    peekPresent.disabled = b.kind === "file";
+    peekPresent.onclick = function () {
+      if (b.kind === "file") return;
+      window.location.assign(presentLink(b));
+    };
     peekOpen.onclick = function () { window.location.assign(b.deepLink); };
     peek.classList.add("open");
     peek.setAttribute("aria-hidden", "false");

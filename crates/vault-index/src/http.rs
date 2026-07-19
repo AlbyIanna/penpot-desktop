@@ -204,6 +204,13 @@ async fn list_boards(
                     .join(format!("{}.png", stem_map.get(board_id).unwrap()));
                 png.is_file().then(|| boards::thumb_url(&m.rel_path, board_id))
             },
+            // D2 gap fix: a placeholder card's deep link, when derivable —
+            // one small `read_dir` (no JSON parse), and only for files with
+            // zero indexed boards (a shrinking set as boards get created).
+            |owner| {
+                let m = meta.get(owner)?;
+                boards::first_page_id(&vault_root, &m.rel_path, owner)
+            },
             project.as_deref(),
             sort,
         );
