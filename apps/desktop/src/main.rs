@@ -10,9 +10,10 @@
 use std::sync::Arc;
 
 use penpot_desktop::control::{self, VaultRunner};
+use penpot_desktop::navwatch::{self, Decision, NavWatch};
 use penpot_desktop::overlay::{self, ProxyUrlSlot};
 use penpot_desktop::AppConfig;
-use tauri::{Manager, RunEvent};
+use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::Mutex;
 
 /// The live vault runner (owns the stack; swaps it on `File > Open Vault`).
@@ -66,6 +67,43 @@ fn main() {
         }))
         .plugin(global_shortcut_plugin)
         .setup(move |app| {
+            // D0: the main window is built HERE (not from tauri.conf.json) so a
+            // navigation handler can be attached — `on_navigation` is a builder
+            // method and a config-declared window gives us no builder.
+            let watch = NavWatch::from_env();
+            let watch_for_handler = watch.clone();
+            let nav_handle = app.handle().clone();
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+                .title("Penpot Local")
+                .inner_size(1280.0, 800.0)
+                .resizable(true)
+                .on_navigation(move |url| {
+                    let url_s = url.to_string();
+                    // Observe first: the log is the spike's primary evidence.
+                    watch_for_handler.record("on_navigation", &url_s);
+                    match navwatch::decide(&url_s, watch_for_handler.redirect_enabled()) {
+                        Decision::Allow => true,
+                        Decision::CancelAndRedirect(path) => {
+                            // Cannot navigate from inside the handler (we are on
+                            // the webview's navigation path); hop to the app
+                            // thread and navigate there.
+                            let h = nav_handle.clone();
+                            let target = path.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Some(w) = h.get_webview_window("main") {
+                                    if let Ok(base) = w.url() {
+                                        if let Ok(dest) = base.join(&target) {
+                                            let _ = w.navigate(dest);
+                                        }
+                                    }
+                                }
+                            });
+                            false // cancel the web-route navigation
+                        }
+                    }
+                })
+                .build()?;
+
             let handle = app.handle().clone();
             let running = running_setup.clone();
 
@@ -208,9 +246,14 @@ fn main() {
                         if let Ok(mut slot) = proxy_slot_boot.lock() {
                             *slot = Some(runner.proxy_url());
                         }
-                        let url: tauri::Url = format!("{}/__bootstrap", runner.proxy_url())
-                            .parse()
-                            .expect("bootstrap url is valid");
+                        // D0: the spike gate points the window at /__navprobe.
+                        // Absent the override this is byte-identical to before.
+                        let start = std::env::var("PENPOT_LOCAL_START_URL")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| format!("{}/__bootstrap", runner.proxy_url()));
+                        let url: tauri::Url =
+                            start.parse().expect("start url is valid");
                         // Bind the tray to the real sync daemon (no-op in
                         // demo mode, where the tray watches the mock).
                         if !demo {
