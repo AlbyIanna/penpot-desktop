@@ -4533,6 +4533,7 @@ dependencies = [
 name = "sync-core"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "ryu",
  "serde",
  "serde_json",
