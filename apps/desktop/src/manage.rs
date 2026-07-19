@@ -193,6 +193,52 @@ async fn move_files(State(st): State<Arc<ManageState>>, Json(req): Json<MoveReq>
     }
 }
 
+/// `(include_libraries, embed_assets)` for the duplicate export.
+///
+/// `(true, true)` is server-rejected on Penpot 2.16.2 (E3). A duplicate wants
+/// its own copy of the media but must not drag linked libraries in, so this
+/// is the only correct pair.
+const DUPLICATE_EXPORT_FLAGS: (bool, bool) = (false, true);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateReq {
+    pub file_id: String,
+    pub name: String,
+    /// Target project; defaults to the source file's project when omitted.
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+async fn duplicate_file(State(st): State<Arc<ManageState>>, Json(req): Json<DuplicateReq>) -> Response {
+    let name = match valid_name(&req.name) {
+        Ok(n) => n,
+        Err(e) => return bad_request(e),
+    };
+    let Some(client) = st.client() else { return no_token() };
+
+    let Some(project_id) = req.project_id.clone() else {
+        return bad_request("projectId is required");
+    };
+
+    let (include_libraries, embed_assets) = DUPLICATE_EXPORT_FLAGS;
+    let exported = match client.export_binfile(&req.file_id, include_libraries, embed_assets).await {
+        Ok(e) => e,
+        Err(e) => return upstream_error(format!("export failed: {e}")),
+    };
+    let bytes = match client.download_exported_binfile(&exported.uri).await {
+        Ok(b) => b,
+        Err(e) => return upstream_error(format!("download failed: {e}")),
+    };
+    // Our own export_binfile always produces binfile-v3 on 2.16.2 (see
+    // penpot-rpc's doc comment), so the version-less import path applies —
+    // same as templates.rs's TemplateFormat::V3Zip.
+    match crate::installer::import_binfile_and_settle(&client, &project_id, &name, bytes, None).await {
+        Ok((new_id, _)) => Json(json!({ "fileId": new_id, "name": name })).into_response(),
+        Err(e) => upstream_error(format!("import failed: {e}")),
+    }
+}
+
 /// Build the D2 manage routes for the proxy's extra router.
 pub fn router(state: Arc<ManageState>) -> Router {
     Router::new()
@@ -200,6 +246,7 @@ pub fn router(state: Arc<ManageState>) -> Router {
         .route("/__api/vault/manage/file", post(new_file))
         .route("/__api/vault/manage/rename", post(rename))
         .route("/__api/vault/manage/move", post(move_files))
+        .route("/__api/vault/manage/duplicate", post(duplicate_file))
         .with_state(state)
 }
 
@@ -267,5 +314,21 @@ mod tests {
                 "accepted name {accepted:?} does not survive sanitize_component unchanged"
             );
         }
+    }
+
+    #[test]
+    fn duplicate_name_defaults_are_validated_like_any_other_name() {
+        // The duplicate route takes a user-supplied name for the copy; it must
+        // go through the same gate as create/rename, not a looser one.
+        assert!(valid_name("Homepage copy").is_ok());
+        assert!(valid_name("../evil").is_err());
+    }
+
+    #[test]
+    fn duplicate_export_flags_are_the_server_accepted_pair() {
+        // (include_libraries=true, embed_assets=true) is rejected by Penpot
+        // 2.16.2 (E3). Pin the pair we send so a well-meaning edit to
+        // "include everything" fails here instead of at runtime.
+        assert_eq!(DUPLICATE_EXPORT_FLAGS, (false, true));
     }
 }
