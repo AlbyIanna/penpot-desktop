@@ -219,6 +219,21 @@ e7:
 d0:
     bash scripts/d0-navigation-spike.sh
 
+# D1 offline + config hardening (PLAN4 milestone D1). Sets every Penpot flag
+# that deletes a cloud surface (registration, the dashboard's cloud templates
+# section, the Google-fonts provider, login-with-password) and proves the
+# offline promise: the flags are SERVED, they actually TOOK EFFECT (the
+# surface is gone — a renamed upstream flag must turn this red, not leave it
+# green), the registration closure is proven separately via the navwatch
+# policy's own unit tests (registration=present is a documented, tolerated
+# outcome — it is closed by navigation, not by the flag), and a full session
+# makes ZERO non-loopback connections, checked on BOTH sides (the SPA's
+# request log and the supervised processes' sockets). Dedicated ports
+# 9046/6508/5581/6524 (control 9047). Chained into `just e2e` — D1 lands
+# product code, unlike the D0 spike.
+d1:
+    bash scripts/d1-offline.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -228,17 +243,22 @@ routes-gate:
 
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
-# so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7).
-# e1-contract is a fast static gate (no stack); e2/e3/e4/e7 boot their own
-# live stacks (dedicated ports) like the m/n suites, safe to chain at the
+# so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7,
+# D1). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1 boot their
+# own live stacks (dedicated ports) like the m/n suites, safe to chain at the
 # tail. n2-thumbs + e4-gallery + e7-plugins need the runtime bundle WITH
-# browsers (`bash scripts/fetch-penpot.sh --with-browsers`);
+# browsers (`bash scripts/fetch-penpot.sh --with-browsers`); d1-offline needs
+# the same bundled browsers (its behavioural surface checks drive a headless
+# browser too).
 # m4-artifact-test.sh stays separate: it needs a dmg build
 # (`bash scripts/build-dmg.sh` first) and carries the E4 offline
 # packaged-gallery leg (g4) + the E7 offline plugin-serving leg (g5).
 # e5-tokens-spike.sh + e6-library-portability-spike.sh stay out by decision:
 # pure-verdict SPIKE gates with no product code to regress (see their recipe
-# comments) — e7 is chained because its thin build DID land product code.
+# comments) — e7 and d1 are chained because their thin builds DID land
+# product code. d0-navigation-spike.sh stays out too: pure-verdict spike, no
+# product behaviour changes by default (D1's navwatch policy IS the product
+# behaviour D0 spiked — D1 exercises it via cargo test, not by re-running D0).
 e2e:
     bash scripts/m1-smoke.sh
     bash scripts/m2-invariant.sh
@@ -255,6 +275,7 @@ e2e:
     bash scripts/e3-library.sh
     bash scripts/e4-gallery.sh
     bash scripts/e7-plugins-spike.sh
+    bash scripts/d1-offline.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

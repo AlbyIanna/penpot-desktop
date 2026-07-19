@@ -541,14 +541,43 @@ fn extra_router(state: Arc<BootstrapState>, config_js: String) -> Router {
 /// CLJS bundle reports `plugins/runtime` among enabled features).
 const PLUGINS_FRONTEND_FLAG: &str = "enable-plugins";
 
+/// D1 — cloud surfaces Penpot's OWN flags can delete. Appended to the frontend
+/// `penpotFlags` string only; the backend `PENPOT_FLAGS` is deliberately
+/// untouched (these are UI surfaces, and a smaller blast radius is worth more
+/// than defence-in-depth we cannot test here).
+///
+/// Why each one, for an offline single-user app with no account:
+///   * `disable-registration` — there is nobody to register.
+///   * `disable-dashboard-templates-section` — links to cloud-hosted content.
+///   * `disable-google-fonts-provider` — a live network dependency; removing it
+///     is load-bearing for the zero-egress guarantee, not cosmetic.
+///   * `disable-login-with-password` — there is no second account to log into.
+///     Audited live before adding (D1 task 4): this flag is FRONTEND-only, so
+///     it hides the SPA's email/password form while our `/__bootstrap` route —
+///     which calls the `login-with-password` RPC server-side, governed by the
+///     untouched backend flag — keeps working. Verified on a fresh data dir:
+///     first-boot provisioning succeeded, `/__bootstrap` still returned 302 with
+///     an `auth-token` cookie, and the login form rendered with no fields.
+///
+/// Known limit, deliberately not fixed here: `disable-registration` removes the
+/// "Create an account" link from the login page, but `#/auth/register` still
+/// renders a working form if reached directly, and the backend signup RPC stays
+/// live — our own provisioning calls it, and that path runs on every DB wipe, so
+/// disabling it backend-side would break the core invariant. That surface is
+/// closed by D0's navigation policy (`#/auth/*` is cancelled in the webview),
+/// not by this flag.
+const D1_CLOUD_SURFACE_FLAGS: &str = "disable-registration disable-dashboard-templates-section \
+     disable-google-fonts-provider disable-login-with-password";
+
 /// Compose the frontend flag string: the supervisor defaults + the plugins
-/// flag (E7 ships plugins enabled), plus any `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS`
-/// tokens appended verbatim.
+/// flag (E7 ships plugins enabled) + the D1 cloud-surface flags, plus any
+/// `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS` tokens appended verbatim.
 fn compose_frontend_flags(extra: Option<&str>) -> String {
     let mut flags = format!(
-        "{} {}",
+        "{} {} {}",
         supervisor::DEFAULT_PENPOT_FLAGS,
-        PLUGINS_FRONTEND_FLAG
+        PLUGINS_FRONTEND_FLAG,
+        D1_CLOUD_SURFACE_FLAGS
     );
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         flags.push(' ');
@@ -1077,12 +1106,46 @@ mod tests {
     fn frontend_flags_include_plugins_by_default_and_append_extras() {
         let flags = compose_frontend_flags(None);
         assert!(flags.starts_with(supervisor::DEFAULT_PENPOT_FLAGS));
-        assert!(flags.ends_with(" enable-plugins"));
+        assert!(flags.ends_with(&format!(" enable-plugins {D1_CLOUD_SURFACE_FLAGS}")));
         let flags = compose_frontend_flags(Some("  enable-foo enable-bar "));
         assert!(flags.contains("enable-plugins"));
         assert!(flags.ends_with(" enable-foo enable-bar"));
         // Empty extra is a no-op, not a trailing space.
         assert_eq!(compose_frontend_flags(Some("  ")), compose_frontend_flags(None));
+    }
+
+    #[test]
+    fn frontend_flags_disable_every_cloud_surface() {
+        let flags = compose_frontend_flags(None);
+        for expected in [
+            "disable-registration",
+            "disable-dashboard-templates-section",
+            "disable-google-fonts-provider",
+            // Added after the D1 task 4 live audit proved boot survives it:
+            // the flag is frontend-only, so /__bootstrap's server-side login
+            // still works. See D1_CLOUD_SURFACE_FLAGS for the evidence.
+            "disable-login-with-password",
+        ] {
+            // Exact-token, not `contains`: a missing separator would fuse two
+            // flags into one token that Penpot silently ignores, and a
+            // substring check would still pass on that broken string.
+            assert!(
+                flags.split(' ').any(|token| token == expected),
+                "missing {expected} as a standalone token in {flags}"
+            );
+        }
+        // The plugins flag (E7) must survive the addition.
+        assert!(
+            flags.split(' ').any(|token| token == "enable-plugins"),
+            "E7 plugins flag lost in {flags}"
+        );
+    }
+
+    #[test]
+    fn backend_flags_are_left_alone_by_the_frontend_composition() {
+        // The cloud-surface flags are UI-only; the JVM's flag string must not
+        // silently acquire them.
+        assert!(!supervisor::DEFAULT_PENPOT_FLAGS.contains("disable-registration"));
     }
 
     #[test]
