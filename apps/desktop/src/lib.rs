@@ -551,12 +551,23 @@ const PLUGINS_FRONTEND_FLAG: &str = "enable-plugins";
 ///   * `disable-dashboard-templates-section` — links to cloud-hosted content.
 ///   * `disable-google-fonts-provider` — a live network dependency; removing it
 ///     is load-bearing for the zero-egress guarantee, not cosmetic.
+///   * `disable-login-with-password` — there is no second account to log into.
+///     Audited live before adding (D1 task 4): this flag is FRONTEND-only, so
+///     it hides the SPA's email/password form while our `/__bootstrap` route —
+///     which calls the `login-with-password` RPC server-side, governed by the
+///     untouched backend flag — keeps working. Verified on a fresh data dir:
+///     first-boot provisioning succeeded, `/__bootstrap` still returned 302 with
+///     an `auth-token` cookie, and the login form rendered with no fields.
 ///
-/// NOT included: `disable-login-with-password`. Our `/__bootstrap` auto-login
-/// signs in with a password, so disabling it could break boot; D1 audits that
-/// live before anyone adds it here.
-const D1_CLOUD_SURFACE_FLAGS: &str =
-    "disable-registration disable-dashboard-templates-section disable-google-fonts-provider";
+/// Known limit, deliberately not fixed here: `disable-registration` removes the
+/// "Create an account" link from the login page, but `#/auth/register` still
+/// renders a working form if reached directly, and the backend signup RPC stays
+/// live — our own provisioning calls it, and that path runs on every DB wipe, so
+/// disabling it backend-side would break the core invariant. That surface is
+/// closed by D0's navigation policy (`#/auth/*` is cancelled in the webview),
+/// not by this flag.
+const D1_CLOUD_SURFACE_FLAGS: &str = "disable-registration disable-dashboard-templates-section \
+     disable-google-fonts-provider disable-login-with-password";
 
 /// Compose the frontend flag string: the supervisor defaults + the plugins
 /// flag (E7 ships plugins enabled) + the D1 cloud-surface flags, plus any
@@ -1110,16 +1121,23 @@ mod tests {
             "disable-registration",
             "disable-dashboard-templates-section",
             "disable-google-fonts-provider",
+            // Added after the D1 task 4 live audit proved boot survives it:
+            // the flag is frontend-only, so /__bootstrap's server-side login
+            // still works. See D1_CLOUD_SURFACE_FLAGS for the evidence.
+            "disable-login-with-password",
         ] {
-            assert!(flags.contains(expected), "missing {expected} in {flags}");
+            // Exact-token, not `contains`: a missing separator would fuse two
+            // flags into one token that Penpot silently ignores, and a
+            // substring check would still pass on that broken string.
+            assert!(
+                flags.split(' ').any(|token| token == expected),
+                "missing {expected} as a standalone token in {flags}"
+            );
         }
         // The plugins flag (E7) must survive the addition.
-        assert!(flags.contains("enable-plugins"), "E7 plugins flag lost");
-        // login-with-password is deliberately NOT disabled here — the
-        // /__bootstrap auto-login uses a password (audited in D1 task 4).
         assert!(
-            !flags.contains("disable-login-with-password"),
-            "login-with-password must not be disabled without the bootstrap audit"
+            flags.split(' ').any(|token| token == "enable-plugins"),
+            "E7 plugins flag lost in {flags}"
         );
     }
 
