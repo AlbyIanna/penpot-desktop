@@ -509,28 +509,52 @@ function isLoopback(u) {
     await page.goto(`${BASE}/__bootstrap`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(SETTLE);
 
+    // PROOF-OF-RENDER before every absence check.
+    //
+    // This is the D0 lesson applied: an absence assertion is worthless unless
+    // you first prove you were looking at a rendered page. A page that failed
+    // to load has no signup form either — so "no form found" would report the
+    // surface as GONE and turn the gate green while the flag did nothing. Each
+    // check therefore returns "gone" | "present" | "inconclusive", and the gate
+    // treats "inconclusive" as a LOUD FAILURE, never as success.
+    const rendered = async () =>
+      (await page.$$eval("body *", (els) => els.length)) > 20;
+
     // Behavioural: the registration surface must not render a signup form.
     await page.goto(`${BASE}/#/auth/register`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(SETTLE);
-    const registrationGone =
-      (await page.$$eval("input[name='password'], input[type='password']", (e) => e.length)) === 0 ||
-      (await page.$$eval("form", (els) =>
-        els.every((f) => !/register|sign\s*up/i.test(f.textContent || "")))); 
+    let registration;
+    if (!(await rendered())) {
+      registration = "inconclusive";
+    } else {
+      const pw = await page.$$eval(
+        "input[type='password']", (e) => e.length);
+      const signup = await page.$$eval("form, button, a", (els) =>
+        els.some((f) => /register|sign\s*up|create account/i.test(f.textContent || "")));
+      registration = pw === 0 && !signup ? "gone" : "present";
+    }
 
     // Behavioural: the dashboard must not show the cloud templates section.
     await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(SETTLE);
-    const templatesSectionGone = (await page.$$eval("*", (els) =>
-      !els.some((e) => /templates/i.test((e.textContent || "").slice(0, 200)) &&
-                        e.children.length === 0)));
+    let templatesSection;
+    if (!(await rendered())) {
+      templatesSection = "inconclusive";
+    } else {
+      const hasTemplates = await page.$$eval("*", (els) =>
+        els.some((e) => /templates/i.test(e.getAttribute?.("class") || "") ||
+                        /view all templates|templates/i.test(
+                          (e.children.length === 0 && e.textContent) || "")));
+      templatesSection = hasTemplates ? "present" : "gone";
+    }
 
     const nonLoopbackRequests = [...new Set(requests.filter((u) => !isLoopback(u)))];
     console.log(JSON.stringify({
       ok: true,
       requests: [...new Set(requests)].length,
       nonLoopbackRequests,
-      registrationGone,
-      templatesSectionGone,
+      registration,      // "gone" | "present" | "inconclusive"
+      templatesSection,  // "gone" | "present" | "inconclusive"
     }));
   } catch (e) {
     console.log(JSON.stringify({ ok: false, error: String(e) }));
@@ -593,13 +617,18 @@ done
 #     upstream flag would still be "served" while the surface came back.
 SURF=$(BASE="$BASE" node "$ROOT/scripts/d1_surfaces.cjs")
 echo "     surfaces: $SURF"
-for key in registrationGone templatesSectionGone; do
+for key in registration templatesSection; do
     v=$(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin).get('$key'))")
-    if [ "$v" = "True" ]; then
-        pass "(b/effect) $key — the surface is actually gone, not just flagged"
-    else
-        fail "(b/effect) $key is False — the flag was SET but did NOT take effect"
-    fi
+    case "$v" in
+        gone)
+            pass "(b/effect) $key — the surface is actually gone, not just flagged" ;;
+        present)
+            fail "(b/effect) $key is PRESENT — the flag was SET but did NOT take effect (upstream may have renamed or dropped it)" ;;
+        *)
+            # Never let "we could not look" read as "it is gone" — that is the
+            # false-pass this whole leg exists to prevent.
+            fail "(b/effect) $key is INCONCLUSIVE — the page did not render, so absence proves nothing; this is an infra failure, not a finding" ;;
+    esac
 done
 
 # (c) ZERO NON-LOOPBACK EGRESS, both sides.
