@@ -1,10 +1,16 @@
 //! D2: the mutation verbs behind `/__home`. Penpot's dashboard is no longer
 //! the way a single user manages their files — this module is.
 //!
-//! Everything here is a straight RPC passthrough: create/rename/move change
-//! the DB, and the sync daemon carries the change to the folder tree on its
-//! normal poll. Delete is different (it must also touch the vault) and is a
-//! later task — deliberately not implemented here.
+//! Create/rename/move are straight RPC passthroughs: they change the DB, and
+//! the sync daemon carries the change to the folder tree on its normal poll.
+//!
+//! Delete is the one verb that touches the vault. It must, because the core
+//! invariant resurrects anything on disk but missing from the DB, and "the
+//! user deleted this" is indistinguishable from "the DB was wiped". It runs
+//! with the sync daemon PAUSED because both possible orderings expose a state
+//! the daemon would otherwise repair: trash-then-delete looks like a new file
+//! in the DB and gets re-exported, delete-then-trash looks like a wiped DB and
+//! gets re-imported.
 //!
 //! Names are validated by [`valid_name`], not sanitised: a name is rejected
 //! outright rather than silently rewritten, so the name on screen always
@@ -21,7 +27,7 @@
 //! no local filesystem work).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
@@ -45,10 +51,24 @@ pub struct ManageState {
     pub token: Option<String>,
     pub team_id: String,
     pub vault_root: PathBuf,
-    /// Lets a later task (delete) pause the daemon across a two-step
-    /// operation. Not wired at boot yet — see `lib.rs::boot` — so this is
-    /// `None` until that task threads a real `SyncControl` through.
-    pub sync: Option<sync_daemon::SyncControl>,
+    /// Late-bound pause/resume handle for `delete_file`.
+    ///
+    /// `boot` (`lib.rs`) merges this router into the proxy BEFORE it spawns
+    /// the sync daemon — see the comment at the merge site — so a real
+    /// `SyncControl` cannot exist yet when `ManageState` is constructed and
+    /// handed to axum as an immutable `Arc`. This starts empty; `boot` holds
+    /// the same `Arc<OnceLock<_>>` and calls `.set()` on it the moment the
+    /// daemon spawns (mirrors `home.rs`'s late-bound `strip_rx`, just with a
+    /// `OnceLock` instead of a `watch` channel since there's nothing to
+    /// stream — one value, set once).
+    ///
+    /// `delete_file` REJECTS a request that arrives before this is set,
+    /// rather than either silently skipping the pause (which would corrupt
+    /// state per the module docs above) or blocking indefinitely (the daemon
+    /// never spawns at all when boot has no access token / default team —
+    /// see `lib.rs::boot`'s `sync_daemon` match — so blocking could hang a
+    /// request forever).
+    pub sync: Arc<OnceLock<sync_daemon::SyncControl>>,
 }
 
 impl ManageState {
@@ -205,7 +225,10 @@ const DUPLICATE_EXPORT_FLAGS: (bool, bool) = (false, true);
 pub struct DuplicateReq {
     pub file_id: String,
     pub name: String,
-    /// Target project; defaults to the source file's project when omitted.
+    /// Target project. REQUIRED in practice — omitting it is a 400, not a
+    /// fallback to the source file's project. Looking that up would cost an
+    /// extra round trip, and the caller always knows it: the home page reads
+    /// it off the card it just clicked.
     #[serde(default)]
     pub project_id: Option<String>,
 }
@@ -239,6 +262,122 @@ async fn duplicate_file(State(st): State<Arc<ManageState>>, Json(req): Json<Dupl
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteReq {
+    pub file_id: String,
+}
+
+/// Compact, filesystem-safe stamp (`YYYYMMDD-HHMMSS`) from a unix timestamp.
+/// Split out from the handler so it is testable without a clock.
+pub fn trash_stamp_from(unix_secs: i64) -> String {
+    // Deliberately not RFC3339: colons are illegal in directory names on
+    // Windows and awkward everywhere else.
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    )
+}
+
+/// Howard Hinnant's days-from-civil, inverted. Avoids pulling in `chrono`
+/// just to name a directory.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Ensures a daemon pause is always released: on the happy path, on any
+/// `Err` from the RPC delete or the trash move, and even if the code in
+/// between panics. `Drop` is the only one of the three that a plain
+/// `pause(); ...; resume();` pair cannot give you — an early `?` return
+/// already skips a bare trailing `resume()`, and a panic skips it too.
+struct PauseGuard(sync_daemon::SyncControl);
+
+impl PauseGuard {
+    fn new(sync: sync_daemon::SyncControl) -> Self {
+        sync.pause();
+        PauseGuard(sync)
+    }
+}
+
+impl Drop for PauseGuard {
+    fn drop(&mut self) {
+        self.0.resume();
+    }
+}
+
+fn sync_not_ready() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "sync daemon not ready yet — the stack is still starting up" })),
+    )
+        .into_response()
+}
+
+async fn delete_file(State(st): State<Arc<ManageState>>, Json(req): Json<DeleteReq>) -> Response {
+    let Some(client) = st.client() else { return no_token() };
+
+    // See the `sync` field doc on `ManageState`: reject rather than skip the
+    // pause or block forever.
+    let Some(sync) = st.sync.get() else { return sync_not_ready() };
+
+    // Pause the daemon for the whole two-step operation. Either order of
+    // (RPC delete, trash) exposes a state the daemon would "repair" — see the
+    // module docs — so it must not observe the midpoint at all. `_pause`'s
+    // `Drop` releases it on every exit path below, including `?`-early-return
+    // and panics.
+    let _pause = PauseGuard::new(sync.clone());
+    let result = delete_inner(&st, &client, &req.file_id).await;
+
+    match result {
+        Ok(rel) => Json(json!({ "ok": true, "trashedPath": rel })).into_response(),
+        Err(e) => upstream_error(e),
+    }
+}
+
+async fn delete_inner(
+    st: &ManageState,
+    client: &PenpotClient,
+    file_id: &str,
+) -> Result<String, String> {
+    // DB first: if this fails, the vault is untouched and the user still has
+    // their file. The reverse (trash first) would leave the DB authoritative
+    // over an empty tree.
+    client.delete_file(file_id).await.map_err(|e| format!("delete-file RPC failed: {e}"))?;
+
+    let stamp = trash_stamp_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
+    let vault = st.vault_root.clone();
+    let id = file_id.to_string();
+    let outcome = tokio::task::spawn_blocking(move || sync_core::trash::trash_file(&vault, &id, &stamp))
+        .await
+        .map_err(|e| format!("trash task panicked: {e}"))?
+        .map_err(|e| format!("trashing the file failed: {e}"))?;
+
+    Ok(outcome
+        .trashed_path
+        .strip_prefix(&st.vault_root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| outcome.trashed_path.to_string_lossy().to_string()))
+}
+
 /// Build the D2 manage routes for the proxy's extra router.
 pub fn router(state: Arc<ManageState>) -> Router {
     Router::new()
@@ -247,6 +386,7 @@ pub fn router(state: Arc<ManageState>) -> Router {
         .route("/__api/vault/manage/rename", post(rename))
         .route("/__api/vault/manage/move", post(move_files))
         .route("/__api/vault/manage/duplicate", post(duplicate_file))
+        .route("/__api/vault/manage/delete", post(delete_file))
         .with_state(state)
 }
 
@@ -330,5 +470,79 @@ mod tests {
         // 2.16.2 (E3). Pin the pair we send so a well-meaning edit to
         // "include everything" fails here instead of at runtime.
         assert_eq!(DUPLICATE_EXPORT_FLAGS, (false, true));
+    }
+
+    #[test]
+    fn delete_stamp_is_filename_safe() {
+        // The stamp lands in a directory name inside .trash/.
+        let s = super::trash_stamp_from(1_753_000_000);
+        assert!(!s.contains(':'), "colon in {s} breaks on some filesystems");
+        assert!(!s.contains('/'), "separator in {s}");
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'), "unexpected char in {s}");
+    }
+
+    #[test]
+    fn trash_stamp_from_matches_independently_computed_utc_strings() {
+        // Expected values computed via Python's datetime.utcfromtimestamp
+        // (a completely separate implementation from civil_from_days), not
+        // by re-deriving them from the function under test:
+        //   0            -> 1970-01-01 00:00:00 UTC (the epoch itself)
+        //   1_000_000_000 -> 2001-09-09 01:46:40 UTC (the well-known "1
+        //                    billion seconds" moment)
+        //   1_700_000_000 -> 2023-11-14 22:13:20 UTC
+        assert_eq!(super::trash_stamp_from(0), "19700101-000000");
+        assert_eq!(super::trash_stamp_from(1_000_000_000), "20010909-014640");
+        assert_eq!(super::trash_stamp_from(1_700_000_000), "20231114-221320");
+    }
+
+    /// Spawn a real (offline) daemon so the pause/resume handle is the
+    /// genuine `sync_daemon::SyncControl`, not a test double — mirrors
+    /// `status.rs`'s `offline_daemon()` helper. The backend URL is
+    /// unroutable, so the engine just retries reconciliation in the
+    /// background; the control handle works regardless.
+    fn offline_sync_control() -> (sync_daemon::SyncDaemonHandle, sync_daemon::SyncControl) {
+        let root = std::env::temp_dir().join(format!(
+            "penpot-desktop-manage-test-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let client = penpot_rpc::PenpotClient::new("http://127.0.0.1:9");
+        let handle = sync_daemon::spawn(client, sync_daemon::SyncConfig::new(root, "team"));
+        let control = handle.control();
+        (handle, control)
+    }
+
+    #[tokio::test]
+    async fn pause_guard_resumes_on_normal_drop() {
+        let (daemon, control) = offline_sync_control();
+        assert!(!control.is_paused());
+        {
+            let _guard = super::PauseGuard::new(control.clone());
+            assert!(control.is_paused(), "guard construction must pause");
+        }
+        assert!(!control.is_paused(), "guard drop must resume");
+        drop(daemon);
+    }
+
+    #[tokio::test]
+    async fn pause_guard_resumes_even_when_the_guarded_work_panics() {
+        // The whole point of using a Drop guard instead of a manual
+        // pause/.../resume pair: it must release the pause even when the
+        // code in between never reaches the resume call, e.g. because it
+        // panics (mirrors a bug in delete_inner, not just a returned Err).
+        // `catch_unwind` only unwinds the current call stack — the runtime
+        // underneath this test is unaffected either way.
+        let (daemon, control) = offline_sync_control();
+        let control_for_panic = control.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = super::PauseGuard::new(control_for_panic);
+            panic!("simulated failure inside the guarded delete operation");
+        }));
+        assert!(result.is_err(), "the panic must have actually happened");
+        assert!(!control.is_paused(), "Drop must run and resume even after a panic");
+        drop(daemon);
     }
 }
