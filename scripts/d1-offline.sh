@@ -12,13 +12,20 @@
 #       this leg alone is never trusted.
 #   (b) TOOK EFFECT — the assertion that actually matters (PLAN4 risk 4).
 #       `node scripts/d1_surfaces.cjs` drives the real SPA (bootstrap login,
-#       #/auth/register, the dashboard) and reports tri-state
-#       gone|present|inconclusive for two surfaces:
+#       #/auth/register, #/auth/login, the dashboard) and reports tri-state
+#       gone|present|inconclusive for three surfaces:
 #         * templatesSection MUST be "gone" — verified live, this flag
 #           genuinely removes the cloud-templates section. "present" fails.
+#         * loginForm MUST be "gone" (no password input, no submit control) —
+#           verified live (D1 task 4), this flag genuinely strips the login
+#           form's fields. "present" fails. This closes what used to be this
+#           gate's KNOWN GAP (a manual, one-shot audit with no automated
+#           re-check); see `.superpowers/sdd/d1-login-audit.md` for the
+#           original manual evidence this behavioural check now re-derives.
 #         * registration is EXPECTED to read "present" and that is NOT a
-#           failure here — see the KNOWN, DOCUMENTED LIMIT below. Only
-#           "inconclusive" (the probe could not look) fails this leg.
+#           failure here — see the (navwatch) leg below, which is what makes
+#           that tolerable. Only "inconclusive" (the probe could not look)
+#           fails this leg for any of the three surfaces.
 #       "inconclusive" always FAILS LOUDLY and is reported as an
 #       INFRASTRUCTURE FAILURE, never as a negative finding — a page that
 #       never rendered proves nothing about what is or isn't on it, and
@@ -31,43 +38,39 @@
 #       if reached directly, and the backend signup RPC stays live — our own
 #       single-user provisioning calls that exact RPC, and that path runs on
 #       EVERY DB WIPE (the project's P0 core invariant), so it cannot be
-#       disabled backend-side. That surface is closed instead by D0's
+#       disabled backend-side. That surface is closed instead by D0/D1's
 #       navigation policy: `apps/desktop/src/navwatch.rs`'s `decide()`
-#       cancels `#/auth/*` navigations in the webview and redirects to
-#       `/__home`. This leg runs the EXISTING Rust unit tests
-#       (`cargo test -p penpot-desktop navwatch::tests::`) that exercise that
-#       policy against `#/auth/login` — there is no test literally named
-#       "register", but `decide()`'s boundary-checked prefix match on the
-#       `#/auth` family (`WEB_ROUTE_PREFIXES`) is the SAME code path for
-#       `#/auth/login` and `#/auth/register` (an exact match, or a `/`
-#       subpath, of the `#/auth` prefix), so the passing login-route cases
-#       prove the whole `#/auth/*` family — register included — is
-#       cancelled+redirected. If this leg ever goes red, the registration
-#       surface is no longer closed by anything and (b)'s "present is fine"
-#       tolerance above stops being true.
+#       cancels the ENTIRE `#/auth/*` family in the webview UNCONDITIONALLY —
+#       no env var required — and redirects to `/__home`. (D1 hardening: this
+#       used to be gated behind `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`, which
+#       nothing in the shipped product ever sets, so the policy this gate
+#       cited as the reason "registration present" is tolerable was actually
+#       DORMANT by default — see .superpowers/sdd/task-6-report.md finding 1.
+#       `#/dashboard`/`#/settings` are UNCHANGED: still measurement-only,
+#       still gated behind that env var, because their native replacement
+#       doesn't exist until D2/D3.) This leg runs the EXISTING Rust unit
+#       tests (`cargo test -p penpot-desktop navwatch::tests::`) and requires
+#       the SPECIFIC tests that pin the unconditional `#/auth` contract with
+#       the env var OFF (the product's actual default) — not just "the suite
+#       passed". If this leg ever goes red, the registration surface is no
+#       longer closed by anything and (b)'s "present is fine" tolerance above
+#       stops being true.
 #   (c) ZERO NON-LOOPBACK EGRESS, both sides, sampled AFTER a realistic
 #       session (create a file, edit it, export it via `export-binfile`) so
 #       the socket check isn't just watching an idle boot:
 #         * (c/spa) the SPA's own request log (from the same browser session
-#           that measured (b)) must show zero non-loopback requests.
+#           that measured (b)) must show zero non-loopback requests. Guarded
+#           on the total request count being non-zero first — an observer
+#           that captured no traffic at all would make nonLoopbackRequests=[]
+#           vacuous, not a real zero-egress finding.
 #         * (c/proc) one `lsof -nP -i` SAMPLE of the supervised process tree,
 #           parsed by `scripts/d1_egress.py`, must show zero non-loopback
 #           peers. THIS IS A SAMPLE, NOT A PROOF OF ABSENCE — a connection
 #           that opens and closes between polls could be missed. It is a
-#           strong signal, stated here as exactly that.
-#
-# KNOWN GAP (documented, not silently dropped): `disable-login-with-password`
-# was added to `D1_CLOUD_SURFACE_FLAGS` after this gate's brief was written
-# (D1 task 4, live-audited: `#/auth/login` renders with no email field, no
-# password field, no submit button — see `.superpowers/sdd/d1-login-audit.md`).
-# This gate's (a) leg asserts the token is SERVED. It does not re-derive a
-# dedicated BEHAVIOURAL re-check for it here: `scripts/d1_surfaces.cjs` (Task
-# 5's finalized, live-verified observer) does not carry a key for the login
-# page, and extending it without a live stack to verify the new selector
-# logic against would trade a documented gap for an unverified assertion in a
-# P0-adjacent gate. Task 4's live evidence stands as the behavioural proof;
-# adding a `loginPassword` key to the observer is a natural, low-risk
-# follow-up left for a dedicated task.
+#           strong signal, stated here as exactly that. Guarded on the total
+#           connection count being non-zero first (same vacuous-pass family
+#           as (c/spa)) — an lsof invocation that silently failed and
+#           produced nothing must not read as "verified clean".
 #
 # Dedicated ports: proxy 9046, backend 6508, postgres 5581, valkey 6524
 # (control 9047 reserved, not bound — headless.rs only opens a control
@@ -255,10 +258,17 @@ echo "     surfaces: $SURF"
 SURF_OK="$(echo "$SURF" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null || echo False)"
 if [ "$SURF_OK" != "True" ]; then
     fail "(b/effect) d1_surfaces.cjs did not complete successfully — INFRASTRUCTURE FAILURE, no surface measurement is trustworthy: $(cat "$WORK_DIR/surfaces.err")"
-    SURF='{"nonLoopbackRequests":[],"registration":null,"templatesSection":null}'
+    # Tri-state fallback uses the contract's own "inconclusive" string, not
+    # JSON null — a null here would print as Python's "None" downstream and
+    # contradict the documented gone|present|inconclusive contract even
+    # though the case statements below already fail correctly on it.
+    SURF='{"requests":0,"nonLoopbackRequests":[],"registration":"inconclusive","templatesSection":"inconclusive","loginForm":"inconclusive"}'
 fi
 
-REG_V="$(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin).get('registration'))")"
+# `or 'inconclusive'` (not just `.get(key, 'inconclusive')`) so a JSON null —
+# not just a missing key — also renders as the contract value, never as
+# Python's bare "None" (finding 5).
+REG_V="$(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin).get('registration') or 'inconclusive')")"
 case "$REG_V" in
     gone)
         pass "(b/effect) registration — the surface is actually gone" ;;
@@ -269,8 +279,9 @@ case "$REG_V" in
         echo "     signup form if reached directly, and the backend signup RPC stays live — our own"
         echo "     single-user provisioning calls that exact RPC, and that path runs on EVERY DB WIPE"
         echo "     (the project's P0 core invariant), so it cannot be disabled backend-side. This"
-        echo "     surface is closed instead by D0's navigation policy (navwatch::decide cancels"
-        echo "     #/auth/* in the webview) — asserted separately below, not by this DOM probe."
+        echo "     surface is closed instead by D0/D1's navigation policy (navwatch::decide cancels"
+        echo "     #/auth/* in the webview UNCONDITIONALLY) — asserted separately below, not by this"
+        echo "     DOM probe."
         ;;
     *)
         # Never let "we could not look" read as "it is gone" — that is the
@@ -279,7 +290,7 @@ case "$REG_V" in
         ;;
 esac
 
-TMPL_V="$(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin).get('templatesSection'))")"
+TMPL_V="$(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin).get('templatesSection') or 'inconclusive')")"
 case "$TMPL_V" in
     gone)
         pass "(b/effect) templatesSection — the surface is actually gone, not just flagged" ;;
@@ -289,12 +300,32 @@ case "$TMPL_V" in
         fail "(b/effect) templatesSection is INCONCLUSIVE ($TMPL_V) — the page did not render, so absence proves nothing; this is an INFRASTRUCTURE FAILURE, not a real negative finding" ;;
 esac
 
+# `disable-login-with-password` behavioural re-check (finding 3 closes the
+# gate's former KNOWN GAP: task 4's live audit was manual and one-shot; this
+# is the automated, repeatable re-check via the SAME observer + tri-state
+# idiom used for registration/templatesSection above).
+LOGIN_V="$(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin).get('loginForm') or 'inconclusive')")"
+case "$LOGIN_V" in
+    gone)
+        pass "(b/effect) loginForm — disable-login-with-password actually removed the password field and submit control, not just flagged" ;;
+    present)
+        fail "(b/effect) loginForm is PRESENT — disable-login-with-password was SET but did NOT take effect" ;;
+    *)
+        fail "(b/effect) loginForm is INCONCLUSIVE ($LOGIN_V) — the page did not render, so absence proves nothing; this is an INFRASTRUCTURE FAILURE, not a real negative finding" ;;
+esac
+
 # --- (navwatch) THE REGISTRATION CLOSURE — proven by policy, not DOM-probed -
 # registration=present above is only tolerable if navwatch::decide() really
-# does cancel+redirect the #/auth family in the webview. Run the EXISTING
-# Rust unit tests that exercise that policy (no live stack needed for this
-# leg — pure function, per apps/desktop/src/navwatch.rs).
-echo "-- (navwatch) cargo test -p penpot-desktop navwatch::tests:: (D0 navigation policy)"
+# does cancel+redirect the #/auth family in the webview — UNCONDITIONALLY,
+# with no env var required (D1 hardening: the policy used to be dormant by
+# default, since only PENPOT_LOCAL_NAVWATCH_REDIRECT=1 enabled it and nothing
+# in the shipped product ever sets that var — see .superpowers/sdd/task-6-report.md
+# finding 1). Run the EXISTING Rust unit tests that exercise that policy (no
+# live stack needed for this leg — pure function, per
+# apps/desktop/src/navwatch.rs), and require the SPECIFIC tests that pin the
+# unconditional contract, not just "the suite passed" (a renamed/weakened
+# test could still make the suite green while the policy regressed).
+echo "-- (navwatch) cargo test -p penpot-desktop navwatch::tests:: (D0/D1 navigation policy)"
 NAVWATCH_LOG="$WORK_DIR/navwatch-test.log"
 if (cd "$ROOT" && cargo test -p penpot-desktop navwatch::tests::) >"$NAVWATCH_LOG" 2>&1; then
     NAVWATCH_RC=0
@@ -302,16 +333,19 @@ else
     NAVWATCH_RC=$?
 fi
 if [ "$NAVWATCH_RC" -eq 0 ] &&
-    grep -q "test navwatch::tests::web_routes_redirect_to_home_when_enabled ... ok" "$NAVWATCH_LOG" &&
+    grep -q "test navwatch::tests::auth_family_is_cancelled_even_with_redirect_disabled ... ok" "$NAVWATCH_LOG" &&
+    grep -q "test navwatch::tests::auth_family_is_cancelled_with_redirect_enabled_too ... ok" "$NAVWATCH_LOG" &&
+    grep -q "test navwatch::tests::dashboard_and_settings_are_allowed_with_redirect_disabled ... ok" "$NAVWATCH_LOG" &&
     grep -q "test navwatch::tests::prefix_match_still_redirects_exact_and_subpath ... ok" "$NAVWATCH_LOG"; then
-    pass "(navwatch) navwatch::decide cancels-and-redirects the #/auth family when enabled"
+    pass "(navwatch) navwatch::decide cancels-and-redirects the #/auth family UNCONDITIONALLY (no env var), while #/dashboard and #/settings stay open by default as measurement-only"
     echo "     NOTE: no test is literally named \"register\" — decide()'s boundary-checked prefix"
-    echo "     match on WEB_ROUTE_PREFIXES treats \"#/auth\" as a family (exact match OR a \"/\""
-    echo "     subpath), so the passing #/auth/login cases above exercise the SAME code path that"
-    echo "     #/auth/register hits. That is what makes registration=present (asserted above) a"
-    echo "     tolerated outcome rather than a silent hole."
+    echo "     match on the #/auth family (exact match OR a \"/\" subpath) is the SAME code path for"
+    echo "     #/auth/login and #/auth/register, and auth_family_is_cancelled_even_with_redirect_disabled"
+    echo "     exercises that family with the env var OFF — the shipped product's actual default. That"
+    echo "     is what makes registration=present (asserted above) a tolerated outcome rather than a"
+    echo "     silent hole, and it no longer depends on an env var the product never sets."
 else
-    fail "(navwatch) cargo test -p penpot-desktop navwatch::tests:: did not confirm the #/auth redirect policy (rc=$NAVWATCH_RC) — see $NAVWATCH_LOG"
+    fail "(navwatch) cargo test -p penpot-desktop navwatch::tests:: did not confirm the unconditional #/auth redirect policy (rc=$NAVWATCH_RC) — see $NAVWATCH_LOG"
 fi
 
 # --- (c/spa) ZERO NON-LOOPBACK EGRESS — SPA side (same session as (b)) -----
@@ -323,11 +357,20 @@ fi
 if [ "$SURF_OK" != "True" ]; then
     fail "(c/spa) SKIPPED — d1_surfaces.cjs did not complete, so there is no real request log to check (INFRASTRUCTURE FAILURE, already reported above; NOT a zero-egress finding)"
 else
-    SPA_BAD="$(echo "$SURF" | python3 -c "import json,sys;print(len(json.load(sys.stdin).get('nonLoopbackRequests',[])))")"
-    if [ "$SPA_BAD" = "0" ]; then
-        pass "(c/spa) the SPA made ZERO non-loopback requests"
+    # Sanity check BEFORE trusting nonLoopbackRequests==[] as exhaustive
+    # (finding 6, same vacuous-pass family as (c/proc) below): a browser
+    # session that made zero requests of ANY kind never actually observed
+    # network traffic, so an empty non-loopback list would prove nothing.
+    REQ_TOTAL="$(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin).get('requests', 0))")"
+    if [ "$REQ_TOTAL" = "0" ]; then
+        fail "(c/spa) INFRASTRUCTURE FAILURE — the browser observer recorded ZERO requests total (not even the page's own loopback traffic); nonLoopbackRequests=[] is vacuous here, not evidence of zero egress"
     else
-        fail "(c/spa) the SPA attempted $SPA_BAD non-loopback request(s): $(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin)['nonLoopbackRequests'])")"
+        SPA_BAD="$(echo "$SURF" | python3 -c "import json,sys;print(len(json.load(sys.stdin).get('nonLoopbackRequests',[])))")"
+        if [ "$SPA_BAD" = "0" ]; then
+            pass "(c/spa) the SPA made ZERO non-loopback requests ($REQ_TOTAL total request(s) observed, confirming the session was actually captured)"
+        else
+            fail "(c/spa) the SPA attempted $SPA_BAD non-loopback request(s): $(echo "$SURF" | python3 -c "import json,sys;print(json.load(sys.stdin)['nonLoopbackRequests'])")"
+        fi
     fi
 fi
 
@@ -372,14 +415,29 @@ else
 fi
 
 # --- (c/proc) ZERO NON-LOOPBACK EGRESS — process side, ONE SAMPLE ----------
+# `lsof` errors are swallowed above (`|| true`) because a transient lsof
+# failure must not abort the whole gate — but that also means an lsof that
+# silently produced NOTHING (permissions hiccup, process already gone, wrong
+# PID set, etc.) would otherwise flow straight through d1_egress.py parse
+# (which returns nonLoopback:[] on empty input BY DESIGN) and read as a clean
+# pass with zero evidence a sample ever actually happened (finding 2). Guard
+# against that vacuous pass: require at least one CONNECTION of any kind
+# (loopback included — this stack always holds several, e.g. the proxy<->
+# backend/postgres/valkey sockets) before trusting the zero-non-loopback
+# verdict.
 lsof -nP -i -a -p "$(pgrep -P "$HEADLESS_PID" | tr '\n' ',' | sed 's/,$//'),$HEADLESS_PID" \
     >"$WORK_DIR/lsof.txt" 2>/dev/null || true
 EG="$(python3 "$EGRESS_PY" parse "$WORK_DIR/lsof.txt")"
-PROC_BAD="$(echo "$EG" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['nonLoopback']))")"
-if [ "$PROC_BAD" = "0" ]; then
-    pass "(c/proc) no supervised process holds a non-loopback connection (single lsof sample — see header caveat)"
+CONN_TOTAL="$(echo "$EG" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['connections']))")"
+if [ "$CONN_TOTAL" = "0" ]; then
+    fail "(c/proc) INFRASTRUCTURE FAILURE — the lsof sample captured ZERO connections of any kind (not even our own loopback sockets); nonLoopback=[] is vacuous here, not evidence of zero egress — see $WORK_DIR/lsof.txt"
 else
-    fail "(c/proc) non-loopback connection(s): $(echo "$EG" | python3 -c "import json,sys;print(json.load(sys.stdin)['nonLoopback'])")"
+    PROC_BAD="$(echo "$EG" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['nonLoopback']))")"
+    if [ "$PROC_BAD" = "0" ]; then
+        pass "(c/proc) no supervised process holds a non-loopback connection ($CONN_TOTAL loopback connection(s) observed, confirming the sample was real — single lsof sample, not a proof of absence: a connection that opens and closes between polls could be missed)"
+    else
+        fail "(c/proc) non-loopback connection(s): $(echo "$EG" | python3 -c "import json,sys;print(json.load(sys.stdin)['nonLoopback'])")"
+    fi
 fi
 
 # --- shutdown ----------------------------------------------------------------

@@ -192,6 +192,24 @@ async function main() {
       templatesSection = hasTemplates ? "present" : "gone";
     }
 
+    // Behavioural: the login-with-password surface must not render a
+    // password field or a submit control. D1 task 4 live-audited this once
+    // by hand (`.superpowers/sdd/d1-login-audit.md`); this is that audit's
+    // automated, repeatable re-check (Task 6 finding 3) using the SAME
+    // proof-of-render + tri-state idiom as registration/templatesSection
+    // above, not a second mechanism.
+    await page.goto(`${BASE}/#/auth/login`, { waitUntil: "domcontentloaded" });
+    let loginForm;
+    if (!(await waitForStableRender(page, SETTLE))) {
+      loginForm = "inconclusive";
+    } else {
+      const pw = await page.$$eval("input[type='password']", (e) => e.length);
+      const submitControls = await page.$$eval(
+        "button[type='submit'], input[type='submit'], form button, form input[type='button']",
+        (e) => e.length);
+      loginForm = pw === 0 && submitControls === 0 ? "gone" : "present";
+    }
+
     const nonLoopbackRequests = [...new Set(
       requests.filter((u) => !isNonNetworkUrl(u) && !isLoopback(u)))];
     console.log(JSON.stringify({
@@ -200,6 +218,7 @@ async function main() {
       nonLoopbackRequests,
       registration,      // "gone" | "present" | "inconclusive"
       templatesSection,  // "gone" | "present" | "inconclusive"
+      loginForm,         // "gone" | "present" | "inconclusive"
     }));
     process.exit(0);
   } catch (e) {
