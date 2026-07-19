@@ -88,11 +88,26 @@ fn main() {
                             // the webview's navigation path); hop to the app
                             // thread and navigate there.
                             let h = nav_handle.clone();
-                            let target = path.clone();
                             tauri::async_runtime::spawn(async move {
                                 if let Some(w) = h.get_webview_window("main") {
+                                    // HAZARD (unreachable today, but noted for
+                                    // D2): joining against `w.url()` trusts
+                                    // whatever the window is currently pointed
+                                    // at as the base. Every redirect-eligible
+                                    // navigation today only ever happens after
+                                    // boot has already pointed the window at
+                                    // the proxy origin, so this always resolves
+                                    // against `http://localhost:<proxy-port>`.
+                                    // But if a redirect-eligible navigation
+                                    // ever fired BEFORE boot repoints the
+                                    // window (still on `tauri://localhost`),
+                                    // this would join to
+                                    // `tauri://localhost/__home` instead of the
+                                    // proxy. D2 should pin the proxy origin
+                                    // explicitly rather than joining against
+                                    // whatever the current URL happens to be.
                                     if let Ok(base) = w.url() {
-                                        if let Ok(dest) = base.join(&target) {
+                                        if let Ok(dest) = base.join(&path) {
                                             let _ = w.navigate(dest);
                                         }
                                     }

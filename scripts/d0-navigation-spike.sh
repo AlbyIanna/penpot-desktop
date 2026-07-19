@@ -16,7 +16,7 @@
 # definite, parseable true/false — a NO-GO (not observed) is a legitimate
 # result that lowers PLAN4 chapter 4's ceiling; it still passes the gate. The
 # GO/NO-GO verdict is written to findings.json as DATA, not asserted as a
-# direction. This task (6) does NOT compute `redirectWorks`/`workspaceIntact`
+# direction. This task (6) does NOT compute `redirectWorks`/`vaultIntact`
 # — Task 7 (below, legs (e)/(f)) fills them in when hashObserved is True;
 # they stay null otherwise (nothing to redirect).
 #
@@ -357,8 +357,16 @@ fi
 # same-document hash change observed there is nothing to redirect, and
 # testing it would be meaningless (see CONTROLLER DECISION above). Mirrors
 # Task 6's own null-writing for these two findings.json fields.
+#
+# NOTE on naming: this measures a hash over a hand-seeded canary `.penpot`
+# dir under VAULT, exercised from /__navprobe — no workspace was ever open
+# during this gate. That is narrower than PLAN4's D0 exit criterion (evidence
+# that redirecting mid-session leaves the live workspace undisturbed), so the
+# findings.json field is named `vaultIntact`: it names what was actually
+# measured (the on-disk vault tree), not a live workspace session. D2 must
+# re-assert this with a real file actually open.
 REDIRECT_WORKS="None"
-WORKSPACE_INTACT="None"
+VAULT_INTACT="None"
 REDIR_RAN="None"
 if [ "$HASH_OBSERVED" = "True" ]; then
     # HASH_BEFORE is taken now — after the (a)-(d) boots above have already
@@ -406,24 +414,24 @@ if [ "$HASH_OBSERVED" = "True" ]; then
         REDIR_RAN="False"
     fi
 
-    # (f) INTEGRITY: the vault must be byte-identical across the mid-session
-    #     cancel+redirect — folder-is-truth is this project's P0 (CLAUDE.md)
-    #     and a navigation trick must not dent it. Gated on the redirect
-    #     leg's own proof-of-life: if that app never booted, the vault was
-    #     never touched either way and HASH_AFTER == HASH_BEFORE would be a
+    # (f) INTEGRITY: the vault must be byte-identical across the redirect
+    #     boot — folder-is-truth is this project's P0 (CLAUDE.md) and a
+    #     navigation trick must not dent it. Gated on the redirect leg's own
+    #     proof-of-life: if that app never booted, the vault was never
+    #     touched either way and HASH_AFTER == HASH_BEFORE would be a
     #     vacuous pass, not a real measurement — so this must fail loudly
     #     too rather than silently record a (meaningless) true.
     if [ "$REDIR_RAN" = "True" ]; then
         HASH_AFTER="$(vault_hash)"
         if [ "$HASH_AFTER" = "$HASH_BEFORE" ]; then
-            WORKSPACE_INTACT="True"
-            pass "(f/integrity) vault tree byte-identical across the mid-session redirect"
+            VAULT_INTACT="True"
+            pass "(f/integrity) vault tree byte-identical across the redirect boot (boot+reconcile included, not isolated; no workspace was open — see notes.vaultIntactCaveat)"
         else
-            WORKSPACE_INTACT="False"
+            VAULT_INTACT="False"
             fail "(f/integrity) vault tree CHANGED across the redirect (before=$HASH_BEFORE after=$HASH_AFTER)"
         fi
     else
-        WORKSPACE_INTACT="None"
+        VAULT_INTACT="None"
         fail "(f/integrity) SKIPPED — the redirect leg (e) never ran (no proof-of-life), so before/after is not a real measurement; this is an infra failure carried over from (e), not a passing (or failing) result"
     fi
 else
@@ -431,7 +439,7 @@ else
 fi
 
 # --- findings.json -----------------------------------------------------------
-# redirectWorks / workspaceIntact (Task 7, legs (e)/(f) above) are real
+# redirectWorks / vaultIntact (Task 7, legs (e)/(f) above) are real
 # measurements when hashObserved is True; they stay null when there was
 # nothing to redirect, or when the redirect leg itself never got proof of
 # life (an infra failure, not a "false" measurement — see (f) above).
@@ -441,7 +449,7 @@ fi
 # itself, so a reader of findings.json can tell "the probe ran and measured
 # X" apart from "the probe never ran" — the latter must never be read as a
 # measurement.
-python3 - "$FINDINGS" "$FULL_OBSERVED" "$HASH_OBSERVED" "$PUSH_OBSERVED" "$USES_ANCHOR" "$PENPOT" "$FULL_RAN" "$HASH_RAN" "$PUSH_RAN" "$REDIRECT_WORKS" "$WORKSPACE_INTACT" "$REDIR_RAN" <<'PY'
+python3 - "$FINDINGS" "$FULL_OBSERVED" "$HASH_OBSERVED" "$PUSH_OBSERVED" "$USES_ANCHOR" "$PENPOT" "$FULL_RAN" "$HASH_RAN" "$PUSH_RAN" "$REDIRECT_WORKS" "$VAULT_INTACT" "$REDIR_RAN" <<'PY'
 import json, sys
 
 def to_bool_or_none(s):
@@ -451,7 +459,7 @@ def to_bool_or_none(s):
         return False
     return None
 
-path, full_o, hash_o, push_o, anchor_o, penpot_raw, full_r, hash_r, push_r, redirect_o, workspace_o, redirect_r = sys.argv[1:13]
+path, full_o, hash_o, push_o, anchor_o, penpot_raw, full_r, hash_r, push_r, redirect_o, vault_o, redirect_r = sys.argv[1:13]
 try:
     penpot_json = json.loads(penpot_raw)
 except Exception:
@@ -476,9 +484,10 @@ findings = {
         "redirect": to_bool_or_none(redirect_r),
     },
     "redirectWorks": to_bool_or_none(redirect_o),
-    "workspaceIntact": to_bool_or_none(workspace_o),
+    "vaultIntact": to_bool_or_none(vault_o),
     "verdict": verdict,
     "notes": {
+        "vaultIntactCaveat": "measures a hash over a hand-seeded canary .penpot dir under VAULT, exercised from /__navprobe; no workspace was ever open during this gate — narrower than 'the workspace stays intact'. D2 must re-assert this with a real file actually open.",
         "usesAnchorHrefCaveat": "d0_penpot_nav.cjs uses a fixed 4s post-load wait; a slower SPA render reads as a false negative here",
         "probeRan": "proof-of-life per case (baseline navwatch observation seen); if false for a case, that case's *Observed field is null (infra failure, not a measurement) and its FAIL was already reported above",
     },
@@ -490,8 +499,18 @@ with open(path, "w", encoding="utf-8") as f:
 print(json.dumps(findings, indent=2, sort_keys=True))
 PY
 
+# The spike's own deliverable must survive a successful run: cleanup() below
+# rm -rf's WORK_DIR (where $FINDINGS lives) whenever FAIL==0, so copy it to a
+# durable location NOW, before that happens, and report that surviving path
+# rather than the one that's about to be deleted. Not committed to git —
+# this is a run artifact, not a repo file.
+DURABLE_FINDINGS_DIR="${D0_FINDINGS_DIR:-$HOME/.cache/penpot-local/d0-findings}"
+mkdir -p "$DURABLE_FINDINGS_DIR"
+DURABLE_FINDINGS="$DURABLE_FINDINGS_DIR/findings-$(date +%Y%m%dT%H%M%S).json"
+cp "$FINDINGS" "$DURABLE_FINDINGS"
+
 echo
-echo "== findings written to $FINDINGS =="
+echo "== findings written to $DURABLE_FINDINGS (copied out of $WORK_DIR before teardown) =="
 echo "D0 VERDICT (data, not an assertion of direction): hashObserved=$HASH_OBSERVED"
 
 echo

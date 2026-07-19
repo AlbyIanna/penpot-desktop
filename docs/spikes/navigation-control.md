@@ -55,7 +55,7 @@ off Penpot's real router. Instead the gate isolates the question onto **our own 
 | (d) Reality check — does Penpot use anchor `href`s? | `usesAnchorHref` | `true` (`penpotNavRaw.anchors = [{"href": "/#/dashboard/recent"}]`) | Penpot's real dashboard links via `<a href="#/dashboard/...">`, which is exactly the case the `hash` probe measured. See caveat 2 below. |
 | — | `probeRan` | `{full: true, hash: true, pushstate: true, redirect: true}` | Proof-of-life for every leg: each case's app actually booted and produced a baseline observation before its measurement is trusted. |
 | (e) Redirect | `redirectWorks` | `true` | With `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`, a navigation to `#/dashboard` was cancelled and the window was sent to `/__home` instead. |
-| (f) Integrity | `workspaceIntact` | `true` | The vault directory tree (seeded with a canary `.penpot` dir before any boot) was byte-identical before and after the mid-session redirect boot. See caveat 3 below — this is narrower than "the redirect is harmless to disk." |
+| (f) Integrity | `vaultIntact` | `true` | The **on-disk vault tree** (seeded with a canary `.penpot` dir before any boot) was byte-identical before and after the redirect boot. This is a hash over files on disk, exercised from `/__navprobe` — no workspace was ever open during this gate. See caveat 3 below for exactly what was and was not measured. |
 | — | `verdict` | `"GO (hash change IS observed by on_navigation)"` | Computed directly from `hashObserved`. |
 
 ### The captured URL trace (leg e, both runs — the single most important piece of evidence)
@@ -106,6 +106,18 @@ These are not fine print; each one bounds what D2/D6 may claim.
    normal boot/reconcile cycle. Do not describe this as "the redirect was proven
    harmless to disk"; describe it as what was actually shown: a boot that includes a
    mid-session hash-route cancellation left the on-disk vault unchanged.
+
+   **Also important — no workspace was open.** The redirect in leg (e) was triggered
+   from `/__navprobe`, our own page, never from a live workspace session. `vaultIntact`
+   is a hash over a hand-seeded canary `.penpot/` directory sitting on disk, taken
+   before and after the redirect boot — it is a filesystem-level check, not a
+   live-session check. PLAN4's D0 exit criterion asked for "evidence that redirecting
+   mid-session leaves the workspace intact"; that is **not** what this gate measured,
+   which is why the finding is named `vaultIntact` — it names the on-disk tree that was
+   actually hashed, not a claim about a live workspace session.
+   **D2 must re-assert this with a real file actually open** — a live workspace with
+   unsaved state present when the redirect fires — before relying on this result for
+   anything beyond "the redirect mechanism itself does not touch disk."
 4. **GUI-session requirement.** `scripts/d0-navigation-spike.sh` launches the real
    Tauri GUI binary (`penpot-desktop`, not the headless binary) so `on_navigation` can
    attach to a real window. It requires a GUI session and cannot run headlessly in CI —
@@ -133,6 +145,14 @@ The GO verdict sets the **ceiling**, not the guarantee, for both downstream mile
 - **D2** should wire `navwatch`'s redirect policy in for real (it is currently
   env-gated off) as part of making `/__home` the front door, reusing
   `navwatch::decide()` and `HOME_PATH` as-is; no new mechanism is needed.
+- **Warning for D2 — `#/auth` is a loaded gun.** `WEB_ROUTE_PREFIXES` includes
+  `#/auth` (for D6's residue cleanup), but this gate never tested that prefix
+  through the `/__bootstrap` auto-login path — the redirect leg here only ever
+  ran from `/__navprobe`. If auto-login transits an `#/auth/...` fragment on its
+  way to a logged-in session, enabling this redirect policy could cancel login
+  itself. **D2 must verify the bootstrap login path before enabling `#/auth`
+  redirection**, not assume it is safe because `#/dashboard` and `#/settings`
+  measured clean.
 - **D6** can apply the same policy to `#/auth` and `#/settings` (already included in
   `WEB_ROUTE_PREFIXES`) and assert, per caveat 1 above, that the assertion is made
   against the Rust-level `on_navigation` observation, not the Chromium anchor scrape.

@@ -21,6 +21,14 @@ pub const ENV_REDIRECT: &str = "PENPOT_LOCAL_NAVWATCH_REDIRECT";
 pub const HOME_PATH: &str = "/__home";
 
 /// Hash routes that belong to the logged-in web experience.
+//
+// WARNING for D2: `#/auth` is included here because D6's residue cleanup
+// wants it, but D0 never exercised this prefix through the `/__bootstrap`
+// auto-login path — the redirect leg in this spike only ever ran from
+// `/__navprobe`. If auto-login transits an `#/auth/...` fragment on its way
+// to a logged-in session, enabling this redirect policy could cancel login
+// itself. D2 MUST verify the bootstrap login path before turning `#/auth`
+// redirection on for real (see docs/spikes/navigation-control.md).
 const WEB_ROUTE_PREFIXES: [&str; 3] = ["#/dashboard", "#/settings", "#/auth"];
 
 /// What the navigation handler should do with a URL.
@@ -44,7 +52,14 @@ pub fn decide(url: &str, redirect_enabled: bool) -> Decision {
         return Decision::Allow;
     };
     let frag = format!("#{frag}");
-    if WEB_ROUTE_PREFIXES.iter().any(|p| frag.starts_with(p)) {
+    // Boundary-checked match: a prefix only matches on an exact hit or a `/`
+    // boundary, so `#/dashboardXYZ` is NOT treated as `#/dashboard` (a plain
+    // `starts_with` would false-positive on any route that merely shares a
+    // prefix string, e.g. a future `#/dashboard-export` route).
+    if WEB_ROUTE_PREFIXES
+        .iter()
+        .any(|p| frag == *p || frag.starts_with(&format!("{p}/")))
+    {
         return Decision::CancelAndRedirect(HOME_PATH.to_string());
     }
     Decision::Allow
@@ -117,5 +132,35 @@ mod tests {
     fn redirect_disabled_allows_everything() {
         // Default production behaviour: observe only, change nothing.
         assert_eq!(decide("http://localhost:9034/#/dashboard", false), Decision::Allow);
+    }
+
+    #[test]
+    fn prefix_match_has_boundary_check() {
+        // A route that merely shares a string prefix with a web route must
+        // NOT be treated as that web route — only an exact match or a `/`
+        // boundary counts.
+        for u in [
+            "http://localhost:9034/#/dashboardXYZ",
+            "http://localhost:9034/#/authenticate",
+        ] {
+            assert_eq!(decide(u, true), Decision::Allow, "{u} must NOT be redirected (no boundary match)");
+        }
+    }
+
+    #[test]
+    fn prefix_match_still_redirects_exact_and_subpath() {
+        // The boundary fix must not regress the real cases: an exact prefix
+        // match, or a prefix followed by a `/` subpath, still redirects.
+        for u in [
+            "http://localhost:9034/#/dashboard",
+            "http://localhost:9034/#/dashboard/team/x",
+            "http://localhost:9034/#/auth/login",
+        ] {
+            assert_eq!(
+                decide(u, true),
+                Decision::CancelAndRedirect("/__home".to_string()),
+                "{u} must still be redirected"
+            );
+        }
     }
 }
