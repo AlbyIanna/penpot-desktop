@@ -14,6 +14,7 @@ pub mod home;
 pub mod installer;
 pub mod layout;
 pub mod navprobe;
+pub mod navwatch;
 pub mod overlay;
 pub mod packages;
 pub mod preflight;
