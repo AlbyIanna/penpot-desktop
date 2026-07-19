@@ -13,6 +13,8 @@ pub mod gitinit;
 pub mod home;
 pub mod installer;
 pub mod layout;
+pub mod navprobe;
+pub mod navwatch;
 pub mod overlay;
 pub mod packages;
 pub mod preflight;
@@ -905,7 +907,8 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         .merge(home_routes)
         .merge(checkpoint_routes)
         .merge(templates_routes)
-        .merge(packages_routes);
+        .merge(packages_routes)
+        .merge(navprobe::router());
 
     let mut proxy_config = proxy::ProxyConfig::new(
         config.runtime_dir.join("frontend"),

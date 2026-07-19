@@ -210,6 +210,15 @@ e6:
 e7:
     bash scripts/e7-plugins-spike.sh
 
+# D0 navigation-control SPIKE gate (PLAN4 milestone D0). Answers whether the
+# webview can observe + redirect Penpot's SPA HASH navigation without touching
+# the SPA (invariant 3). REQUIRES A GUI SESSION — opens a real Tauri window, so
+# it is NOT CI-headless. Dedicated ports 9034/6496/5569/6512 (control 9037).
+# DECISION: deliberately NOT chained into `just e2e` — pure-verdict spike, no
+# product behaviour changes by default (E5/E6 precedent).
+d0:
+    bash scripts/d0-navigation-spike.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this

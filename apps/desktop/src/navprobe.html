@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>navprobe:idle</title>
+<style>
+  body { font: 14px -apple-system, system-ui, sans-serif; padding: 2rem; }
+  code { background: #eee; padding: 0 .25rem; }
+</style>
+<h1>D0 navigation probe</h1>
+<p>This page is OURS (not Penpot's SPA). It performs one navigation on command so
+the Rust side can record what <code>on_navigation</code> observed.</p>
+<p id="state">idle</p>
+<script>
+  // Our own page, our own JS — invariant 3 governs Penpot's SPA, not this route.
+  const params = new URLSearchParams(location.search);
+  const run = params.get("run");
+  const state = document.getElementById("state");
+
+  function done(kind) {
+    state.textContent = "ran: " + kind;
+    document.title = "navprobe:" + kind + ":done";
+  }
+
+  // Delay so the harness can attach and the initial load settles first.
+  setTimeout(() => {
+    if (run === "hash") {
+      // Same-document fragment change — the case Penpot's router uses.
+      location.hash = "#/dashboard";
+      done("hash");
+    } else if (run === "pushstate") {
+      // History API — produces NO navigation event in most engines.
+      history.pushState({}, "", "#/settings");
+      done("pushstate");
+    } else if (run === "full") {
+      // Control case: a real document navigation that MUST be observed.
+      done("full");
+      location.assign("/__navprobe?run=none&stage=second");
+    } else {
+      done("none");
+    }
+  }, 300);
+</script>
