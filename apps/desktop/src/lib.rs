@@ -13,6 +13,7 @@ pub mod gitinit;
 pub mod home;
 pub mod installer;
 pub mod layout;
+pub mod manage;
 pub mod navprobe;
 pub mod navwatch;
 pub mod overlay;
@@ -931,12 +932,29 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     });
     let packages_routes = packages::router(packages_state.clone());
 
+    // --- D2 manage routes (create/rename/move) ------------------------------
+    // Pure RPC passthroughs behind `/__api/vault/manage/*`: they change the
+    // DB and the sync daemon carries the result to the folder tree on its
+    // normal poll, so none of them touch the vault directly. `sync` is `None`
+    // here because the daemon (below) is not spawned yet at this point in
+    // `boot` — a later task (delete) needs a live `SyncControl` and will
+    // thread one through properly.
+    let manage_state = Arc::new(manage::ManageState {
+        backend_base: readiness.backend_base_url.clone(),
+        token: credentials.access_token.clone(),
+        team_id: team_id.clone(),
+        vault_root: config.designs_dir.clone(),
+        sync: None,
+    });
+    let manage_routes = manage::router(manage_state);
+
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
         .merge(home_routes)
         .merge(checkpoint_routes)
         .merge(templates_routes)
         .merge(packages_routes)
+        .merge(manage_routes)
         .merge(navprobe::router());
 
     let mut proxy_config = proxy::ProxyConfig::new(
