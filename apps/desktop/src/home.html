@@ -533,7 +533,7 @@
         projectsList = (data.projects || []).slice().sort(function (a, b) {
           return a.name.localeCompare(b.name);
         });
-        var key = projectsList.map(function (p) { return p.id; }).join(" ");
+        var key = projectsList.map(function (p) { return p.id; }).join(" ");
         var cur = projectSel.value;
         if (key !== lastProjectIdsKey) {
           lastProjectIdsKey = key;

@@ -282,9 +282,18 @@ mod tests {
     #[test]
     fn dotdot_manifest_path_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        // The vault root is a NESTED directory inside the `TempDir`, not the
+        // `TempDir`'s own path — so `root.join("../escaped-victim")` below
+        // resolves to a sibling still inside the sandbox (`tmp`'s own
+        // directory), not into the system temp dir's parent. Otherwise this
+        // test would create-then-`remove_dir_all` a real directory outside
+        // its own sandbox, which is exactly the kind of escape this test is
+        // supposed to be proving `trash_file` rejects.
+        let root = tmp.path().join("vault");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.as_path();
         // A sibling directory next to the vault root that `..` could escape
-        // into.
+        // into — still inside `tmp`, so `TempDir`'s own `Drop` cleans it up.
         std::fs::create_dir_all(root.join("../escaped-victim")).ok();
 
         seed(root, "f1", "Proj/hello.penpot");
@@ -305,8 +314,6 @@ mod tests {
             m2.files.contains_key("f1"),
             "manifest entry was dropped despite the trash being rejected"
         );
-
-        std::fs::remove_dir_all(root.join("../escaped-victim")).ok();
     }
 
     #[test]

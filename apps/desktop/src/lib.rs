@@ -954,6 +954,7 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         team_id: team_id.clone(),
         vault_root: config.designs_dir.clone(),
         sync: manage_sync.clone(),
+        delete_lock: tokio::sync::Mutex::new(()),
     });
     let manage_routes = manage::router(manage_state);
 

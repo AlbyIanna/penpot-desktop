@@ -160,9 +160,28 @@ async function main() {
     result.actionsPresent =
       newProjectCount >= 1 && newFileCount >= 1 && cardActionCount >= 1 ? "yes" : "no";
 
-    // --- read the deep link off a real board card (never constructed) -----
-    await page.waitForSelector("a.board-card[data-deeplink]", { timeout: NAV_TIMEOUT });
-    const card = await page.$("a.board-card[data-deeplink]");
+    // --- read the deep link off a REAL board card (never constructed, and
+    // never a D2 placeholder) -----------------------------------------------
+    // D2's `/__home` grid also renders a placeholder `a.board-card.file-card`
+    // for every manifest file with zero indexed boards yet (vault-index's
+    // `CardKind::File` — apps/desktop/src/home.html tags it with the extra
+    // `file-card` class specifically so callers like this one can tell the
+    // two apart). Excluding that class is required: a placeholder's
+    // `boardId` is a synthetic `file:<uuid>` with no real board behind it, so
+    // picking one here would silently weaken this leg.
+    const REAL_BOARD_CARD_SELECTOR = "a.board-card:not(.file-card)[data-deeplink]";
+    const realBoardCount = await page.locator(REAL_BOARD_CARD_SELECTOR).count();
+    if (realBoardCount === 0) {
+      result.workspaceRendered = "inconclusive";
+      result.reopenRendered = "inconclusive";
+      result.error =
+        "no real board card on /__home (only placeholder file cards, if any) — " +
+        "we could not find a board to test with";
+      console.log(JSON.stringify(result));
+      process.exit(1);
+    }
+    await page.waitForSelector(REAL_BOARD_CARD_SELECTOR, { timeout: NAV_TIMEOUT });
+    const card = await page.$(REAL_BOARD_CARD_SELECTOR);
     const deepLink = card ? await card.getAttribute("data-deeplink") : null;
     result.deepLink = deepLink || null;
     if (!isWellFormedWorkspaceDeepLink(deepLink)) {

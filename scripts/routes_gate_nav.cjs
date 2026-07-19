@@ -103,15 +103,25 @@ function fail(msg) {
     }
 
     // --- (3) N4 viewer route -> /#/view (Peek "Present") -----------------
+    // MUST be a real board (kind === "board"), never D2's placeholder file
+    // card (kind === "file", boardId = "file:<uuid>", vault-index's
+    // `CardKind::File` — see crates/vault-index/src/boards.rs). frame-id in
+    // the viewer URL below is that boardId: a placeholder's synthetic
+    // "file:<uuid>" still commits as a /#/view navigation (Penpot doesn't
+    // validate frame-id exists before routing), which would make this leg
+    // pass while pointing at a frame that does not exist — "could not find a
+    // board to test with" must never read as "the test passed", so this
+    // fails loudly instead of silently falling back to the first card.
     await page.goto(BASE + "/__home", { waitUntil: "domcontentloaded" });
     const board = await page.evaluate(async () => {
       const r = await fetch("/__api/vault/boards");
       if (!r.ok) return null;
       const j = await r.json();
-      return (j.boards && j.boards[0]) || null;
+      const boards = (j.boards || []).filter((b) => b && b.kind === "board");
+      return boards[0] || null;
     });
     if (!board || !board.fileId || !board.pageId || !board.boardId) {
-      fail("could not read a board from /__api/vault/boards for the viewer leg");
+      fail("could not find a real board to test with (only placeholder file cards, if any, were indexed)");
     }
     const viewerLink =
       "/#/view?file-id=" + encodeURIComponent(board.fileId) +

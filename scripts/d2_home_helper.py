@@ -445,10 +445,18 @@ def cmd_wait_board_indexed(workdir, timeout):
         except Exception as e:  # noqa: BLE001
             return False, f"boards query failed: {e}"
         boards = data.get("boards", [])
-        ids = {b.get("fileId") for b in boards}
+        # D2 made the listing emit a card for EVERY manifest file, board or
+        # not (vault-index's `CardKind::File` placeholder,
+        # crates/vault-index/src/boards.rs) — serialized as `"kind": "file"`
+        # vs `"kind": "board"` (`BoardCard.kind`, lowercase via
+        # `#[serde(rename_all = "lowercase")]`). Counting placeholder cards
+        # here would make this proof-of-looking pass even when the real board
+        # never got indexed, so only real boards count.
+        real_boards = [b for b in boards if b.get("kind") == "board"]
+        ids = {b.get("fileId") for b in real_boards}
         if file_b_id in ids:
-            return True, f"{len(boards)} board(s) indexed, including the surviving file"
-        return False, f"{len(boards)} board(s) indexed, surviving file not among them yet"
+            return True, f"{len(real_boards)} real board(s) indexed, including the surviving file"
+        return False, f"{len(real_boards)} real board(s) indexed (of {len(boards)} cards), surviving file not among them yet"
 
     ok, info = poll(check, timeout)
     if not ok:

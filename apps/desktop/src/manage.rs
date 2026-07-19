@@ -79,6 +79,18 @@ pub struct ManageState {
     /// see `lib.rs::boot`'s `sync_daemon` match — so blocking could hang a
     /// request forever).
     pub sync: Arc<OnceLock<sync_daemon::SyncControl>>,
+    /// Serializes the delete critical section (pause → RPC delete → trash
+    /// move → resume) across CONCURRENT delete requests.
+    ///
+    /// Without this, two overlapping deletes each build their own
+    /// `PauseGuard`. The first guard's `Drop` resumes the daemon the instant
+    /// its own delete finishes — even while the second delete is still
+    /// sitting between its RPC delete and `trash_file` — reopening exactly
+    /// the unprotected midpoint the pause exists to close (see the module
+    /// docs). Held for the whole guarded task in `delete_file`, so only one
+    /// delete is ever inside pause→delete→trash at a time; a second request
+    /// simply waits its turn rather than racing the first guard's `Drop`.
+    pub delete_lock: tokio::sync::Mutex<()>,
 }
 
 impl ManageState {
@@ -373,18 +385,36 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// delete and the trash move — exactly the unprotected midpoint this whole
 /// module exists to prevent. A timeout is therefore surfaced to the caller
 /// as an error (see `delete_file`), never treated as "probably paused now".
-struct PauseGuard(sync_daemon::SyncControl);
+///
+/// `was_already_paused` is captured at construction, BEFORE
+/// `pause_and_wait_idle` flips the flag: sync can already be paused because
+/// the user paused it deliberately from the tray (`status.rs`'s
+/// `SyncControl`, the exact same handle this one wraps). Without recording
+/// that, `Drop` (and the timeout error path) would call `resume()`
+/// unconditionally and silently turn the user's own pause back on — a
+/// delete must never have that side effect. `resume()` is therefore only
+/// called here when THIS guard is the one that paused sync in the first
+/// place.
+struct PauseGuard {
+    sync: sync_daemon::SyncControl,
+    was_already_paused: bool,
+}
 
 impl PauseGuard {
     async fn new(sync: sync_daemon::SyncControl) -> Result<Self, sync_daemon::PauseAckError> {
+        let was_already_paused = sync.is_paused();
         match sync.pause_and_wait_idle().await {
-            Ok(()) => Ok(PauseGuard(sync)),
+            Ok(()) => Ok(PauseGuard { sync, was_already_paused }),
             Err(e) => {
                 // pause_and_wait_idle already flipped the flag before it hit
                 // the timeout; release it ourselves since no guard exists to
                 // do it in `Drop` — otherwise a timed-out attempt would leave
-                // the daemon paused forever.
-                sync.resume();
+                // the daemon paused forever. But only if WE flipped it: if
+                // sync was already paused before this call, leave it paused
+                // — see the struct doc.
+                if !was_already_paused {
+                    sync.resume();
+                }
                 Err(e)
             }
         }
@@ -393,7 +423,9 @@ impl PauseGuard {
 
 impl Drop for PauseGuard {
     fn drop(&mut self) {
-        self.0.resume();
+        if !self.was_already_paused {
+            self.sync.resume();
+        }
     }
 }
 
@@ -446,6 +478,14 @@ async fn delete_file(State(st): State<Arc<ManageState>>, Json(req): Json<DeleteR
     let st_for_task = st.clone();
     let file_id = req.file_id.clone();
     let task: tokio::task::JoinHandle<Result<String, DeleteError>> = tokio::spawn(async move {
+        // Held for the ENTIRE guarded operation, declared first so it is
+        // dropped LAST (Rust drops locals in reverse declaration order): a
+        // second concurrent delete blocks here until this one's `_pause` has
+        // already resumed (or deliberately not resumed — see `PauseGuard`),
+        // so it can never observe the unprotected midpoint between this
+        // delete's RPC call and its trash move. See `delete_lock`'s field
+        // doc on `ManageState`.
+        let _serialize = st_for_task.delete_lock.lock().await;
         let _pause = PauseGuard::new(sync).await.map_err(DeleteError::PauseNotAcknowledged)?;
         delete_inner(&st_for_task, &client, &file_id).await.map_err(DeleteError::Delete)
     });
@@ -700,41 +740,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_guard_does_not_resume_a_sync_that_was_already_paused() {
+        // The user-visible half of finding 1b: a delete must never turn a
+        // deliberate tray pause back on. `status.rs`'s tray toggle and this
+        // guard share the exact same `sync_daemon::SyncControl`, so pausing
+        // it here before the guard exists is the same scenario as the user
+        // hitting "pause sync" from the tray moments before a delete lands.
+        let (_tmp, daemon, control) = offline_sync_control();
+        control.pause();
+        assert!(control.is_paused(), "test setup: sync must start paused");
+        {
+            // Sync is already paused, so pause_and_wait_idle's ack is
+            // immediate (mirrors `pause_guard_resumes_even_when_the_guarded_
+            // work_panics`'s scheduling note: the daemon acks idle from its
+            // startup check before it ever touches the unroutable network).
+            let _guard = super::PauseGuard::new(control.clone())
+                .await
+                .expect("daemon is already paused; the ack should be immediate");
+            assert!(control.is_paused(), "still paused while the guard is held");
+        }
+        assert!(
+            control.is_paused(),
+            "guard drop must NOT resume a sync that was already paused before the delete started"
+        );
+        control.resume();
+        assert!(!control.is_paused());
+        // See the comment on `drop(daemon)` above: a graceful `stop().await`
+        // here would block on the unroutable backend's retry budget.
+        drop(daemon);
+    }
+
+    #[tokio::test]
     async fn pause_guard_resumes_even_when_the_guarded_work_panics() {
         // The whole point of using a Drop guard instead of a manual
         // pause/.../resume pair: it must release the pause even when the
         // code in between never reaches the resume call, e.g. because it
         // panics (mirrors a bug in delete_inner, not just a returned Err).
         //
-        // `PauseGuard::new` is async (it awaits `pause_and_wait_idle`), so a
-        // plain `std::panic::catch_unwind` around it can no longer stand in
-        // for the guarantee we actually need: `delete_file` now runs the
-        // whole guarded operation inside `tokio::spawn` (see its doc
-        // comment), and that IS the real panic boundary in production —
-        // tokio catches a panicking task's unwind internally, which runs
-        // `Drop` for everything on that task's stack exactly like
-        // `catch_unwind` would. Mirroring that here tests the actual
-        // mechanism instead of a synthetic stand-in for it.
+        // Guard CONSTRUCTION happens here, in this test's own task (see the
+        // scheduling note below for why), but the already-live guard is then
+        // MOVED into the spawned task and dropped there by panicking with it
+        // still on that task's stack. `delete_file` runs the whole guarded
+        // operation, construction included, inside `tokio::spawn` in
+        // production, and that IS the real panic boundary — tokio catches a
+        // panicking task's unwind internally, which runs `Drop` for
+        // everything on that task's stack exactly like
+        // `std::panic::catch_unwind` would. Moving an already-constructed
+        // guard into the panicking task and dropping it there still
+        // exercises that exact mechanism; a synthetic `catch_unwind` around
+        // an async fn cannot stand in for it.
         //
         // Scheduling note: `#[tokio::test]` defaults to the single-threaded
         // (current-thread) runtime, which never interleaves tasks WITHIN one
-        // poll — but it also doesn't guarantee poll ORDER between two tasks
-        // that are both already queued (the daemon task from
-        // `offline_sync_control`, spawned first, and the guard task spawned
-        // below). If the daemon happened to get its first poll before the
-        // guard task ever calls `pause()`, it would race into the
-        // unroutable RPC and not check the flag again until that call times
-        // out — well past `PauseGuard::new`'s timeout. So `pause()` is
-        // called directly, HERE, synchronously, before spawning anything:
-        // that runs as part of this task's current poll, guaranteed to
-        // land before either the daemon's or the guard task's first poll.
+        // poll and polls already-queued tasks in spawn order — so the daemon
+        // task from `offline_sync_control` (spawned first, inside that
+        // helper) would get its first poll before anything spawned after it.
+        // If the daemon observed `pause_rx` still unpaused on that first
+        // poll, it would race into the unroutable RPC and, per
+        // `engine::run`'s retry-wait branch (selects on `shutdown` and a 5s
+        // sleep — NOT on `pause_rx`), not check the flag again for a further
+        // 5s: past `PauseGuard::new`'s own 5s timeout. So `PauseGuard::new`
+        // is awaited HERE, synchronously reached with no yield since
+        // `offline_sync_control` returned: `pause_and_wait_idle` flips the
+        // pause flag before its own first await, which is guaranteed to run
+        // before this task's first yield and therefore before the daemon
+        // task's first poll — the same guarantee the old bare `pause()` call
+        // gave, without pre-pausing sync from the guard's point of view (see
+        // `PauseGuard`'s `was_already_paused`, which this must leave `false`
+        // — a construction-time pre-pause here would be indistinguishable
+        // from a user-initiated tray pause and defeat finding 1b's fix).
         let (_tmp, daemon, control) = offline_sync_control();
-        control.pause();
-        let control_for_panic = control.clone();
+        let guard = super::PauseGuard::new(control.clone())
+            .await
+            .expect("offline daemon acks pause before touching the network");
+        assert!(control.is_paused(), "guard construction must pause");
+
         let task = tokio::spawn(async move {
-            let _guard = super::PauseGuard::new(control_for_panic)
-                .await
-                .expect("daemon is already paused above; the ack should be immediate");
+            let _guard = guard;
             panic!("simulated failure inside the guarded delete operation");
         });
         let result = task.await;
