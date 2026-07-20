@@ -62,15 +62,24 @@ pub fn resolve(raw_path: &Path, vault_root: &Path, manifest: &Manifest) -> Resol
         };
     }
 
-    // Both `raw_path` (just proven a dir above) and `vault_root` (the
-    // app's configured vault, assumed to exist) should canonicalize
-    // cleanly; fall back to the raw path on failure so a transient FS
-    // error degrades to a (safe, if imprecise) External/NotAPenpotDir
-    // rather than panicking.
-    let canonical_path =
-        std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
-    let canonical_vault =
-        std::fs::canonicalize(vault_root).unwrap_or_else(|_| vault_root.to_path_buf());
+    // The in/out-of-vault decision is a P0 boundary (a misattribution is a
+    // cross-vault spill vector), so it must rest on FULLY resolved paths on
+    // both sides. `raw_path` was just proven a dir, so it canonicalizes;
+    // `vault_root` is the app's configured vault and normally does too. If
+    // either fails to resolve we cannot trust the boundary — so we FAIL
+    // CLOSED (refuse to classify) rather than fall back to the raw,
+    // un-canonicalized string, which is exactly the escape a `..`/symlink
+    // path could exploit to look in-vault when it points outside.
+    let (Ok(canonical_path), Ok(canonical_vault)) =
+        (std::fs::canonicalize(raw_path), std::fs::canonicalize(vault_root))
+    else {
+        return Resolved::NotAPenpotDir {
+            reason: format!(
+                "{} could not be resolved against the vault",
+                raw_path.display()
+            ),
+        };
+    };
 
     let Ok(rel) = canonical_path.strip_prefix(&canonical_vault) else {
         return Resolved::External { path: canonical_path };
@@ -155,6 +164,20 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("Proj/New.penpot")).unwrap();
         assert!(matches!(resolve(&tmp.path().join("Proj/New.penpot"), tmp.path(), &Manifest::default()),
                          Resolved::PendingImport { .. }));
+    }
+
+    #[test]
+    fn an_unresolvable_vault_root_fails_closed_not_open() {
+        // If the vault_root cannot be canonicalized we must not fall back to
+        // the raw string and risk misattributing an external path as in-vault
+        // (a P0 spill vector). Fail closed.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("X.penpot")).unwrap();
+        let missing_vault = tmp.path().join("does-not-exist");
+        assert!(matches!(
+            resolve(&tmp.path().join("X.penpot"), &missing_vault, &Manifest::default()),
+            Resolved::NotAPenpotDir { .. }
+        ));
     }
 
     #[test]
