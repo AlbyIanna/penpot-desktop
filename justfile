@@ -296,6 +296,37 @@ d3:
 d4:
     bash scripts/d4-preferences.sh
 
+# D5 documents gate (PLAN4 milestone D5, THE gate for making the app
+# document-based). Boots a throwaway headless stack to seed two real,
+# on-disk `.penpot` files (DocA/DocB), then a real GUI session for the rest:
+# (a) launching with a `.penpot` path as a CLI argument opens it — proven via
+# the localhost control server's `GET /windows` (Task 2), with the
+# reachability/non-empty check as its own "proof of looking" leg so a broken
+# control server can never read as "no document"; (b) the open window's
+# title tracks a live rename (`POST /__api/vault/manage/rename` -> D5 Task
+# 6's `watch_rename_titles`); (c) a SECOND launch, given a genuinely free
+# distinct port block, forwards its document into instance 1 instead of
+# double-booting a second stack — the M5-cooperation exit criterion, with
+# both a positive control (instance 1's own log DOES carry the boot-signal
+# strings) and the actual forwarding proof (`/windows` on instance 1 gains
+# DocB's window); (d) importing a `.penpot` from outside the vault keeps
+# ZERO cross-vault spill (P0) — the native confirm dialog can't be clicked
+# headlessly, so this drives the underlying copy-into-`Imported/`-then-let-
+# the-daemon-notice mechanism directly (the brief's own explicit fallback)
+# and reuses n5_vaults_helper.py's own seed/wait_present plus its
+# db_file_ids/boards_file_ids/search_count zero-spill primitives verbatim;
+# (e) Finder double-click and drag-drop are SKIPPED with reasons (no headless
+# equivalent exists for either — see scripts/d5a-finder-spike.sh /
+# scripts/d5-plist-check.sh for the packaged-app legs), kept out of the pass
+# count, while the resolver + import-path logic every one of them funnels
+# through is REQUIRED by name (`cargo test -p penpot-desktop -- docopen::`,
+# the D1/D2/D3 precedent). Needs a real GUI session (same constraint as
+# D0/D2/D3, not CI-headless). Dedicated ports: proxy 9056, backend 6518,
+# postgres 5591, valkey 6534, control 9057 (+ a would-be SECOND port block
+# for assertion c's double-boot trap — see the script header).
+d5:
+    bash scripts/d5-documents.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -306,29 +337,34 @@ routes-gate:
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
 # so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7,
-# D1–D4). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2/d3/
-# d4 boot their own live stacks (dedicated ports) like the m/n suites, safe
-# to chain at the tail. n2-thumbs + e4-gallery + e7-plugins + d4-preferences
-# need the runtime bundle WITH browsers (`bash scripts/fetch-penpot.sh
-# --with-browsers`) — d4 specifically for its dev-mode exporter (assertion c,
-# the renders-on/off exit criterion); d1-offline and d2-home need the same
-# bundled browsers (their behavioural checks drive a headless browser too).
-# d2-home ALSO needs a GUI session for its navwatch leg (same operational
-# constraint as d0 — not CI-headless) — unlike d0, d2 stays in the chain
-# because it lands product code. d3-menus also boots a real GUI session for
-# its boot-only smoke leg (same constraint), chained for the same reason: D3
-# lands product code. d4-preferences is CI-headless (no GUI session needed —
-# every route it drives, including the vault switch and the reboot-in-place,
-# is same-origin HTTP off the proxy), chained because D4 lands product code
-# like D1–D3. m4-artifact-test.sh stays separate: it needs a dmg build
-# (`bash scripts/build-dmg.sh` first) and carries the E4 offline
-# packaged-gallery leg (g4) + the E7 offline plugin-serving leg (g5).
+# D1–D5). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2/d3/
+# d4/d5 boot their own live stacks (dedicated ports) like the m/n suites,
+# safe to chain at the tail. n2-thumbs + e4-gallery + e7-plugins +
+# d4-preferences need the runtime bundle WITH browsers (`bash scripts/fetch-
+# penpot.sh --with-browsers`) — d4 specifically for its dev-mode exporter
+# (assertion c, the renders-on/off exit criterion); d1-offline and d2-home
+# need the same bundled browsers (their behavioural checks drive a headless
+# browser too). d2-home ALSO needs a GUI session for its navwatch leg (same
+# operational constraint as d0 — not CI-headless) — unlike d0, d2 stays in
+# the chain because it lands product code. d3-menus also boots a real GUI
+# session for its boot-only smoke leg (same constraint), chained for the
+# same reason: D3 lands product code. d4-preferences is CI-headless (no GUI
+# session needed — every route it drives, including the vault switch and the
+# reboot-in-place, is same-origin HTTP off the proxy), chained because D4
+# lands product code like D1–D3. d5-documents ALSO needs a real GUI session
+# (assertions a/b/c drive the actual GUI binary, twice — a second launch is
+# the whole point of assertion c), chained because D5 lands product code
+# too. m4-artifact-test.sh stays separate: it needs a dmg build (`bash
+# scripts/build-dmg.sh` first) and carries the E4 offline packaged-gallery
+# leg (g4) + the E7 offline plugin-serving leg (g5).
 # e5-tokens-spike.sh + e6-library-portability-spike.sh stay out by decision:
 # pure-verdict SPIKE gates with no product code to regress (see their recipe
 # comments) — e7 and d1 are chained because their thin builds DID land
-# product code. d0-navigation-spike.sh stays out too: pure-verdict spike, no
-# product behaviour changes by default (D1's navwatch policy IS the product
-# behaviour D0 spiked — D1 exercises it via cargo test, not by re-running D0).
+# product code. d0-navigation-spike.sh and d5a-finder-spike.sh stay out too:
+# pure-verdict spikes, no product behaviour changes by default (D1's navwatch
+# policy IS the product behaviour D0 spiked — D1 exercises it via cargo
+# test, not by re-running D0; D5's document-open wiring IS the product
+# behaviour d5a spiked — d5-documents exercises it directly).
 e2e:
     bash scripts/m1-smoke.sh
     bash scripts/m2-invariant.sh
@@ -349,6 +385,7 @@ e2e:
     bash scripts/d2-home.sh
     bash scripts/d3-menus.sh
     bash scripts/d4-preferences.sh
+    bash scripts/d5-documents.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).
