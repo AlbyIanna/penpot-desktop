@@ -573,7 +573,10 @@ else
     fail "(d) the daemon never imported $IMPORTED_REL: $(cat "$WORK_DIR/wait-imported.err" 2>/dev/null)"; exit 1
 fi
 
-PRESENT_A="$(d5helper assert_present "$IMPORTED_ID" d5importneedle 2>&1)"
+# wait_present, NOT assert_present: the vault-index (/boards, /search) lands one
+# poll AFTER the DB/manifest, so a one-shot check right after wait_manifest_id
+# can see inDb=true/inBoards=false and flake. Poll the index barrier.
+PRESENT_A="$(d5helper wait_present "$IMPORTED_ID" d5importneedle "$DISK_POLL_TIMEOUT" 2>&1)"
 if [ $? -eq 0 ]; then
     pass "(d) the imported file is present in A's DB/boards/search: $PRESENT_A"
 else

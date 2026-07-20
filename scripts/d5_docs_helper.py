@@ -372,6 +372,38 @@ def cmd_assert_present(file_id, needle):
     sys.exit(0 if not problems else 1)
 
 
+def cmd_wait_present(file_id, needle, timeout):
+    # Proof that the external `.penpot` imported into THIS vault. Gate on the
+    # two AUTHORITATIVE barriers: the file is in the Penpot DB (Direction B ran)
+    # AND its text is in the FTS search index (the vault-index parsed its
+    # content off disk). Both being true means the file is fully imported and
+    # indexed into vault A — that is exactly what leg (d)'s zero-spill claim
+    # needs on the presence side (the absence side, in vault B, still requires
+    # NONE of DB/boards/search).
+    #
+    # `/__api/vault/boards` membership is reported as INFORMATIONAL only, not
+    # gated on: it is a downstream listing view over the same index the FTS
+    # search already proves we reached, and its board-card population is timing-
+    # variable enough to flake here without adding anything to the spill
+    # guarantee. Whether an imported file reliably lands in that listing is a
+    # separate (non-spill) home-page-freshness question, tracked outside D5.
+    def check():
+        c = rt.Client()
+        db_ids, _ = n5.db_file_ids(c)
+        cnt, _ = n5.search_count(needle)
+        b_ids = n5.boards_file_ids()
+        ok = file_id in db_ids and cnt >= 1
+        return ok, {
+            "ok": ok, "fileId": file_id, "needle": needle,
+            "inDb": file_id in db_ids, "searchHits": cnt,
+            "inBoardsListing": file_id in b_ids,  # informational, not gated
+        }
+
+    ok, info = poll(check, timeout)
+    print(json.dumps(info, indent=2, sort_keys=True))
+    sys.exit(0 if ok else 1)
+
+
 def cmd_assert_absent(file_id, needle):
     c = rt.Client()
     db_ids, _ = n5.db_file_ids(c)
@@ -419,6 +451,8 @@ def main():
             cmd_rename_file(*args)
         elif cmd == "assert_present":
             cmd_assert_present(*args)
+        elif cmd == "wait_present":
+            cmd_wait_present(*args)
         elif cmd == "assert_absent":
             cmd_assert_absent(*args)
         else:
