@@ -149,6 +149,29 @@ impl WindowRegistry {
     }
 }
 
+/// Whether opening a file should focus an existing window or create one.
+/// Split out from the Tauri call (`open_file_window` in `main.rs`) so the
+/// decision — the behaviour that matters most for D3 — is unit-testable
+/// without a Tauri runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reuse {
+    /// A window for this file is already open; focus this label instead of
+    /// creating a duplicate.
+    Focus(String),
+    /// No window for this file exists yet; the caller should build one at
+    /// this label.
+    Create(String),
+}
+
+/// Decide how to handle "open this file": reuse the window already showing
+/// it, or create a new one at its deterministic label.
+pub fn reuse_or_create(file_id: &str, reg: &WindowRegistry) -> Reuse {
+    match reg.label_for_file(file_id) {
+        Some(label) => Reuse::Focus(label),
+        None => Reuse::Create(file_window_label(file_id)),
+    }
+}
+
 /// Lock `inner`, recovering from poisoning instead of propagating the panic.
 ///
 /// The registry is about to sit behind the menu builder and every window
@@ -250,5 +273,16 @@ mod tests {
         r.insert(OpenWindow { label: label.clone(), file_id: Some("f1".into()), title: "New".into() });
         assert_eq!(r.list().len(), 1);
         assert_eq!(r.list()[0].title, "New");
+    }
+
+    #[test]
+    fn opening_an_already_open_file_reuses_its_window() {
+        // The decision the GUI path depends on, extracted so it is testable
+        // without a Tauri runtime.
+        let r = WindowRegistry::new();
+        let label = file_window_label("f1");
+        r.insert(OpenWindow { label: label.clone(), file_id: Some("f1".into()), title: "Alpha".into() });
+        assert_eq!(reuse_or_create("f1", &r), Reuse::Focus(label));
+        assert_eq!(reuse_or_create("f2", &r), Reuse::Create(file_window_label("f2")));
     }
 }

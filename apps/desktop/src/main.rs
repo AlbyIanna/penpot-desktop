@@ -12,10 +12,149 @@ use std::sync::Arc;
 use penpot_desktop::control::{self, VaultRunner};
 use penpot_desktop::navwatch::{self, Decision, NavWatch};
 use penpot_desktop::overlay::{self, ProxyUrlSlot};
-use penpot_desktop::windows::HOME_LABEL;
+use penpot_desktop::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
 use penpot_desktop::AppConfig;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::sync::Mutex;
+
+/// Build the shared `on_navigation` policy closure for the window labelled
+/// `label`: D1/D2's rule that `#/auth/*` and `#/dashboard` are cancelled and
+/// redirected to `/__home`, applied to whichever window's webview reports the
+/// navigation (see `navwatch::decide`).
+///
+/// D0 wrote this closure inline for the home window only. D3 needs the exact
+/// same rules on every file window `open_file_window` creates below — a
+/// second, hand-copied closure per window would let the copies drift, and a
+/// drifted copy is exactly how `#/dashboard` would quietly become reachable
+/// again from a file window, undoing D1/D2. So the closure is built once,
+/// here, parameterized only by which window it should redirect (the target
+/// of `CancelAndRedirect` must be the window that navigated, not always
+/// `HOME_LABEL`) — the redirect *rule* itself (`navwatch::decide`) is never
+/// duplicated.
+fn navigation_policy(
+    app: &tauri::AppHandle,
+    label: &str,
+    watch: NavWatch,
+) -> impl Fn(&tauri::Url) -> bool + Send + 'static {
+    let nav_handle = app.clone();
+    let label = label.to_string();
+    move |url| {
+        let url_s = url.to_string();
+        // Observe first: the log is the spike's primary evidence.
+        watch.record("on_navigation", &url_s);
+        match navwatch::decide(&url_s, watch.redirect_enabled()) {
+            Decision::Allow => true,
+            Decision::CancelAndRedirect(path) => {
+                // Cannot navigate from inside the handler (we are on the
+                // webview's navigation path); hop to the app thread and
+                // navigate there.
+                let h = nav_handle.clone();
+                let label = label.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(w) = h.get_webview_window(&label) {
+                        // See the D0 HAZARD note this closure was lifted
+                        // from: joining against `w.url()` trusts whatever the
+                        // window is currently pointed at. Every window this
+                        // policy is attached to (home via `/__bootstrap`,
+                        // file windows via their deep link) is always already
+                        // on the proxy origin by the time a redirect-eligible
+                        // navigation can fire, so this still resolves against
+                        // `http://localhost:<proxy-port>`.
+                        if let Ok(base) = w.url() {
+                            if let Ok(dest) = base.join(&path) {
+                                let _ = w.navigate(dest);
+                            }
+                        }
+                    }
+                });
+                false // cancel the web-route navigation
+            }
+        }
+    }
+}
+
+/// D3 hook point: called whenever the set of open windows changes (a file
+/// window opened or closed). A later task rebuilds the native Window menu
+/// from `WindowRegistry::list()` here — for now this is a no-op so the two
+/// call sites below (`open_file_window`'s `Create` arm and its
+/// `on_window_event` `Destroyed` handler) have exactly one place to grow that
+/// wiring, instead of the menu-rebuild call being invented twice later.
+fn on_window_set_changed(_app: &tauri::AppHandle, _reg: &WindowRegistry) {
+    // Intentionally empty: see the doc comment above.
+}
+
+/// Open `file_id` in its own window (D3: window-per-file). If a window for
+/// this file is already open, this FOCUSES it instead of creating a second
+/// one — that decision is `windows::reuse_or_create`, unit-tested in
+/// `windows.rs` without a Tauri runtime; this function is the thin Tauri-side
+/// translation of it, kept out of `windows.rs` so that module stays
+/// Tauri-free (mirrors `overlay::toggle_palette`'s split for the N4 palette).
+///
+/// `title` becomes both the window title and the `OpenWindow` record's title
+/// (the Window menu's future display string) — window-per-file's whole point
+/// is that the title IS the filename.
+pub fn open_file_window(
+    app: &tauri::AppHandle,
+    reg: &WindowRegistry,
+    proxy_url: &str,
+    team_id: &str,
+    file_id: &str,
+    page_id: Option<&str>,
+    title: &str,
+) -> tauri::Result<()> {
+    match windows::reuse_or_create(file_id, reg) {
+        Reuse::Focus(label) => {
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+            Ok(())
+        }
+        Reuse::Create(label) => {
+            // vault_index::workspace_deep_link builds the exact
+            // `/#/workspace?team-id=…&file-id=…[&page-id=…]` path — hand-
+            // assembling it here would risk drifting from the sanitization
+            // that function applies (crates/vault-index/src/query.rs:32).
+            let path = vault_index::workspace_deep_link(team_id, file_id, page_id);
+            let full = format!("{}{}", proxy_url.trim_end_matches('/'), path);
+            let url: tauri::Url = full.parse().map_err(tauri::Error::InvalidUrl)?;
+
+            let watch = NavWatch::from_env();
+            let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
+                .title(title)
+                .inner_size(1280.0, 800.0)
+                .resizable(true)
+                // D1/D2: the same navigation policy as the home window — see
+                // `navigation_policy` above.
+                .on_navigation(navigation_policy(app, &label, watch))
+                .build()?;
+
+            reg.insert(OpenWindow {
+                label: label.clone(),
+                file_id: Some(file_id.to_string()),
+                title: title.to_string(),
+            });
+
+            // Keep the registry honest: forget the window the moment it is
+            // destroyed, so a closed file never lingers as a ghost entry in
+            // the future Window menu, and lets a later "open this file"
+            // request build a fresh window instead of trying to focus one
+            // that no longer exists.
+            let reg_for_close = reg.clone();
+            let app_for_close = app.clone();
+            window.on_window_event(move |event| {
+                if let WindowEvent::Destroyed = event {
+                    reg_for_close.remove(&label);
+                    on_window_set_changed(&app_for_close, &reg_for_close);
+                }
+            });
+
+            on_window_set_changed(app, reg);
+            Ok(())
+        }
+    }
+}
 
 /// The live vault runner (owns the stack; swaps it on `File > Open Vault`).
 /// `None` until boot completes.
@@ -71,53 +210,18 @@ fn main() {
             // D0: the main window is built HERE (not from tauri.conf.json) so a
             // navigation handler can be attached — `on_navigation` is a builder
             // method and a config-declared window gives us no builder.
+            //
+            // D3: the navigation-policy closure moved to the top-level
+            // `navigation_policy` function (was inlined here through D0-D2) so
+            // `open_file_window` can attach the exact same rules to every file
+            // window instead of hand-copying this closure — see that
+            // function's doc comment for why a second copy would be a hazard.
             let watch = NavWatch::from_env();
-            let watch_for_handler = watch.clone();
-            let nav_handle = app.handle().clone();
             WebviewWindowBuilder::new(app, HOME_LABEL, WebviewUrl::default())
                 .title("Penpot Local")
                 .inner_size(1280.0, 800.0)
                 .resizable(true)
-                .on_navigation(move |url| {
-                    let url_s = url.to_string();
-                    // Observe first: the log is the spike's primary evidence.
-                    watch_for_handler.record("on_navigation", &url_s);
-                    match navwatch::decide(&url_s, watch_for_handler.redirect_enabled()) {
-                        Decision::Allow => true,
-                        Decision::CancelAndRedirect(path) => {
-                            // Cannot navigate from inside the handler (we are on
-                            // the webview's navigation path); hop to the app
-                            // thread and navigate there.
-                            let h = nav_handle.clone();
-                            tauri::async_runtime::spawn(async move {
-                                if let Some(w) = h.get_webview_window(HOME_LABEL) {
-                                    // HAZARD (unreachable today, but noted for
-                                    // D2): joining against `w.url()` trusts
-                                    // whatever the window is currently pointed
-                                    // at as the base. Every redirect-eligible
-                                    // navigation today only ever happens after
-                                    // boot has already pointed the window at
-                                    // the proxy origin, so this always resolves
-                                    // against `http://localhost:<proxy-port>`.
-                                    // But if a redirect-eligible navigation
-                                    // ever fired BEFORE boot repoints the
-                                    // window (still on `tauri://localhost`),
-                                    // this would join to
-                                    // `tauri://localhost/__home` instead of the
-                                    // proxy. D2 should pin the proxy origin
-                                    // explicitly rather than joining against
-                                    // whatever the current URL happens to be.
-                                    if let Ok(base) = w.url() {
-                                        if let Ok(dest) = base.join(&path) {
-                                            let _ = w.navigate(dest);
-                                        }
-                                    }
-                                }
-                            });
-                            false // cancel the web-route navigation
-                        }
-                    }
-                })
+                .on_navigation(navigation_policy(&app.handle().clone(), HOME_LABEL, watch))
                 .build()?;
 
             let handle = app.handle().clone();
