@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use penpot_desktop::control::{self, VaultRunner};
 use penpot_desktop::menubar::{self, LiveVault, LiveVaultSlot, MenuCtx};
-use penpot_desktop::navwatch::NavWatch;
+use penpot_desktop::navwatch::{NavWatch, HOME_PATH};
 use penpot_desktop::overlay::{self, ProxyUrlSlot};
 use penpot_desktop::windows::{OpenWindow, WindowRegistry, HOME_LABEL};
 use penpot_desktop::AppConfig;
@@ -106,7 +106,7 @@ fn main() {
                 .title("Penpot Local")
                 .inner_size(1280.0, 800.0)
                 .resizable(true)
-                .on_navigation(menubar::navigation_policy(&app.handle().clone(), HOME_LABEL, watch))
+                .on_navigation(menubar::navigation_policy(&app.handle().clone(), HOME_LABEL, watch, HOME_PATH))
                 .build()?;
 
             // D3: register the home window itself — nothing did this before

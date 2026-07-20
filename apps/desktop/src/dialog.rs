@@ -5,10 +5,24 @@
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
-/// AppleScript string literal escaping (backslash first, then quotes).
+/// AppleScript string literal escaping: control characters first (mapped to
+/// a plain space), then backslash, then quotes.
+///
+/// D3-review MINOR fix (finding 4): the escaping itself was already
+/// injection-safe, but a filename containing `\n`/`\r` (a valid byte in a
+/// POSIX filename, however rare) produced an UNTERMINATED AppleScript string
+/// literal — the newline breaks the `"..."` onto a second source line —
+/// which makes `osascript` fail with a syntax error and the dialog never
+/// appears at all, so Export/Import silently aborts with no feedback to the
+/// user. Control characters carry no meaning a native dialog can render
+/// anyway, so mapping them to a space (rather than stripping them, which
+/// could collide two distinct names) is a safe, lossy sanitization done
+/// BEFORE the backslash/quote escaping below — it introduces no new
+/// backslashes or quotes for that pass to worry about.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn applescript_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let sanitized: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    sanitized.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn show(title: &str, message: &str, icon: &str) {
@@ -189,5 +203,28 @@ mod tests {
     fn choose_file_script_mentions_every_extension() {
         let s = choose_file_script("Open", &["penpot", "zip"]);
         assert!(s.contains("penpot") && s.contains("zip"), "{s}");
+    }
+
+    #[test]
+    fn control_characters_are_mapped_to_spaces_not_left_to_break_the_literal() {
+        // A raw '\n' or '\r' would break the "..." literal onto a second
+        // source line, making osascript fail with a syntax error (finding
+        // 4) — the escaped string must contain neither, and no dialog
+        // silently vanishing as a result.
+        assert_eq!(applescript_escape("line1\nline2"), "line1 line2");
+        assert_eq!(applescript_escape("a\rb\tc"), "a b c");
+        for s in [applescript_escape("line1\nline2"), applescript_escape("a\rb\tc")] {
+            assert!(!s.contains('\n') && !s.contains('\r'), "escaped string still breaks the literal: {s:?}");
+        }
+    }
+
+    #[test]
+    fn a_filename_with_a_newline_still_produces_a_single_line_script() {
+        // End-to-end through the two script builders that embed
+        // user-controlled strings (the save-name and the open prompt).
+        let s = save_file_script("Export", "weird\nname.zip");
+        assert_eq!(s.lines().count(), 1, "script must stay a single AppleScript line: {s:?}");
+        let s2 = choose_file_script("pick\r\na file", &["penpot"]);
+        assert_eq!(s2.lines().count(), 1, "script must stay a single AppleScript line: {s2:?}");
     }
 }

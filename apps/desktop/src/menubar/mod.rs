@@ -46,7 +46,7 @@ use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, Windo
 use crate::navwatch::{self, Decision, NavWatch};
 use crate::recent::{self, RecentEntry};
 use crate::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
-use model::{build_menu_model, command_for_id, Command, Entry, MenuModel, RECENT_PREFIX};
+use model::{build_menu_model, command_for_id, Command, Entry, MenuModel, Predefined, RECENT_PREFIX};
 
 /// Late-bound facts about the active vault/stack: unknown before boot
 /// completes, and refreshed again on every N5 vault switch (`File > Open
@@ -107,28 +107,37 @@ pub struct MenuCtx {
 // Model → tauri::menu::* translation (no branching of its own)
 // ---------------------------------------------------------------------------
 
-/// Map a `model::Entry::Predefined` name to its `PredefinedMenuItem`
-/// constructor. The set of names is fixed and entirely owned by `model.rs`
-/// (seven strings, all listed there); a name reaching the fallback arm means
-/// the two files have drifted apart, which is a programming error caught the
-/// first time the menu is built — not a condition a user can trigger.
-fn predefined_item<R: Runtime>(app: &AppHandle<R>, name: &str) -> tauri::Result<PredefinedMenuItem<R>> {
-    match name {
-        "undo" => PredefinedMenuItem::undo(app, None),
-        "redo" => PredefinedMenuItem::redo(app, None),
-        "cut" => PredefinedMenuItem::cut(app, None),
-        "copy" => PredefinedMenuItem::copy(app, None),
-        "paste" => PredefinedMenuItem::paste(app, None),
-        "select-all" => PredefinedMenuItem::select_all(app, None),
-        "minimize" => PredefinedMenuItem::minimize(app, None),
+/// Map a `model::Predefined` kind to its `PredefinedMenuItem` constructor.
+/// This match is EXHAUSTIVE (no wildcard arm) — a variant added to
+/// `model::Predefined` without a matching arm here fails the BUILD. This
+/// used to be a string lookup with a `panic!` fallback arm for an
+/// unrecognized name (D3-review MINOR finding 6b): that function ran inside
+/// `rebuild`, which callback runs from window-event handlers, so a drift
+/// between the two files would have panicked a UI callback instead of
+/// failing to compile. The enum in `model.rs` closes that hole entirely —
+/// there is no runtime "unknown name" case left.
+fn predefined_item<R: Runtime>(app: &AppHandle<R>, kind: Predefined) -> tauri::Result<PredefinedMenuItem<R>> {
+    match kind {
+        Predefined::Undo => PredefinedMenuItem::undo(app, None),
+        Predefined::Redo => PredefinedMenuItem::redo(app, None),
+        Predefined::Cut => PredefinedMenuItem::cut(app, None),
+        Predefined::Copy => PredefinedMenuItem::copy(app, None),
+        Predefined::Paste => PredefinedMenuItem::paste(app, None),
+        Predefined::SelectAll => PredefinedMenuItem::select_all(app, None),
+        Predefined::Minimize => PredefinedMenuItem::minimize(app, None),
         // macOS's "Zoom" menu item IS `PredefinedMenuItem::maximize` — there
         // is no separately named "zoom" constructor in tauri::menu.
-        "zoom" => PredefinedMenuItem::maximize(app, None),
-        "close-window" => PredefinedMenuItem::close_window(app, None),
-        other => panic!(
-            "menubar: model.rs emitted Predefined({other:?}), which mod.rs does not \
-             translate — the two files have drifted; add a case here"
-        ),
+        Predefined::Zoom => PredefinedMenuItem::maximize(app, None),
+        Predefined::CloseWindow => PredefinedMenuItem::close_window(app, None),
+        // The application-submenu items (D3-review CRITICAL finding 1): the
+        // OS supplies the "About <app>"/"Quit <app>" wording itself when
+        // `text` is `None`, exactly like every other predefined item here.
+        Predefined::About => PredefinedMenuItem::about(app, None, None),
+        Predefined::Services => PredefinedMenuItem::services(app, None),
+        Predefined::Hide => PredefinedMenuItem::hide(app, None),
+        Predefined::HideOthers => PredefinedMenuItem::hide_others(app, None),
+        Predefined::ShowAll => PredefinedMenuItem::show_all(app, None),
+        Predefined::Quit => PredefinedMenuItem::quit(app, None),
     }
 }
 
@@ -165,8 +174,8 @@ fn append_entries<R: Runtime>(app: &AppHandle<R>, parent: &Submenu<R>, entries: 
                 parent.append(&PredefinedMenuItem::separator(app)?)?;
                 i += 1;
             }
-            Entry::Predefined(name) => {
-                parent.append(&predefined_item(app, name)?)?;
+            Entry::Predefined(kind) => {
+                parent.append(&predefined_item(app, *kind)?)?;
                 i += 1;
             }
         }
@@ -203,10 +212,11 @@ pub fn install<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) -> tauri::Result<(
 /// this liberally: on every window open/close, every key-window change, and
 /// once more after boot completes / after an N5 vault switch.
 pub fn rebuild<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) -> tauri::Result<()> {
-    let key_has_file = ctx.registry.key().is_some_and(|w| w.file_id.is_some());
+    let key = ctx.registry.key();
+    let key_label = key.as_ref().map(|w| w.label.as_str());
     let open_windows = ctx.registry.list();
     let recents = recent::list_recent(&ctx.data_dir, recent::RECENT_LIMIT);
-    let model = build_menu_model(&open_windows, &recents, key_has_file);
+    let model = build_menu_model(&open_windows, &recents, key_label);
     let menu = build_tauri_menu(app, &model)?;
     app.set_menu(menu)?;
     Ok(())
@@ -227,30 +237,46 @@ pub fn on_window_set_changed<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) {
 // ---------------------------------------------------------------------------
 
 /// Build the shared `on_navigation` policy closure for the window labelled
-/// `label`: D1/D2's rule that `#/auth/*` and `#/dashboard` are cancelled and
-/// redirected to `/__home`. Used for the home window (by `main.rs`) AND
-/// every file window (by [`open_file_window`] below) so the redirect rule is
-/// defined exactly once — a second, hand-copied closure is exactly how
-/// `#/dashboard` would quietly become reachable again from a file window.
+/// `label`: D1/D2's rule that `#/auth/*` and `#/dashboard` are cancelled,
+/// redirecting to `recovery_path` on THIS window. Used for the home window
+/// (by `main.rs`, `recovery_path = navwatch::HOME_PATH`) AND every file
+/// window (by [`open_file_window`] below, `recovery_path` = that file's own
+/// `workspace_deep_link`) so the redirect rule is defined exactly once — a
+/// second, hand-copied closure is exactly how `#/dashboard` would quietly
+/// become reachable again from a file window.
+///
+/// **D3-review IMPORTANT fix (finding 2):** `navwatch::decide` always
+/// returns `/__home` as the path inside `Decision::CancelAndRedirect` — that
+/// constant is right for the home window, but sending a FILE window there
+/// left the window showing Home while the registry still recorded its
+/// `file_id`, a "ghost" the Window menu, Export/Reveal, and `reuse_or_create`
+/// all then acted on incorrectly. The single cancel-or-allow decision in
+/// `navwatch::decide` is UNCHANGED (still one policy body, still
+/// Tauri-free/unit-tested there); only the recovery DESTINATION is now a
+/// parameter of this one translation function, per-window, rather than a
+/// second copy of the redirect rule.
 pub fn navigation_policy<R: Runtime>(
     app: &AppHandle<R>,
     label: &str,
     watch: NavWatch,
+    recovery_path: &str,
 ) -> impl Fn(&tauri::Url) -> bool + Send + 'static {
     let nav_handle = app.clone();
     let label = label.to_string();
+    let recovery_path = recovery_path.to_string();
     move |url| {
         let url_s = url.to_string();
         watch.record("on_navigation", &url_s);
         match navwatch::decide(&url_s, watch.redirect_enabled()) {
             Decision::Allow => true,
-            Decision::CancelAndRedirect(path) => {
+            Decision::CancelAndRedirect(_) => {
                 let h = nav_handle.clone();
                 let label = label.clone();
+                let recovery_path = recovery_path.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(w) = h.get_webview_window(&label) {
                         if let Ok(base) = w.url() {
-                            if let Ok(dest) = base.join(&path) {
+                            if let Ok(dest) = base.join(&recovery_path) {
                                 let _ = w.navigate(dest);
                             }
                         }
@@ -294,11 +320,17 @@ pub fn open_file_window<R: Runtime>(
             let url: tauri::Url = full.parse().map_err(tauri::Error::InvalidUrl)?;
 
             let watch = NavWatch::from_env();
+            // Recovery path is THIS window's own deep link (`path`, computed
+            // above), not the home window's `/__home` — see
+            // `navigation_policy`'s doc comment (D3-review finding 2). Using
+            // the shared `/__home` here would be the ghost-window bug: this
+            // window would show Home while the registry still says it shows
+            // `file_id`.
             let window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
                 .title(title)
                 .inner_size(1280.0, 800.0)
                 .resizable(true)
-                .on_navigation(navigation_policy(app, &label, watch))
+                .on_navigation(navigation_policy(app, &label, watch, &path))
                 .build()?;
 
             ctx.registry.insert(OpenWindow {
@@ -335,10 +367,11 @@ pub fn open_file_window<R: Runtime>(
 // ---------------------------------------------------------------------------
 
 fn dispatch<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, id: &str) {
-    let key_has_file = ctx.registry.key().is_some_and(|w| w.file_id.is_some());
+    let key = ctx.registry.key();
+    let key_label = key.as_ref().map(|w| w.label.as_str());
     let open_windows = ctx.registry.list();
     let recents = recent::list_recent(&ctx.data_dir, recent::RECENT_LIMIT);
-    let model = build_menu_model(&open_windows, &recents, key_has_file);
+    let model = build_menu_model(&open_windows, &recents, key_label);
     let Some(command) = command_for_id(&model, id) else {
         // Not a bug by itself (predefined items fire without going through
         // `command_for_id` at all — they never reach `dispatch`), but any id
@@ -565,6 +598,28 @@ async fn export_key_file(ctx: &MenuCtx) {
     .flatten() else {
         return;
     };
+    // D3-review MINOR fix (finding 5): refuse a destination inside the
+    // vault — the folder tree is the core invariant's source of truth, and a
+    // stray exported `.zip` dropped into it is not something the sync daemon
+    // understands (it is not a `.penpot` binfile directory), so it would
+    // just sit there as vault clutter the daemon and the Files list both
+    // have no idea what to do with. Mirrors `open_picked_folder`'s existing
+    // `strip_prefix(&live.vault_root)` check above, just checking the
+    // opposite direction (destination must be OUTSIDE, not inside).
+    if dest.strip_prefix(&live.vault_root).is_ok() {
+        crate::dialog::native_error_dialog(
+            "Penpot Local — Export failed",
+            &format!(
+                "{} is inside the active vault ({}). The vault's folder tree is the \
+                 source of truth for your projects — exporting into it would drop a \
+                 stray file the sync daemon doesn't understand. Choose a location \
+                 outside the vault.",
+                dest.display(),
+                live.vault_root.display()
+            ),
+        );
+        return;
+    }
     match tauri::async_runtime::spawn_blocking(move || std::fs::write(&dest, bytes)).await {
         Ok(Ok(())) => crate::dialog::native_info_dialog("Penpot Local — Export", "Export complete."),
         Ok(Err(e)) => crate::dialog::native_error_dialog("Penpot Local — Export failed", &format!("{e}")),
@@ -744,7 +799,6 @@ fn run_command<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, command: Command) 
             "\u{2022} Preferences is not available yet (arrives in a later milestone).\n\
              \u{2022} Open…, Import… and Export… use native pickers on macOS only.\n\
              \u{2022} The menu bar is app-wide (a macOS constraint): it always reflects\n  whichever window is currently key, not a per-window menu.\n\
-             \u{2022} The Window menu lists every open window but cannot visually mark\n  which one is currently key.\n\
              \u{2022} New Project has no file to open yet, so it opens Home instead,\n  where the new (empty) project appears immediately.",
         ),
     }
@@ -773,8 +827,8 @@ mod tests {
             OpenWindow { label: HOME_LABEL.into(), file_id: None, title: "Penpot Local".into() },
             OpenWindow { label: "file-f1".into(), file_id: Some("f1".into()), title: "Alpha".into() },
         ];
-        for key_has_file in [false, true] {
-            let model = build_menu_model(&windows, &recent, key_has_file);
+        for key_label in [None, Some("file-f1")] {
+            let model = build_menu_model(&windows, &recent, key_label);
             for section in &model.sections {
                 for entry in &section.entries {
                     if let Entry::Item(item) = entry {
