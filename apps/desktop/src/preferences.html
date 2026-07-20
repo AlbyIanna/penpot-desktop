@@ -248,7 +248,14 @@
   // reconnect poll below). `null` until one has finished since the server
   // process started.
   var currentLastOp = null;
-  function opKey(op) { return op ? (op.op + "@" + op.at) : null; }
+  // Keyed on `seq`, NOT `op + "@" + at` — `at` has one-second resolution
+  // (see last_op.rs's module doc "Identity" section), so two consecutive
+  // operations finishing within the same wall-clock second would produce an
+  // identical key and this page would accept the FIRST (stale) record as
+  // proof the SECOND one finished. `seq` is the monotonic counter that
+  // exists specifically to make that impossible; `scripts/d4_prefs_helper.py`
+  // already keys off it for exactly this reason.
+  function opKey(op) { return op ? String(op.seq) : null; }
 
   // Live facts only — never touches the toggle checkboxes, so a poll landing
   // mid-interaction can never yank back a change the user just made.
@@ -396,7 +403,12 @@
           els.rebootBtn.textContent = prevLabel;
           if (!lastOp) {
             setSaveNote("Still waiting for the local stack to come back — try reloading the page.");
-          } else if (lastOp.op === "reboot" && !lastOp.ok) {
+          } else if (lastOp.op !== "reboot") {
+            // A different operation's record raced in during this wait (e.g.
+            // a vaultSwitch kicked off elsewhere) — this poll only has proof
+            // that op finished, not the reboot it was actually awaiting.
+            setSaveNote("The local stack is back, but a different operation (" + lastOp.op + ") finished in the meantime — reload the page to check status.");
+          } else if (!lastOp.ok) {
             setSaveNote("Restart failed: " + (lastOp.error || "unknown error"));
           } else {
             els.reboot.hidden = true;
@@ -443,7 +455,12 @@
           els.switchBtn.disabled = false;
           if (!lastOp) {
             setSwitchNote("Still waiting for the local stack to come back — try reloading the page.");
-          } else if (lastOp.op === "vaultSwitch" && !lastOp.ok) {
+          } else if (lastOp.op !== "vaultSwitch") {
+            // A different operation's record raced in during this wait (e.g.
+            // a reboot kicked off elsewhere) — this poll only has proof that
+            // op finished, not the vault switch it was actually awaiting.
+            setSwitchNote("The local stack is back, but a different operation (" + lastOp.op + ") finished in the meantime — reload the page to check status.");
+          } else if (!lastOp.ok) {
             setSwitchNote("Switch failed: " + (lastOp.error || "unknown error"));
           } else {
             setSwitchNote("Switched vault.");

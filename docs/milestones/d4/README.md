@@ -12,7 +12,7 @@ the last of Penpot's account surfaces to go.
 
 | Setting | Applies |
 |---|---|
-| Vault location / switch | **Live** — delegates to the N5 `switch_to` machinery, unchanged |
+| Vault location / switch | **Reboot (202 + poll)** — full teardown-and-reboot via the N5 `switch_to` machinery, unchanged; same ack-then-detach shape as the reboot row below, not a live in-place change |
 | Sync on/off | **Live**, and now persisted |
 | Renders (thumbnails/exporter) — turning OFF | **Live** — stops the poll loop |
 | Renders — turning ON | **Reboot** — the supervisor cannot hot-add the exporter child |
@@ -38,9 +38,10 @@ That is a pure function (`wipes_disposable_state`) with a test, not a comment.
 ```mermaid
 flowchart TD
     S["a setting changes"] --> Q{"needs_reboot?"}
-    Q -->|no| L["apply live<br/>(sync pause, stop renders, vault switch)"]
+    Q -->|no| L["apply live<br/>(sync pause, stop renders)"]
     Q -->|yes| A["202 Accepted, then<br/>stop stack → boot again<br/>SAME vault, no wipe"]
     A --> P["client polls until lastOp changes"]
+    V["vault switch<br/>(POST /__api/prefs/vault)"] --> A
 ```
 
 ## Three defects found by running it
@@ -54,9 +55,10 @@ over the preference because the gates rely on it as an escape hatch.
 `/__api/prefs/reboot` awaited an operation that stops the whole stack — including the proxy
 serving that very request — then boots a new one. The response could never arrive; the gate
 caught it as a socket timeout. Both now **acknowledge first** (`202`) and do the work in a
-detached task, with the outcome recorded in a `lastOp` field so a failure is still visible after
-the connection is gone. The client polls until `lastOp` *changes*, not merely until some request
-succeeds — the old stack can still answer for a moment.
+detached task, with the outcome recorded in a `lastOp` **file** (`<data_dir>/last-op.json`, not an
+in-memory field — the whole point is that it must outlive the very `PrefsState` it reports on)
+so a failure is still visible after the connection is gone. The client polls until `lastOp`
+*changes*, not merely until some request succeeds — the old stack can still answer for a moment.
 
 **3. Renaming a test broke another milestone's gate.** Closing `#/settings` renamed the navwatch
 tests, and `scripts/d1-offline.sh` requires specific test names *by name* — deliberately, so that

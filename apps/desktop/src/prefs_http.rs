@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(body["vault"]["path"], "");
         assert_eq!(body["syncPaused"], false);
         assert_eq!(body["rendersRunning"], false);
-        assert_eq!(prefs::load(tmp.path()).sync_enabled, false, "the file on disk must match");
+        assert!(!prefs::load(tmp.path()).sync_enabled, "the file on disk must match");
 
         // Now a boot-time change on top (plugins off): needsReboot must flip
         // true. The page always resends the FULL object, so this carries the
@@ -407,7 +407,7 @@ mod tests {
         let body = json_body(resp).await;
         assert_eq!(body["ok"], true);
         assert_eq!(body["needsReboot"], true, "disabling plugins is boot-time");
-        assert_eq!(prefs::load(tmp.path()).plugins_enabled, false);
+        assert!(!prefs::load(tmp.path()).plugins_enabled);
     }
 
     #[tokio::test]

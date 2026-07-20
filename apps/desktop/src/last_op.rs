@@ -39,13 +39,14 @@
 //! record apart from a stale one already sitting on disk from an earlier
 //! operation — that's why a bare `{op, ok}` isn't enough baseline/target
 //! comparison on its own once the record survives a process. [`seq`] is a
-//! counter persisted IN the record itself (read-modify-write: next = previous
-//! + 1, starting at 1 if nothing is on disk yet), so two operations that
-//! finish with an identical-looking `{op, ok, error}` — even within the same
-//! wall-clock second, where `at`'s one-second resolution alone could collide
-//! — still produce distinguishable records. The poller's contract: capture
-//! `seq` (or `None`) as a baseline before kicking off an operation, then wait
-//! for the persisted `seq` to differ from that baseline.
+//! counter persisted IN the record itself: read-modify-write, the next value
+//! is the previous one plus one, starting at 1 if nothing is on disk yet.
+//! That means two operations that finish with an identical-looking
+//! `{op, ok, error}` — even within the same wall-clock second, where `at`'s
+//! one-second resolution alone could collide — still produce distinguishable
+//! records. The poller's contract: capture `seq` (or `None`) as a baseline
+//! before kicking off an operation, then wait for the persisted `seq` to
+//! differ from that baseline.
 
 use std::path::Path;
 
@@ -87,15 +88,36 @@ pub fn load(data_dir: &Path) -> Option<LastOp> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
+/// Process-wide lock guarding the `load` → bump `seq` → `atomic_write`
+/// sequence in [`record`]. `switch_to`/`reboot_in_place` are serialized by
+/// `VaultRunner::switch_lock`, but that guard is already dropped by the time
+/// the detached task in `prefs_http.rs` calls `record` — the write happens
+/// AFTER the awaited future resolves, deliberately, so it can capture the
+/// caller's `Result` (see this module's "Write ordering" doc). That leaves a
+/// window where two detached tasks finishing back-to-back (a reboot and a
+/// switch both in flight, or two switches from two callers) could both read
+/// the same `seq` before either writes, then both write — the loser's
+/// outcome silently vanishes. This mutex closes that window without
+/// touching `switch_lock` itself, which exists for a different purpose
+/// (serializing the stop→boot dance, not the bookkeeping after it).
+static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Record a detached switch/reboot's outcome, atomically. `seq` is derived
 /// from whatever is currently on disk (corrupt/missing counts as "nothing
 /// yet", i.e. the next `seq` is 1) so it keeps climbing across process
-/// restarts, not just within one.
+/// restarts, not just within one. The read-modify-write is additionally
+/// serialized process-wide by [`RECORD_LOCK`] — see its doc for why that is
+/// needed on top of `VaultRunner::switch_lock`.
 pub fn record(data_dir: &Path, op: &str, result: Result<(), String>) -> anyhow::Result<()> {
     let (ok, error) = match result {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e)),
     };
+    // Poisoning would only happen if a prior call panicked mid-write, which
+    // would already have taken down the process; recovering the guard here
+    // (rather than propagating the poison) keeps a single unrelated panic
+    // from permanently wedging every future last-op record.
+    let _guard = RECORD_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let seq = load(data_dir).map(|prev| prev.seq + 1).unwrap_or(1);
     let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let record = LastOp { op: op.to_string(), ok, error, at, seq };
@@ -187,6 +209,40 @@ mod tests {
             record(tmp.path(), "reboot", Ok(())).unwrap();
             assert_eq!(load(tmp.path()).unwrap().seq, i);
         }
+    }
+
+    #[test]
+    fn concurrent_records_never_collide_on_seq() {
+        // Simulates two detached tasks (e.g. a reboot and a switch, both
+        // triggered by the page in quick succession) finishing at roughly
+        // the same time and both calling `record`. `switch_lock` in
+        // `control.rs` is already released by the time either caller gets
+        // here — this test is what proves `RECORD_LOCK` picks up where that
+        // guard leaves off, rather than trusting the ordering documented in
+        // finding 5's fix without exercising it.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_path_buf();
+        const N: u64 = 8;
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || record(&path, "reboot", Ok(())).unwrap())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Without serialization, several threads can race `load` before any
+        // of them `atomic_write`s, so multiple end up computing the SAME
+        // `seq` and the last writer clobbers the rest — the final on-disk
+        // `seq` would land below `N`. With `RECORD_LOCK` in place, every
+        // call's read-modify-write is atomic with respect to the others, so
+        // `N` fully serialized increments must leave `seq == N` on disk.
+        assert_eq!(
+            load(&path).unwrap().seq,
+            N,
+            "concurrent record() calls must be serialized, not lose an outcome to a seq collision"
+        );
     }
 
     #[test]

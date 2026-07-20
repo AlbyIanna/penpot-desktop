@@ -73,6 +73,13 @@ Subcommands:
       timeout — a live-effect assertion must be able to time out and FAIL,
       never spin forever and get killed by the shell's own timeout as a
       false pass.
+  selftest
+      Offline unit tests (no server, no gate) for `resolve_baseline_key` —
+      the pure decision `reboot`/`vault`'s baseline read was extracted into
+      so a transient-GET-failure-must-die-not-degrade-to-None regression
+      (Task 7 finding 2) is checkable without standing up the whole stack.
+      Prints "selftest OK" and exits 0, or raises `AssertionError` and exits
+      non-zero. Same convention as scripts/d1_egress.py's `selftest`.
 """
 
 import json
@@ -143,6 +150,89 @@ def _get_lenient(path, per_call_timeout=5):
         return None
 
 
+def _probe_prefs_once(per_call_timeout=5):
+    """Single attempt to reach `GET /__api/prefs`. Returns `(True, data)` if
+    the request actually reached the server (`data` may legitimately have
+    `lastOp: null` — nothing has ever been recorded yet, which is a valid
+    baseline, not a failure), or `(False, None)` if the request itself
+    failed (timeout, connection refused, HTTP error). Kept separate from
+    `_last_op_key`/`resolve_baseline_key` so those can be exercised by
+    `selftest` against canned `(ok, data)` tuples with no server involved."""
+    req = urllib.request.Request(BASE + "/__api/prefs", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=per_call_timeout) as resp:
+            return True, json.loads(resp.read())
+    except Exception:
+        return False, None
+
+
+class BaselineUnreachable(Exception):
+    """Raised by `resolve_baseline_key` when every probe attempt failed to
+    reach the server at all — as opposed to reaching it and legitimately
+    finding no `lastOp` yet. Callers must not paper over this by treating it
+    as "no baseline": see `resolve_baseline_key`'s doc."""
+
+    def __init__(self, attempts):
+        super().__init__(f"{attempts} attempt(s) all failed to reach the server")
+        self.attempts = attempts
+
+
+def resolve_baseline_key(attempts):
+    """Pure decision (Task 7 finding 2's fix): given `attempts`, a list of
+    `(ok, data)` tuples from repeatedly probing `GET /__api/prefs` for the
+    pre-action `lastOp` baseline (oldest first, as `_probe_prefs_once`
+    returns them), decide the baseline key `_wait_for_op_outcome` should
+    later compare against.
+
+    The FIRST attempt that actually reached the server (`ok=True`) settles
+    the baseline — even if `lastOp` is null there, which genuinely means
+    "nothing recorded yet" and is a perfectly valid baseline (`None`), not a
+    failure.
+
+    Only if EVERY attempt failed to reach the server at all does this raise
+    `BaselineUnreachable`. Before this fix, a single-shot lenient GET that
+    failed transiently collapsed straight to `None` — indistinguishable from
+    "reachable, nothing recorded" — and `_wait_for_op_outcome` would then
+    accept whatever `lastOp` ALREADY happens to sit on disk (e.g. left by an
+    earlier switch/reboot in the same gate run — legs (e), (f), (h) all run
+    with a prior record already present) as if it were proof THIS operation
+    finished, passing instantly without the operation having run at all. "We
+    could not read the baseline" must never degrade into "accept any
+    record" — so this raises instead of returning `None`, and the caller
+    (`_read_baseline_with_retries`) turns that into a loud `die()`."""
+    for ok, data in attempts:
+        if ok:
+            return _last_op_key(data)
+    raise BaselineUnreachable(len(attempts))
+
+
+def _read_baseline_with_retries(retries=3, retry_delay_s=1.0):
+    """Read the pre-action `lastOp` baseline, retrying transient `GET`
+    failures up to `retries` times before giving up. Dies loudly (rather
+    than silently treating an unreachable server as "no baseline") if the
+    stack cannot be reached at all — see `resolve_baseline_key`'s doc for
+    why that distinction matters."""
+    attempts = []
+    for attempt in range(retries):
+        attempts.append(_probe_prefs_once())
+        if attempts[-1][0]:
+            break
+        if attempt < retries - 1:
+            time.sleep(retry_delay_s)
+    try:
+        return resolve_baseline_key(attempts)
+    except BaselineUnreachable as e:
+        die(
+            f"could not read GET /__api/prefs to capture the pre-action lastOp "
+            f"baseline after {e.attempts} attempt(s) — the stack is expected to "
+            f"be up at this point. Refusing to treat this as \"no baseline\": "
+            f"that would let a pre-existing stale last-op.json record already "
+            f"on disk be accepted as this operation's own outcome (see "
+            f"resolve_baseline_key's doc).",
+            1,
+        )
+
+
 def _last_op_key(data):
     """A value that changes iff a NEW detached switch/reboot has finished and
     been recorded — `lastOp.seq`, or `None` before anything has EVER finished
@@ -202,8 +292,15 @@ def _post_then_wait(path, body, timeout):
     via `_wait_for_op_outcome` and reprints it in the OLD synchronous shape —
     `ok` reflects the REAL result (`lastOp.ok`), not just whether the 202 was
     accepted, so every existing `grep '"ok": true'`/`'"ok": false'` caller
-    keeps working unchanged."""
-    baseline_key = _last_op_key(_get_lenient("/__api/prefs"))
+    keeps working unchanged.
+
+    The baseline itself is read with retries (`_read_baseline_with_retries`)
+    and dies loudly if the server cannot be reached at all — Task 7 finding
+    2's fix. A single transient failure here must never silently degrade
+    into "no baseline", which would let `_wait_for_op_outcome` accept
+    whatever `lastOp` already happens to be sitting on disk as this
+    operation's own outcome."""
+    baseline_key = _read_baseline_with_retries()
     ack = _post(path, body, timeout=15)
     if not ack.get("accepted"):
         # Rejected synchronously (e.g. empty path, runner not ready yet) —
@@ -280,6 +377,49 @@ def cmd_wait_bool(field, expected, timeout):
     die(f"wait_bool({field}) timed out after {timeout}s: last={last!r} want={want}", 1)
 
 
+def cmd_selftest():
+    """Exercises `resolve_baseline_key` (Task 7 finding 2's fix) against
+    canned `(ok, data)` attempt sequences — no server involved. Matches the
+    `selftest` convention `scripts/d1_egress.py` already uses for a pure
+    parsing/decision function that would otherwise only be reachable through
+    a live stack."""
+    # A reachable first attempt with an existing lastOp settles the baseline
+    # on its seq immediately — no retry needed.
+    assert resolve_baseline_key([(True, {"lastOp": {"seq": 5}})]) == 5
+
+    # A reachable attempt where NOTHING has ever been recorded yet is a
+    # legitimate baseline of None — not a failure, must not raise.
+    assert resolve_baseline_key([(True, {"lastOp": None})]) is None
+    assert resolve_baseline_key([(True, {})]) is None
+
+    # Transient failures before a reachable attempt do not change the
+    # answer — the first attempt that actually reached the server wins,
+    # whichever position it is at.
+    assert resolve_baseline_key([(False, None), (False, None), (True, {"lastOp": {"seq": 7}})]) == 7
+    assert resolve_baseline_key([(False, None), (True, {"lastOp": None})]) is None
+
+    # The core regression this test exists for: if EVERY attempt failed to
+    # reach the server, this must raise rather than silently returning None
+    # (which is indistinguishable from "reachable, nothing recorded" and
+    # would let `_wait_for_op_outcome` accept a pre-existing stale record on
+    # disk as this operation's own outcome).
+    try:
+        resolve_baseline_key([(False, None), (False, None), (False, None)])
+        raise AssertionError("resolve_baseline_key must raise when every attempt fails to reach the server")
+    except BaselineUnreachable as e:
+        assert e.attempts == 3
+
+    # A single failed attempt alone (no retries configured) must also raise,
+    # not quietly become None.
+    try:
+        resolve_baseline_key([(False, None)])
+        raise AssertionError("a single unreachable attempt must raise, not degrade to None")
+    except BaselineUnreachable:
+        pass
+
+    print("selftest OK")
+
+
 def main():
     if len(sys.argv) < 2:
         die("usage: d4_prefs_helper.py <cmd> ...", 64)
@@ -293,6 +433,7 @@ def main():
         "config_js_has": cmd_config_js_has,
         "csp_present": cmd_csp_present,
         "wait_bool": cmd_wait_bool,
+        "selftest": cmd_selftest,
     }.get(cmd)
     if fn is None:
         die(f"unknown subcommand {cmd}", 64)
