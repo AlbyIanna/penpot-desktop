@@ -7,6 +7,7 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use penpot_desktop::control::{self, VaultRunner};
@@ -17,6 +18,40 @@ use penpot_desktop::windows::{OpenWindow, WindowRegistry, HOME_LABEL};
 use penpot_desktop::AppConfig;
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::sync::Mutex;
+
+/// D5 Task 3 — the first argv element that looks like a document path, not a
+/// flag. `args` is the FULL argv INCLUDING argv[0] (the executable path) —
+/// the same convention as `std::env::args()` and
+/// `tauri_plugin_single_instance`'s callback — so index 0 is always skipped.
+/// "Looks like a path" is deliberately minimal (not a flag, i.e. does not
+/// start with `-`): `docopen::resolve` is the real judge of whether it is
+/// actually a `.penpot` directory, in or out of the vault; this only decides
+/// whether there is an argument worth handing to it at all.
+fn document_arg<I: IntoIterator<Item = String>>(args: I) -> Option<PathBuf> {
+    args.into_iter().skip(1).find(|a| !a.starts_with('-')).map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod document_arg_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_first_non_flag_argument_after_the_program_name() {
+        let args = ["penpot-desktop", "--flag", "/a/b.penpot"].map(String::from);
+        assert_eq!(document_arg(args), Some(PathBuf::from("/a/b.penpot")));
+    }
+
+    #[test]
+    fn no_path_argument_yields_none() {
+        let args = ["penpot-desktop", "--flag"].map(String::from);
+        assert_eq!(document_arg(args), None);
+    }
+
+    #[test]
+    fn bare_invocation_with_no_args_yields_none() {
+        assert_eq!(document_arg(Vec::<String>::new()), None);
+    }
+}
 
 // D3: `navigation_policy` (the shared `on_navigation` closure builder) and
 // `open_file_window` (window-per-file's Tauri-side builder) now live in
@@ -79,14 +114,41 @@ fn main() {
         // M5: single-instance guard — MUST be the first plugin registered so
         // it runs before anything else. A second launch never boots its own
         // supervisor stack (M4 finding: postgres would refuse the shared data
-        // dir); instead the running instance gets this callback and refocuses
-        // its window while the second process exits immediately.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            tracing::info!("second launch detected: focusing the existing window");
-            if let Some(window) = app.get_webview_window(HOME_LABEL) {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
+        // dir); instead the running instance gets this callback.
+        //
+        // D5 Task 3: a second launch now FORWARDS a `.penpot` argument to
+        // `open_document` instead of only refocusing — cooperating with this
+        // guard rather than swallowing the document is the M5-cooperation
+        // exit criterion (PLAN's Global Constraints). `MenuCtx` is retrieved
+        // via Tauri managed state (`app.manage` in `.setup()` below,
+        // `try_state` here): by the time a SECOND launch can fire this
+        // callback, the FIRST instance has already finished `.setup()`, so
+        // the state is guaranteed present — see `app.manage(menu_ctx...)`
+        // below for why this ordering is safe. Still refocuses when there is
+        // no document argument, exactly like before this task.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            match document_arg(argv) {
+                Some(path) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "second launch: forwarding document to the running instance"
+                    );
+                    match app.try_state::<MenuCtx>() {
+                        Some(ctx) => menubar::open_document(app, &ctx, &path),
+                        None => tracing::warn!(
+                            "second launch: MenuCtx not yet managed (first instance still \
+                             booting?); cannot forward the document"
+                        ),
+                    }
+                }
+                None => {
+                    tracing::info!("second launch detected: focusing the existing window");
+                    if let Some(window) = app.get_webview_window(HOME_LABEL) {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
             }
         }))
         .plugin(global_shortcut_plugin)
@@ -101,6 +163,16 @@ fn main() {
             // every file window instead of hand-copying this closure — see
             // that function's doc comment for why a second copy would be a
             // hazard.
+            // D5 Task 3, arrival path 1: a `.penpot` path on the FIRST
+            // launch's own argv (`penpot-desktop /path/to/x.penpot`) —
+            // `main.rs` ignored argv entirely before this task. Reading it is
+            // cheap and can happen right away; ACTING on it (`open_document`,
+            // below) has to wait until boot has published the vault facts
+            // (`menu_live`), the same ordering `open_file_window` already
+            // requires — there is nothing to resolve a path against before
+            // that.
+            let cli_document_path = document_arg(std::env::args());
+
             let watch = NavWatch::from_env();
             let home_window = WebviewWindowBuilder::new(app, HOME_LABEL, WebviewUrl::default())
                 .title("Penpot Local")
@@ -273,6 +345,16 @@ fn main() {
                 tracing::error!("failed to install the native menu bar: {e}");
             }
 
+            // D5 Task 3: manage `MenuCtx` as Tauri state so the single-
+            // instance callback (registered above, BEFORE `.setup()` runs)
+            // can retrieve it via `try_state` on a second launch. `MenuCtx`
+            // is cheap to clone (its fields are all `Arc`-backed or plain
+            // owned data — see its doc comment) and `Send + Sync + 'static`
+            // (required by `app.manage`), so managing a clone here changes
+            // nothing about the `menu_ctx` used everywhere else in this
+            // closure — both keep pointing at the same registry/live slot.
+            app.manage(menu_ctx.clone());
+
             // Keep the registry (and therefore the Window menu / key-window-
             // dependent enabled state) honest for the home window too: forget
             // it if it's ever destroyed, and track focus so `key_has_file`
@@ -325,6 +407,7 @@ fn main() {
             // The window already shows placeholder-dist ("booting…"); bring
             // the stack up asynchronously and swap the URL when ready.
             let menu_ctx_boot = menu_ctx.clone();
+            let cli_document_path_boot = cli_document_path.clone();
             tauri::async_runtime::spawn(async move {
                 // N5: resolve the active vault (registry + interrupted-switch
                 // recovery), then boot it; the runner owns the stack and swaps
@@ -355,6 +438,14 @@ fn main() {
                             live.vault_root = runner.active().root();
                         }
                         menubar::on_window_set_changed(&handle, &menu_ctx_boot);
+                        // D5 Task 3, arrival path 1 (continued): now that the
+                        // vault facts are published, act on the first
+                        // launch's own argv path if there was one — the same
+                        // ordering `open_file_window` already requires (it
+                        // no-ops before `menu_live.vault_root` is set).
+                        if let Some(path) = &cli_document_path_boot {
+                            menubar::open_document(&handle, &menu_ctx_boot, path);
+                        }
                         // D0: the spike gate points the window at /__navprobe.
                         // Absent the override this is byte-identical to before.
                         let start = std::env::var("PENPOT_LOCAL_START_URL")
@@ -440,8 +531,8 @@ fn main() {
         });
     }
 
-    app.run(move |_handle, event| {
-        if let RunEvent::Exit = event {
+    app.run(move |handle, event| match event {
+        RunEvent::Exit => {
             // Blocking is fine here: the event loop is done; make sure no
             // child processes outlive the app.
             let running = running.clone();
@@ -451,5 +542,31 @@ fn main() {
                 }
             });
         }
+        // D5 Task 3, arrival path 3: the D5a spike proved the macOS Finder/
+        // `open` document path arrives HERE, as an Apple event, NOT as argv
+        // (`docs/spikes/finder-document-association.md`) — this is the ONE
+        // place that leg can be wired. `RunEvent::Opened` itself only exists
+        // on macOS/iOS/Android at the tauri-runtime level; this app only
+        // ships for macOS/Windows/Linux, so the arm is macOS-only.
+        #[cfg(target_os = "macos")]
+        RunEvent::Opened { urls } => {
+            let count = urls.len();
+            match handle.try_state::<MenuCtx>() {
+                Some(ctx) => {
+                    for url in urls {
+                        match url.to_file_path() {
+                            Ok(path) => menubar::open_document(handle, &ctx, &path),
+                            Err(()) => tracing::warn!(
+                                %url, "RunEvent::Opened: not a file:// URL; ignoring"
+                            ),
+                        }
+                    }
+                }
+                None => tracing::warn!(
+                    count, "RunEvent::Opened fired before MenuCtx was managed; dropping the url(s)"
+                ),
+            }
+        }
+        _ => {}
     });
 }

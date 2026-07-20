@@ -43,6 +43,7 @@ use penpot_rpc::{Auth, PenpotClient};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
+use crate::docopen;
 use crate::navwatch::{self, Decision, NavWatch};
 use crate::recent::{self, RecentEntry};
 use crate::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
@@ -366,6 +367,113 @@ pub fn open_file_window<R: Runtime>(
 
             on_window_set_changed(app, ctx);
             Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D5: "open a document" — the one funnel every arrival path uses
+// ---------------------------------------------------------------------------
+
+/// D5 Task 3 — what [`open_document`] does for each [`docopen::Resolved`]
+/// outcome, pulled out as a PURE decision (no `AppHandle`, no I/O) so it is
+/// unit-testable without a Tauri runtime — the same "decision vs. dumb Tauri
+/// glue" split as `windows::reuse_or_create`/`Reuse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentAction {
+    /// A known in-vault file: open (or focus) its window.
+    OpenInVault { file_id: String, title: String },
+    /// A `.penpot` outside the vault. Task 5 wires the copy-in + import
+    /// offer; for now the caller only logs what was skipped.
+    OfferImport { path: PathBuf },
+    /// A `.penpot` inside the vault the daemon hasn't imported yet. Task 5
+    /// wires the poll-until-id; for now the caller only logs what was
+    /// skipped.
+    WaitForImport { rel_path: String },
+    /// Not a Penpot document at all.
+    Reject { reason: String },
+}
+
+/// [`docopen::Resolved`] -> [`DocumentAction`]. A 1:1 mapping today, but kept
+/// as its own function (rather than matching `Resolved` directly in
+/// [`open_document`]) so the ROUTING DECISION — which is what Task 8's gate
+/// and this task's own test care about — is exercised without needing a
+/// manifest, a vault root, or a Tauri app at all.
+pub fn document_action(resolved: docopen::Resolved) -> DocumentAction {
+    match resolved {
+        docopen::Resolved::InVault { file_id, title } => DocumentAction::OpenInVault { file_id, title },
+        docopen::Resolved::External { path } => DocumentAction::OfferImport { path },
+        docopen::Resolved::PendingImport { rel_path } => DocumentAction::WaitForImport { rel_path },
+        docopen::Resolved::NotAPenpotDir { reason } => DocumentAction::Reject { reason },
+    }
+}
+
+/// Open `raw_path` as a document: resolve it against the ACTIVE vault's
+/// manifest ([`docopen::resolve`] — never another vault, per the zero-spill
+/// invariant: `live.vault_root` only comes from `ctx.live`, the same
+/// late-bound slot every other menu-bar command reads) and act on the
+/// result via [`document_action`].
+///
+/// This is the ONE funnel every "open a document" entry point calls into —
+/// the first-launch CLI argument, a second launch forwarding its argv, and
+/// `RunEvent::Opened` (Finder/`open`, macOS) all fed by `main.rs`; drag-drop
+/// (Task 4) reuses it too. Getting the routing decision right once here is
+/// the whole point of splitting it into [`document_action`] above.
+///
+/// `InVault` opens exactly like every other "open a file" path —
+/// [`open_file_window`], same reuse-or-create, same navigation policy,
+/// nothing forked. `OfferImport`/`WaitForImport` are NOT wired to anything
+/// destructive yet (Task 5 adds the copy-in + poll): this task's brief is to
+/// log clearly what was skipped, never stub silently. `Reject` also raises a
+/// native error dialog — every call site that reaches `open_document` today
+/// is itself a direct user gesture (a CLI argument, a second launch, a
+/// Finder open), so there is no "quiet background rescan" case here that a
+/// dialog would spam.
+pub fn open_document<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, raw_path: &Path) {
+    let live = live_snapshot(&ctx.live);
+    if live.vault_root.as_os_str().is_empty() {
+        tracing::info!(
+            path = %raw_path.display(),
+            "open_document called before boot completed; ignoring"
+        );
+        return;
+    }
+    let Some(manifest) = load_manifest(&live.vault_root) else {
+        // Mirrors `open_picked_folder`'s same guard: a vault that hasn't
+        // synced yet has nothing to resolve against. Not destructive, so a
+        // log (not a dialog) is enough — the manifest appears within one
+        // sync-daemon poll and the next open attempt will succeed.
+        tracing::warn!(
+            path = %raw_path.display(),
+            "open_document: vault has not synced yet; cannot resolve"
+        );
+        return;
+    };
+    let resolved = docopen::resolve(raw_path, &live.vault_root, &manifest);
+    match document_action(resolved) {
+        DocumentAction::OpenInVault { file_id, title } => {
+            if let Err(e) = open_file_window(app, ctx, &file_id, None, &title) {
+                tracing::error!("open_file_window failed: {e}");
+            }
+        }
+        DocumentAction::OfferImport { path } => {
+            tracing::info!(
+                path = %path.display(),
+                "open_document: external .penpot skipped — import offer not wired yet (Task 5)"
+            );
+        }
+        DocumentAction::WaitForImport { rel_path } => {
+            tracing::info!(
+                rel_path,
+                "open_document: vault-internal .penpot pending import skipped — poll not wired yet (Task 5)"
+            );
+        }
+        DocumentAction::Reject { reason } => {
+            tracing::warn!(path = %raw_path.display(), reason, "open_document: not a Penpot document");
+            crate::dialog::native_error_dialog(
+                "Penpot Local — Open",
+                &format!("{} is not a Penpot document.\n\n{reason}", raw_path.display()),
+            );
         }
     }
 }
@@ -866,5 +974,53 @@ mod tests {
         assert_eq!(file_display_name("Client A/homepage.penpot"), "homepage");
         assert_eq!(file_display_name("bare.penpot"), "bare");
         assert_eq!(file_display_name("no-extension"), "no-extension");
+    }
+
+    // -----------------------------------------------------------------
+    // D5 Task 3 — `open_document`'s routing decision, extracted into
+    // `document_action` so it is testable without a Tauri runtime, a
+    // manifest, or a vault root (mirrors `windows::reuse_or_create`'s split
+    // between the pure decision and the dumb Tauri glue around it).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_in_vault_resolution_opens_the_file() {
+        let action = document_action(docopen::Resolved::InVault {
+            file_id: "fid1".into(),
+            title: "Home".into(),
+        });
+        assert_eq!(
+            action,
+            DocumentAction::OpenInVault { file_id: "fid1".into(), title: "Home".into() }
+        );
+    }
+
+    #[test]
+    fn an_external_resolution_offers_import_not_opens() {
+        let path = PathBuf::from("/outside/Loose.penpot");
+        let action = document_action(docopen::Resolved::External { path: path.clone() });
+        assert_eq!(action, DocumentAction::OfferImport { path });
+    }
+
+    #[test]
+    fn a_pending_import_resolution_waits_not_opens() {
+        let action = document_action(docopen::Resolved::PendingImport {
+            rel_path: "Proj/New.penpot".into(),
+        });
+        assert_eq!(
+            action,
+            DocumentAction::WaitForImport { rel_path: "Proj/New.penpot".into() }
+        );
+    }
+
+    #[test]
+    fn a_non_penpot_resolution_is_rejected() {
+        let action = document_action(docopen::Resolved::NotAPenpotDir {
+            reason: "notes is not a directory".into(),
+        });
+        assert_eq!(
+            action,
+            DocumentAction::Reject { reason: "notes is not a directory".into() }
+        );
     }
 }
