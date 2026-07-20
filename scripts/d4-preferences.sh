@@ -519,6 +519,23 @@ fi
 # assertion, reused verbatim.
 # =========================================================================
 echo "-- (e) Preferences-initiated vault switch: zero cross-vault spill"
+# Leg (d) above deliberately left sync DISABLED and proved the setting survives
+# a restart. That is the milestone's load-bearing guarantee — and it means the
+# switched-to vault would never sync, so (e) would fail for a reason that has
+# nothing to do with cross-vault spill. Re-enable sync here, and assert it took
+# effect, so a failure below can only mean spill.
+# exportsEnabled stays false: leg (c) turned renders off, and turning them back
+# on is a boot-time change that would demand a reboot we do not want here.
+RESP="$(d4helper post '{"syncEnabled":true,"exportsEnabled":false,"pluginsEnabled":true,"cspEnabled":true}' 2>"$WORK_DIR/resync.err")"
+if echo "$RESP" | grep -q '"ok": true'; then
+    if d4helper wait_bool syncPaused false "$LIVE_APPLY_TIMEOUT" >/dev/null 2>"$WORK_DIR/resync-wait.err"; then
+        pass "(e) setup: sync re-enabled after leg (d) left it off (so a sync failure below means spill, not a paused daemon)"
+    else
+        fail "(e) setup: sync did not resume — the rest of this leg would be untrustworthy"; exit 1
+    fi
+else
+    fail "(e) setup: could not re-enable sync: $RESP $(cat "$WORK_DIR/resync.err" 2>/dev/null)"; exit 1
+fi
 NEEDLE_A="d4needleA"; NEEDLE_B="d4needleB"
 RESP="$(d4helper vault "$VAULT_A" "$SWITCH_TIMEOUT" 2>"$WORK_DIR/vault-a.err")"
 if echo "$RESP" | grep -q '"ok": true'; then
