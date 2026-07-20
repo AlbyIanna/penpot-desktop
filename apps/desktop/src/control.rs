@@ -124,6 +124,29 @@ impl VaultRunner {
         self.app.lock().await.as_ref().and_then(|a| a.export_status())
     }
 
+    /// The active vault's default team id, if the stack is up. D3's menu bar
+    /// needs this to build workspace deep links (`vault_index::
+    /// workspace_deep_link`) when dispatching File > Open… / Open Recent —
+    /// same "peek into the live `RunningApp`" shape as `sync_status` /
+    /// `sync_control` / `export_status` above. `None` only in the same brief
+    /// window those return `None` in (mid-switch, or provisioning never
+    /// produced a default team).
+    pub async fn team_id(&self) -> Option<String> {
+        self.app.lock().await.as_ref().and_then(|a| a.profile.default_team_id.clone())
+    }
+
+    /// The active vault's RPC access token, if the stack is up. D3's menu
+    /// bar needs this for the commands that genuinely must go through the
+    /// backend (New File, New Project, Import…) rather than touching the
+    /// vault directly — the core invariant for THIS task is narrower than
+    /// the app-wide one: nothing in the menu bar may write to the vault
+    /// itself, only the sync daemon does that, on its own schedule, after
+    /// the RPC call lands in the DB. Same "peek into the live `RunningApp`"
+    /// shape as `team_id`/`sync_status` above.
+    pub async fn access_token(&self) -> Option<String> {
+        self.app.lock().await.as_ref().and_then(|a| a.credentials.access_token.clone())
+    }
+
     /// Stop the current stack (process-exit path). Idempotent.
     pub async fn shutdown(&self) {
         if let Some(app) = self.app.lock().await.take() {
