@@ -20,6 +20,7 @@ pub mod navwatch;
 pub mod overlay;
 pub mod packages;
 pub mod preflight;
+pub mod prefs;
 pub mod recent;
 pub mod reveal;
 pub mod status;
