@@ -596,14 +596,27 @@ fn copy_into_vault(vault_root: &Path, source: &Path, source_name: &str) -> anyho
 /// then COPY (never move — `source` is the user's own file, left untouched)
 /// the `.penpot` into the active vault, then hand off to
 /// [`poll_until_imported_and_open`] for the daemon to pick it up on its own
-/// schedule. `live.vault_root` is read fresh from `ctx.live` right here, not
-/// captured earlier — the same zero-cross-vault-spill discipline every other
-/// command in this module already follows (an N5 vault switch mid-flow must
-/// never make this land in the vault that was active when the user clicked,
-/// only the one active when the copy actually happens).
+/// schedule.
+///
+/// The vault used for the copy AND the poll is resolved by
+/// [`resolve_post_confirm_vault`] **after** the confirm dialog returns, not
+/// before it is shown: `native_confirm_dialog` runs in a separate
+/// `osascript` process and does not block the Tauri event loop, so a vault
+/// switch (menu action N5, "Open Vault…") is reachable while the dialog is
+/// up. There is also an earlier, non-authoritative check before the dialog
+/// — it exists only to skip popping a dialog the app can't act on yet (boot
+/// not complete); its value is discarded and never reused for the copy or
+/// the poll. This is the zero-cross-vault-spill discipline every other
+/// command in this module already follows: an N5 switch mid-flow must
+/// never make this land in the vault that was active when the user
+/// clicked, only the one active when the copy actually happens.
 async fn offer_import<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, source: PathBuf) {
-    let live = live_snapshot(&ctx.live);
-    if live.vault_root.as_os_str().is_empty() {
+    // Fast, NON-authoritative pre-dialog gate: boot not having completed
+    // yet is by far the likeliest reason `vault_root` is empty, so bail
+    // before even showing the dialog rather than making the user click
+    // through a confirm that can't do anything. This snapshot is discarded
+    // right after the check — see the doc comment above for why.
+    if live_snapshot(&ctx.live).vault_root.as_os_str().is_empty() {
         tracing::info!(path = %source.display(), "import offer requested before boot completed; ignoring");
         return;
     }
@@ -628,10 +641,21 @@ async fn offer_import<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, source: Pat
         return;
     }
 
-    let vault_root = live.vault_root.clone();
+    // THE authoritative snapshot: taken fresh right here, after the confirm
+    // dialog has closed, so it reflects a vault switch that happened while
+    // the dialog was up. Used for BOTH the copy target and the poll below.
+    let Some(vault_root) = resolve_post_confirm_vault(&ctx.live) else {
+        tracing::info!(
+            path = %source.display(),
+            "vault facts not ready when import was confirmed; ignoring",
+        );
+        return;
+    };
+
     let copy_result = tauri::async_runtime::spawn_blocking({
         let source = source.clone();
         let source_name = source_name.clone();
+        let vault_root = vault_root.clone();
         move || copy_into_vault(&vault_root, &source, &source_name)
     })
     .await;
@@ -647,7 +671,24 @@ async fn offer_import<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, source: Pat
         }
     };
 
-    poll_until_imported_and_open(app, ctx, &live.vault_root, &rel_path).await;
+    poll_until_imported_and_open(app, ctx, &vault_root, &rel_path).await;
+}
+
+/// The decision half of the post-confirmation re-snapshot used by
+/// [`offer_import`]: `None` means the vault facts aren't ready (mirrors the
+/// pre-dialog gate there) and the caller must bail rather than copy into an
+/// empty path. Split out so the load-bearing property — "the vault used is
+/// the one read AFTER confirmation, not the one read before the dialog was
+/// shown" — is unit-testable without a Tauri runtime or a real dialog: a
+/// test can snapshot a slot, mutate it (standing in for an N5 switch while
+/// the dialog is up), then assert this function returns the MUTATED value.
+fn resolve_post_confirm_vault(slot: &LiveVaultSlot) -> Option<PathBuf> {
+    let live = live_snapshot(slot);
+    if live.vault_root.as_os_str().is_empty() {
+        None
+    } else {
+        Some(live.vault_root)
+    }
 }
 
 /// Poll the vault's manifest for `rel_path` until the sync daemon assigns it
@@ -1517,5 +1558,48 @@ mod tests {
         assert_eq!(second, "Imported/dup-2.penpot");
         assert!(vault.path().join(&first).is_dir());
         assert!(vault.path().join(&second).is_dir());
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_post_confirm_vault` — the fix for the cross-vault-spill
+    // window in `offer_import`: the native confirm dialog runs in a
+    // separate `osascript` process and does not block the Tauri event
+    // loop, so a `File > Open Vault` switch (N5) is reachable while it is
+    // up. These tests can't drive a real dialog or event loop, but they
+    // pin down the actual decision: the vault used for the copy+poll must
+    // be the one read from the slot AFTER confirmation, reflecting any
+    // switch that happened in between — not a value captured earlier.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_post_confirm_vault_reflects_a_switch_that_happened_after_an_earlier_read() {
+        let slot: LiveVaultSlot = Arc::new(Mutex::new(LiveVault {
+            vault_root: PathBuf::from("/vaults/A"),
+            ..Default::default()
+        }));
+
+        // Stand-in for the OLD, buggy pre-dialog snapshot: what the old
+        // code would have used for the copy+poll target.
+        let pre_confirm = live_snapshot(&slot);
+        assert_eq!(pre_confirm.vault_root, PathBuf::from("/vaults/A"));
+
+        // Stand-in for an N5 `File > Open Vault` switch happening while the
+        // (non-blocking) confirm dialog is still up.
+        *slot.lock().unwrap() = LiveVault { vault_root: PathBuf::from("/vaults/B"), ..Default::default() };
+
+        // The fix: resolving AFTER confirmation must see vault B, the one
+        // active now — never vault A, the one active when the user clicked.
+        let resolved = resolve_post_confirm_vault(&slot);
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/vaults/B")),
+            "must use the vault active after confirmation, not the one read before the dialog"
+        );
+    }
+
+    #[test]
+    fn resolve_post_confirm_vault_bails_cleanly_when_vault_facts_are_not_ready() {
+        let slot: LiveVaultSlot = Arc::new(Mutex::new(LiveVault::default()));
+        assert_eq!(resolve_post_confirm_vault(&slot), None);
     }
 }
