@@ -270,6 +270,32 @@ d2:
 d3:
     bash scripts/d3-menus.sh
 
+# D4 Preferences gate (PLAN4 milestone D4). A LIVE gate against the native
+# Preferences window's HTTP surface (`/__api/prefs*`, `apps/desktop/src/
+# prefs_http.rs`): preferences persist across a restart (file AND
+# `GET /__api/prefs`); a live setting (sync pause/resume) actually reaches
+# the daemon, not just the file; the exporter toggle actually stops renders
+# (PLAN4's stated exit criterion) — proven POSITIVE first (renders ON, an
+# edit produces a fresh render, reusing n2-thumbs.sh's own `exports_check`
+# helper rather than a third hasher) then NEGATIVE (renders OFF, the same
+# kind of edit produces no new render within a window at least as long as
+# the positive leg's own measured latency); sync-off survives a restart —
+# the specific failure this milestone must not ship, since `SyncControl`
+# starts unpaused on every boot; a Preferences-initiated vault switch
+# (`POST /__api/prefs/vault`) keeps ZERO cross-vault spill (P0), reusing
+# n5-vaults.sh's own `assert_state` rather than new assertions; and a
+# reboot-in-place (`POST /__api/prefs/reboot`) does NOT wipe the vault's DB
+# state (original file ids preserved) while a boot-time toggle
+# (plugins/CSP) really does flip on the SERVED `/js/config.js` /
+# `/index.html` CSP header only after that reboot, not before. Dedicated
+# ports: proxy 9054, backend 6516, postgres 5589, valkey 6532 (+ a D4-local
+# dev-mode exporter port, 6533 — assertion (c) needs real renders; no
+# separate control port is needed since every D4 route under test is
+# same-origin off the proxy). Needs the dev-mode exporter prerequisites
+# (scripts/fetch-penpot.sh --with-browsers + host node), same as m5.
+d4:
+    bash scripts/d4-preferences.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -280,17 +306,21 @@ routes-gate:
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
 # so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7,
-# D1–D3). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2/d3
-# boot their own live stacks (dedicated ports) like the m/n suites, safe to
-# chain at the tail. n2-thumbs + e4-gallery + e7-plugins need the runtime
-# bundle WITH browsers (`bash scripts/fetch-penpot.sh --with-browsers`);
-# d1-offline and d2-home need the same bundled browsers (their behavioural
-# checks drive a headless browser too). d2-home ALSO needs a GUI session for
-# its navwatch leg (same operational constraint as d0 — not CI-headless) —
-# unlike d0, d2 stays in the chain because it lands product code. d3-menus
-# also boots a real GUI session for its boot-only smoke leg (same
-# constraint), chained for the same reason: D3 lands product code.
-# m4-artifact-test.sh stays separate: it needs a dmg build
+# D1–D4). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2/d3/
+# d4 boot their own live stacks (dedicated ports) like the m/n suites, safe
+# to chain at the tail. n2-thumbs + e4-gallery + e7-plugins + d4-preferences
+# need the runtime bundle WITH browsers (`bash scripts/fetch-penpot.sh
+# --with-browsers`) — d4 specifically for its dev-mode exporter (assertion c,
+# the renders-on/off exit criterion); d1-offline and d2-home need the same
+# bundled browsers (their behavioural checks drive a headless browser too).
+# d2-home ALSO needs a GUI session for its navwatch leg (same operational
+# constraint as d0 — not CI-headless) — unlike d0, d2 stays in the chain
+# because it lands product code. d3-menus also boots a real GUI session for
+# its boot-only smoke leg (same constraint), chained for the same reason: D3
+# lands product code. d4-preferences is CI-headless (no GUI session needed —
+# every route it drives, including the vault switch and the reboot-in-place,
+# is same-origin HTTP off the proxy), chained because D4 lands product code
+# like D1–D3. m4-artifact-test.sh stays separate: it needs a dmg build
 # (`bash scripts/build-dmg.sh` first) and carries the E4 offline
 # packaged-gallery leg (g4) + the E7 offline plugin-serving leg (g5).
 # e5-tokens-spike.sh + e6-library-portability-spike.sh stay out by decision:
@@ -318,6 +348,7 @@ e2e:
     bash scripts/d1-offline.sh
     bash scripts/d2-home.sh
     bash scripts/d3-menus.sh
+    bash scripts/d4-preferences.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).
