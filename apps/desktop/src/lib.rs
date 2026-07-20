@@ -14,6 +14,7 @@ pub mod home;
 pub mod installer;
 pub mod layout;
 pub mod manage;
+pub mod menubar;
 pub mod navprobe;
 pub mod navwatch;
 pub mod overlay;
