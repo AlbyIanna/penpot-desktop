@@ -89,7 +89,7 @@ impl WindowRegistry {
     /// a window (e.g. after a title change) must not fork the registry's
     /// idea of what's open.
     pub fn insert(&self, w: OpenWindow) {
-        let mut inner = self.inner.lock().expect("window registry lock poisoned");
+        let mut inner = lock_recovering(&self.inner);
         inner.windows.insert(w.label.clone(), w);
     }
 
@@ -97,7 +97,7 @@ impl WindowRegistry {
     /// label — a stale key aimed at a closed window would misdirect every
     /// one of the six call sites this registry exists to fix.
     pub fn remove(&self, label: &str) {
-        let mut inner = self.inner.lock().expect("window registry lock poisoned");
+        let mut inner = lock_recovering(&self.inner);
         inner.windows.remove(label);
         if inner.key.as_deref() == Some(label) {
             inner.key = None;
@@ -107,7 +107,7 @@ impl WindowRegistry {
     /// All open windows in Window-menu order: the home window first, then
     /// files alphabetically by title.
     pub fn list(&self) -> Vec<OpenWindow> {
-        let inner = self.inner.lock().expect("window registry lock poisoned");
+        let inner = lock_recovering(&self.inner);
         let mut out: Vec<OpenWindow> = inner.windows.values().cloned().collect();
         out.sort_by(|a, b| {
             let a_is_home = a.label == HOME_LABEL;
@@ -125,7 +125,7 @@ impl WindowRegistry {
     /// second "open this file" request focuses the existing window instead
     /// of opening a duplicate.
     pub fn label_for_file(&self, file_id: &str) -> Option<String> {
-        let inner = self.inner.lock().expect("window registry lock poisoned");
+        let inner = lock_recovering(&self.inner);
         inner
             .windows
             .values()
@@ -135,18 +135,34 @@ impl WindowRegistry {
 
     /// Mark `label` as the key (frontmost/last-focused) window.
     pub fn set_key(&self, label: &str) {
-        let mut inner = self.inner.lock().expect("window registry lock poisoned");
+        let mut inner = lock_recovering(&self.inner);
         inner.key = Some(label.to_string());
     }
 
     /// The key window's record, if it is still open.
     pub fn key(&self) -> Option<OpenWindow> {
-        let inner = self.inner.lock().expect("window registry lock poisoned");
+        let inner = lock_recovering(&self.inner);
         inner
             .key
             .as_ref()
             .and_then(|label| inner.windows.get(label).cloned())
     }
+}
+
+/// Lock `inner`, recovering from poisoning instead of propagating the panic.
+///
+/// The registry is about to sit behind the menu builder and every window
+/// lookup; a poisoned `Mutex` would make `.expect()` panic on every later
+/// call, wedging the menu bar permanently for the rest of the app's life —
+/// far worse than the panic that poisoned it in the first place. Recovery is
+/// safe here because the registry holds no cross-field invariant a panic
+/// mid-update could leave broken: it's a plain map of open windows plus one
+/// optional key, and `BTreeMap`/`Option` mutations that panic (e.g. an OOM in
+/// `insert`) leave the map in *some* valid state, just possibly missing the
+/// one update that was in flight — recovering and carrying on is strictly
+/// better than every subsequent call panicking too.
+fn lock_recovering(inner: &Mutex<Inner>) -> std::sync::MutexGuard<'_, Inner> {
+    inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Default for WindowRegistry {
@@ -195,6 +211,35 @@ mod tests {
         r.remove(&label);
         assert!(r.list().is_empty());
         assert!(r.key().is_none(), "key must not dangle at a closed window");
+    }
+
+    #[test]
+    fn registry_survives_a_panic_while_the_lock_was_held() {
+        let r = WindowRegistry::new();
+        r.insert(OpenWindow { label: HOME_LABEL.into(), file_id: None, title: "Penpot Local".into() });
+
+        // Poison the mutex: panic on a thread while a clone of `r` holds the
+        // lock inside `insert`. `Mutex` is not re-entrant so the only way to
+        // panic mid-lock from a single thread is via a closure invoked while
+        // the guard is alive — `catch_unwind` around that closure emulates
+        // exactly the "a callback panicked while the registry was locked"
+        // scenario this fix targets.
+        let r2 = r.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock_recovering(&r2.inner);
+            panic!("simulated panic while the window registry lock is held");
+        }));
+        assert!(result.is_err(), "the closure should have panicked");
+
+        // The registry must still work afterwards: a poisoned-but-recovered
+        // lock, not a permanently wedged one.
+        r.insert(OpenWindow {
+            label: file_window_label("f1"),
+            file_id: Some("f1".into()),
+            title: "Alpha".into(),
+        });
+        let titles: Vec<String> = r.list().into_iter().map(|w| w.title).collect();
+        assert_eq!(titles, vec!["Penpot Local", "Alpha"]);
     }
 
     #[test]
