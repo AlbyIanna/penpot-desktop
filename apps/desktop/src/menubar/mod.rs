@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use penpot_rpc::{Auth, PenpotClient};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, DragDropEvent, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 use crate::docopen;
 use crate::navwatch::{self, Decision, NavWatch};
@@ -361,6 +361,21 @@ pub fn open_file_window<R: Runtime>(
                 WindowEvent::Focused(true) => {
                     ctx_for_events.registry.set_key(&label_for_events);
                     on_window_set_changed(&app_for_events, &ctx_for_events);
+                }
+                // D5 Task 4: dragging a `.penpot` onto a file window opens
+                // it, through the SAME funnel every other arrival path uses
+                // (`open_document` — CLI argv, second launch,
+                // `RunEvent::Opened`). This is caught NATIVELY by Tauri's
+                // window-event loop, never by a script injected into the
+                // SPA (invariant 3). A drop delivers every dragged path at
+                // once; handle each. A `.penpot` is a DIRECTORY on disk, so
+                // `docopen::resolve`'s own `is_dir`/`.penpot`-suffix checks
+                // already route anything else to `NotAPenpotDir` — no
+                // pre-filtering needed here.
+                WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
+                    for path in paths {
+                        open_document(&app_for_events, &ctx_for_events, path);
+                    }
                 }
                 _ => {}
             });
