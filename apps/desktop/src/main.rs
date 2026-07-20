@@ -16,7 +16,7 @@ use penpot_desktop::navwatch::{NavWatch, HOME_PATH};
 use penpot_desktop::overlay::{self, ProxyUrlSlot};
 use penpot_desktop::windows::{OpenWindow, WindowRegistry, HOME_LABEL};
 use penpot_desktop::AppConfig;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{DragDropEvent, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::sync::Mutex;
 
 /// D5 Task 3 — the first argv element that looks like a document path, not a
@@ -370,6 +370,13 @@ fn main() {
             // dependent enabled state) honest for the home window too: forget
             // it if it's ever destroyed, and track focus so `key_has_file`
             // reflects reality the instant the user switches windows.
+            //
+            // D5 Task 4 (post-review fix): the home window is the primary —
+            // usually the ONLY — window at launch, so it must handle a
+            // dropped `.penpot` too, not just file windows. Wired to the
+            // SAME `handle_drop` helper `open_file_window` uses in
+            // `menubar.rs`, so there is exactly one drag-drop-to-`open_document`
+            // path rather than two hand-copied ones.
             let menu_ctx_for_home = menu_ctx.clone();
             let handle_for_home = app.handle().clone();
             home_window.on_window_event(move |event| match event {
@@ -380,6 +387,9 @@ fn main() {
                 WindowEvent::Focused(true) => {
                     menu_ctx_for_home.registry.set_key(HOME_LABEL);
                     menubar::on_window_set_changed(&handle_for_home, &menu_ctx_for_home);
+                }
+                WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
+                    menubar::handle_drop(&handle_for_home, &menu_ctx_for_home, paths);
                 }
                 _ => {}
             });

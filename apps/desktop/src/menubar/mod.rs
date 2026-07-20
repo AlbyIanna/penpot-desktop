@@ -364,19 +364,10 @@ pub fn open_file_window<R: Runtime>(
                     on_window_set_changed(&app_for_events, &ctx_for_events);
                 }
                 // D5 Task 4: dragging a `.penpot` onto a file window opens
-                // it, through the SAME funnel every other arrival path uses
-                // (`open_document` — CLI argv, second launch,
-                // `RunEvent::Opened`). This is caught NATIVELY by Tauri's
-                // window-event loop, never by a script injected into the
-                // SPA (invariant 3). A drop delivers every dragged path at
-                // once; handle each. A `.penpot` is a DIRECTORY on disk, so
-                // `docopen::resolve`'s own `is_dir`/`.penpot`-suffix checks
-                // already route anything else to `NotAPenpotDir` — no
-                // pre-filtering needed here.
+                // it — see [`handle_drop`], the body shared with the home
+                // window's identical arm in `main.rs`.
                 WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) => {
-                    for path in paths {
-                        open_document(&app_for_events, &ctx_for_events, path);
-                    }
+                    handle_drop(&app_for_events, &ctx_for_events, paths);
                 }
                 _ => {}
             });
@@ -384,6 +375,26 @@ pub fn open_file_window<R: Runtime>(
             on_window_set_changed(app, ctx);
             Ok(())
         }
+    }
+}
+
+/// D5 Task 4 (post-review fix): the shared body of the `DragDrop` window-
+/// event arm. A drop delivers every dragged path at once; each goes through
+/// the SAME [`open_document`] funnel every other arrival path uses (CLI
+/// argv, second launch, `RunEvent::Opened`). Caught NATIVELY by Tauri's
+/// window-event loop, never by a script injected into the SPA (invariant 3).
+/// A `.penpot` is a DIRECTORY on disk, so `docopen::resolve`'s own
+/// `is_dir`/`.penpot`-suffix checks already route anything else to
+/// `NotAPenpotDir` — no pre-filtering needed here.
+///
+/// Both the home window (`main.rs` — the primary and usually ONLY window at
+/// launch) and every file window ([`open_file_window`] below) wire this to
+/// their own `WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. })` arm.
+/// Pulled out once two call sites needed the identical body, rather than
+/// hand-copying a loop over `open_document` a second time.
+pub fn handle_drop<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, paths: &[PathBuf]) {
+    for path in paths {
+        open_document(app, ctx, path);
     }
 }
 

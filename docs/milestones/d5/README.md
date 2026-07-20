@@ -95,3 +95,11 @@ guarantee is unchanged.
   question (it is always in the DB and search; its listing-card timing varied in the gate) —
   not a spill or correctness issue.
 - **Finder, drag-drop and the pickers remain macOS-only.**
+- **Concurrent imports of distinct files sharing a basename can race.** `copy_into_vault`
+  computes its target under `Imported/<name>.penpot` from a directory listing taken before the
+  copy starts. If two *different* external files with the same basename are imported at nearly
+  the same time, both can compute the same target, and the second's atomic swap
+  (`commit_dir_swap`) overwrites the first — the losing import is silently dropped. No
+  user-original is lost (both sources are the user's own files, untouched; only the in-vault
+  copy is clobbered), and this requires two near-simultaneous imports colliding on the exact
+  same basename, but it is not yet guarded against. Documented here, not fixed.
