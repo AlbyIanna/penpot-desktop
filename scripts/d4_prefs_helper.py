@@ -28,12 +28,21 @@ Subcommands:
       never a partial patch, same contract prefs.rs itself keeps). Prints
       the JSON response.
   reboot [timeout-s]
-      POST /__api/prefs/reboot (blocks until `reboot_in_place` returns —
-      the HTTP response IS the readiness signal, no polling needed). Prints
-      the JSON response.
+      POST /__api/prefs/reboot. The route itself ACKs immediately with a 202
+      (`{"ok":true,"accepted":true}`) and runs `reboot_in_place` in a
+      detached task that outlives the request — it tears down the very
+      proxy serving the request, so a synchronous response can never arrive
+      (see apps/desktop/src/prefs_http.rs's module doc). This subcommand
+      hides that: it records the `lastOp` in effect before the POST, sends
+      it, then polls GET /__api/prefs (tolerating connection failures —
+      expected while the stack is down) until `lastOp` changes, and prints a
+      JSON object shaped like the old synchronous response
+      (`{"ok": <real outcome>, "accepted": true, "lastOp": {...}, "vault":
+      {...}}`) so callers keep grepping `"ok": true`/`"ok": false` for the
+      REAL result, not just the 202 ack.
   vault <path> [timeout-s]
-      POST /__api/prefs/vault {"path": path} (blocks until `switch_to`
-      returns). Prints the JSON response.
+      POST /__api/prefs/vault {"path": path}. Same ack-then-poll shape as
+      `reboot` above, delegating to `switch_to` in the detached task.
   config_js_has <token>
       GET /js/config.js, parse the `penpotFlags` string, and check whether
       <token> is present as a WHOLE token (space-split membership — the same
@@ -108,6 +117,79 @@ def _dotted_get(d, path):
     return cur
 
 
+def _get_lenient(path, per_call_timeout=5):
+    """Like `_get` but returns `None` (never dies) on ANY failure — while a
+    detached switch/reboot is tearing the stack down or the new one is still
+    booting, connection-refused is EXPECTED here, not an error worth a fatal
+    HELPER-FAIL."""
+    req = urllib.request.Request(BASE + path, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=per_call_timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _last_op_key(data):
+    """A value that changes iff a NEW detached switch/reboot has finished and
+    been recorded — `(op, at)`, or `None` before anything has ever finished.
+    See `_wait_for_op_outcome` for why this, not just "a GET succeeded", is
+    the readiness signal."""
+    op = (data or {}).get("lastOp")
+    return (op.get("op"), op.get("at")) if op else None
+
+
+def _wait_for_op_outcome(baseline_key, timeout):
+    """Poll GET /__api/prefs until `lastOp` differs from `baseline_key` (the
+    op in effect right before the switch/reboot was kicked off) — NOT just
+    until any GET succeeds. A GET can succeed against the OLD stack too:
+    there is a brief window before the detached task has torn anything down
+    yet, and some failures (e.g. an unusable target path) are caught before
+    the stack is touched at all, so the origin never actually goes away
+    either. `lastOp` changing is the one signal that holds in every case,
+    because only the detached task itself writes it, and only once it is
+    completely done — success or failure alike."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        data = _get_lenient("/__api/prefs")
+        if data is not None:
+            last = data
+            if _last_op_key(data) != baseline_key:
+                return data
+        time.sleep(1)
+    die(
+        f"timed out after {timeout}s waiting for the detached switch/reboot to "
+        f"finish (last successful GET /__api/prefs: "
+        f"{json.dumps(last) if last is not None else 'none succeeded'})",
+        1,
+    )
+
+
+def _post_then_wait(path, body, timeout):
+    """`POST <path>` against an ack-then-detach route (`/reboot`, `/vault`):
+    captures the `lastOp` baseline, sends the request (which should ACK with
+    a 202 almost immediately), then waits for the detached task's outcome
+    via `_wait_for_op_outcome` and reprints it in the OLD synchronous shape —
+    `ok` reflects the REAL result (`lastOp.ok`), not just whether the 202 was
+    accepted, so every existing `grep '"ok": true'`/`'"ok": false'` caller
+    keeps working unchanged."""
+    baseline_key = _last_op_key(_get_lenient("/__api/prefs"))
+    ack = _post(path, body, timeout=15)
+    if not ack.get("accepted"):
+        # Rejected synchronously (e.g. empty path, runner not ready yet) —
+        # nothing was kicked off, nothing to poll for.
+        return ack
+    final = _wait_for_op_outcome(baseline_key, timeout)
+    last_op = final.get("lastOp") or {}
+    return {
+        "ok": bool(last_op.get("ok")),
+        "accepted": True,
+        "lastOp": last_op,
+        "vault": final.get("vault"),
+    }
+
+
 def cmd_prefs_file(data_dir):
     path = os.path.join(data_dir, "preferences.json")
     if not os.path.isfile(path):
@@ -134,11 +216,11 @@ def cmd_post(body_json):
 
 
 def cmd_reboot(timeout="300"):
-    print(json.dumps(_post("/__api/prefs/reboot", None, timeout=float(timeout)), sort_keys=True))
+    print(json.dumps(_post_then_wait("/__api/prefs/reboot", None, float(timeout)), sort_keys=True))
 
 
 def cmd_vault(path, timeout="600"):
-    print(json.dumps(_post("/__api/prefs/vault", {"path": path}, timeout=float(timeout)), sort_keys=True))
+    print(json.dumps(_post_then_wait("/__api/prefs/vault", {"path": path}, float(timeout)), sort_keys=True))
 
 
 def cmd_config_js_has(token):

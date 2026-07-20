@@ -19,24 +19,46 @@
 //!   switch), and reports `{ok, needsReboot}` — `needsReboot` comes straight
 //!   from [`prefs::needs_reboot`]; nothing here re-derives which settings
 //!   are boot-time, exactly per that function's own doc.
-//! - `POST /__api/prefs/reboot` — [`control::VaultRunner::reboot_in_place`],
-//!   then `{ok}`. The page calls this ONLY from an explicit "Apply &
-//!   Restart" the user clicks — this route itself never decides to reboot on
-//!   its own; `POST /__api/prefs` never calls it either. Silently rebooting
-//!   the supervised stack under an open workspace window is exactly what the
-//!   D4 plan forbids.
-//! - `POST /__api/prefs/vault` `{path}` — delegates verbatim to
-//!   [`control::VaultRunner::switch_to`], the N5 zero-cross-vault-spill
-//!   machinery. This route does not, and must not, reimplement any part of
-//!   that switch — see that method's module doc for why.
+//! - `POST /__api/prefs/reboot` — kicks off
+//!   [`control::VaultRunner::reboot_in_place`], then `{ok}`. The page calls
+//!   this ONLY from an explicit "Apply & Restart" the user clicks — this
+//!   route itself never decides to reboot on its own; `POST /__api/prefs`
+//!   never calls it either. Silently rebooting the supervised stack under an
+//!   open workspace window is exactly what the D4 plan forbids.
+//! - `POST /__api/prefs/vault` `{path}` — kicks off
+//!   [`control::VaultRunner::switch_to`] VERBATIM, the N5
+//!   zero-cross-vault-spill machinery. This route does not, and must not,
+//!   reimplement any part of that switch — see that method's module doc for
+//!   why.
+//!
+//! **Both of the above ACK-then-detach.** `switch_to` and `reboot_in_place`
+//! tear down the entire supervised stack — including the very proxy serving
+//! the request that asked for it — then boot a new one. A synchronous
+//! response can therefore never be delivered: the connection dies mid-flight
+//! before the client sees anything. So both routes instead validate what they
+//! can synchronously (empty path, runner not installed yet), then hand the
+//! actual stop→boot dance to a `tokio::spawn`ed task that outlives the
+//! request and respond immediately with `202 Accepted` +
+//! `{"ok":true,"accepted":true}`. The spawn is deliberate, not
+//! `tokio::select!` or anything tied to the request future's lifetime — a
+//! dropped connection (which the teardown itself guarantees) must never
+//! cancel a switch/reboot partway through; an interrupted switch is exactly
+//! the failure `vault-switch.json`'s crash marker exists to recover from.
+//! Because the caller can no longer receive a pass/fail verdict in the HTTP
+//! response, the detached task's outcome is logged loudly AND recorded in
+//! `PrefsState::last_op` (a single `Option<LastOpStatus>`, overwritten by
+//! whichever of switch/reboot finishes next — no history, just "what
+//! happened last", which is all a caller polling `GET /__api/prefs` needs to
+//! notice a failure instead of it being silently swallowed). `GET
+//! /__api/prefs` reports it back as `lastOp`.
 //!
 //! This module never writes to the vault: every route here either touches
 //! `preferences.json` (in the app DATA dir, never the vault — see
 //! `prefs.rs`'s module doc) or delegates to `VaultRunner`, which owns the
 //! vault-touching machinery itself.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use axum::extract::State;
 use axum::response::{Html, IntoResponse, Response};
@@ -58,11 +80,49 @@ struct PrefsState {
     /// `control::RunnerSlot`'s doc) — `None` only in the brief window before
     /// boot finishes installing it.
     runner: RunnerSlot,
+    /// Outcome of the most recently FINISHED detached switch/reboot task (see
+    /// module doc for why this can't just ride the HTTP response). `None`
+    /// until the first switch/reboot completes since this process started.
+    /// Deliberately just the last one, not a log — `GET /__api/prefs` only
+    /// needs enough to notice "the thing I just kicked off failed", and a
+    /// `std::sync::Mutex` is enough since nothing here ever holds the lock
+    /// across an `.await`.
+    last_op: StdMutex<Option<LastOpStatus>>,
+}
+
+/// See `PrefsState::last_op`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct LastOpStatus {
+    /// `"vaultSwitch"` or `"reboot"`.
+    op: &'static str,
+    ok: bool,
+    error: Option<String>,
+    /// UTC, same stamp format `vault::SwitchMarker` uses elsewhere in this
+    /// codebase — not parsed by anything here, just for a human glancing at
+    /// `GET /__api/prefs` to see how stale it is.
+    at: String,
+}
+
+/// Record a detached switch/reboot's outcome where `GET /__api/prefs` can
+/// find it, and log it loudly — this is the ONLY place a caller can still
+/// learn whether it failed, since the HTTP response that kicked it off was
+/// already sent as a `202` before the work even started.
+fn record_last_op(state: &PrefsState, op: &'static str, result: Result<(), String>) {
+    let (ok, error) = match result {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
+    let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    *state.last_op.lock().expect("last_op mutex") = Some(LastOpStatus { op, ok, error, at });
 }
 
 /// Build the D4 Preferences routes for the proxy's extra router.
 pub fn router(data_dir: impl Into<PathBuf>, runner: RunnerSlot) -> Router {
-    let state = Arc::new(PrefsState { data_dir: data_dir.into(), runner });
+    let state = Arc::new(PrefsState {
+        data_dir: data_dir.into(),
+        runner,
+        last_op: StdMutex::new(None),
+    });
     Router::new()
         .route("/__preferences", get(preferences_page))
         .route("/__api/prefs", get(get_prefs).post(post_prefs))
@@ -124,11 +184,19 @@ async fn get_prefs(State(state): State<Arc<PrefsState>>) -> Response {
         None => (json!({ "path": "", "name": "" }), false, false),
     };
 
+    let last_op = state.last_op.lock().expect("last_op mutex").clone();
+
     Json(json!({
         "preferences": preferences,
         "vault": vault,
         "syncPaused": sync_paused,
         "rendersRunning": renders_running,
+        // D4 — outcome of the most recently finished detached switch/reboot
+        // (see module doc + `PrefsState::last_op`); `null` if none has
+        // finished yet this process. This is how a caller of the
+        // ack-then-detach `/reboot` and `/vault` routes below finds out
+        // whether the thing it kicked off actually succeeded.
+        "lastOp": last_op,
     }))
     .into_response()
 }
@@ -175,17 +243,25 @@ async fn post_reboot(State(state): State<Arc<PrefsState>>) -> Response {
     let Some(runner) = state.runner.lock().await.clone() else {
         return runner_not_ready();
     };
-    match runner.reboot_in_place().await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => {
-            tracing::error!(error = format!("{e:#}"), "D4: reboot-in-place failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "ok": false, "error": format!("{e:#}") })),
-            )
-                .into_response()
+    // ACK first, act second (see module doc) — `reboot_in_place` tears down
+    // the proxy answering this very request, so a synchronous response can
+    // never arrive. Detach into a task that outlives the request; its
+    // outcome lands in `state.last_op` for `GET /__api/prefs` to report,
+    // since it can no longer ride this response.
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        match runner.reboot_in_place().await {
+            Ok(()) => {
+                tracing::info!("D4: preferences-initiated reboot-in-place complete");
+                record_last_op(&state_for_task, "reboot", Ok(()));
+            }
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "D4: reboot-in-place failed");
+                record_last_op(&state_for_task, "reboot", Err(format!("{e:#}")));
+            }
         }
-    }
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "ok": true, "accepted": true }))).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,28 +278,38 @@ async fn post_vault(State(state): State<Arc<PrefsState>>, Json(req): Json<VaultS
         )
             .into_response();
     }
+    let target = PathBuf::from(path);
     let Some(runner) = state.runner.lock().await.clone() else {
         return runner_not_ready();
     };
-    // N5 — delegate to `VaultRunner::switch_to` VERBATIM. This route must
-    // never reimplement any part of the zero-cross-vault-spill machinery
-    // (the crash-safe marker, the disposable-state wipe, the registry
-    // repoint) — that is the whole point of routing a Preferences-initiated
-    // switch through the exact same method the tray and File > Open Vault…
-    // already use.
-    match runner.switch_to(Path::new(path)).await {
-        Ok(vref) => {
-            Json(json!({ "ok": true, "active": { "id": vref.id, "path": vref.path } })).into_response()
+    // ACK first, act second (see module doc) — `switch_to` tears down the
+    // proxy answering this very request, so a synchronous response can never
+    // arrive. Detach into a task that outlives the request (a dropped
+    // connection must NOT cancel the switch partway through — that is
+    // exactly the interrupted-switch case the crash marker inside
+    // `switch_to` exists to recover from), and record the outcome in
+    // `state.last_op` since it can no longer ride this response back.
+    //
+    // N5 — still delegates to `VaultRunner::switch_to` VERBATIM inside the
+    // task. This route must never reimplement any part of the
+    // zero-cross-vault-spill machinery (the crash-safe marker, the
+    // disposable-state wipe, the registry repoint) — that is the whole point
+    // of routing a Preferences-initiated switch through the exact same
+    // method the tray and File > Open Vault… already use.
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        match runner.switch_to(&target).await {
+            Ok(vref) => {
+                tracing::info!(vault = %vref.path, "D4: preferences-initiated vault switch complete");
+                record_last_op(&state_for_task, "vaultSwitch", Ok(()));
+            }
+            Err(e) => {
+                tracing::error!(error = format!("{e:#}"), "D4: preferences-initiated vault switch failed");
+                record_last_op(&state_for_task, "vaultSwitch", Err(format!("{e:#}")));
+            }
         }
-        Err(e) => {
-            tracing::error!(error = format!("{e:#}"), "D4: preferences-initiated vault switch failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "ok": false, "error": format!("{e:#}") })),
-            )
-                .into_response()
-        }
-    }
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "ok": true, "accepted": true }))).into_response()
 }
 
 #[cfg(test)]

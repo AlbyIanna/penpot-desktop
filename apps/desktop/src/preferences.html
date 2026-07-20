@@ -14,6 +14,18 @@
   only an explicit click on "Apply & Restart" does that, via
   `POST /__api/prefs/reboot`. Silently rebooting a supervised stack under an
   open workspace window is exactly what this page must never do.
+
+  Both `POST /__api/prefs/reboot` and `POST /__api/prefs/vault` ACK with a
+  `202` before doing any work — they tear down the very proxy serving this
+  page, so THIS PAGE'S OWN ORIGIN goes away and comes back. A fetch made
+  mid-teardown, or while the new stack is still booting, fails outright
+  (connection refused) — that is expected, not an error to surface as a
+  failure. So after either call, this page stops making one-shot requests
+  and instead polls `GET /__api/prefs` on a short interval, showing a
+  "reconnecting" state, until a request finally succeeds again — then it
+  reloads live state AND checks `lastOp` (the server's own record of how
+  that detached switch/reboot actually turned out, since the `202` response
+  itself never carries a pass/fail verdict) to report success or failure.
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -230,6 +242,14 @@
 
   function setSwitchNote(text) { els.switchNote.textContent = text || ""; }
 
+  // The server's own record of how the most recently FINISHED detached
+  // switch/reboot turned out (see prefs_http.rs's module doc) — kept in sync
+  // by every successful GET /__api/prefs (`load`, `pollLive`, and the
+  // reconnect poll below). `null` until one has finished since the server
+  // process started.
+  var currentLastOp = null;
+  function opKey(op) { return op ? (op.op + "@" + op.at) : null; }
+
   // Live facts only — never touches the toggle checkboxes, so a poll landing
   // mid-interaction can never yank back a change the user just made.
   function applyStatus(data) {
@@ -240,6 +260,46 @@
     els.rendersStatus.textContent = data.rendersRunning ? "Running" : "Stopped";
     els.rendersStatus.className = "status-pill " + (data.rendersRunning ? "st-ok" : "st-paused");
     if (!els.switchInput.value && data.vault.path) { els.switchInput.value = data.vault.path; }
+    currentLastOp = data.lastOp || null;
+  }
+
+  // Both `/reboot` and `/vault` ACK with a 202 and then tear down THIS VERY
+  // ORIGIN in the background (see the file-level comment above). Poll
+  // GET /__api/prefs, showing `noteText` meanwhile, until it reports a
+  // `lastOp` different from `baselineKey` (the op in effect when the action
+  // was kicked off) — NOT just until any request succeeds. A request can
+  // succeed against the OLD stack too: there is a brief window before the
+  // detached task has torn anything down yet, and some failures (e.g. an
+  // unusable target path) are caught before the stack is touched at all, so
+  // the origin never actually goes away. `lastOp` changing is the one signal
+  // that holds in every case, because only the detached task itself writes
+  // it, and only once it is completely done — success or failure.
+  var RECONNECT_INTERVAL_MS = 1000;
+  var RECONNECT_MAX_ATTEMPTS = 150; // ~2.5 minutes
+  function waitForOpOutcome(baselineKey, noteText, onDone, attempt) {
+    attempt = attempt || 0;
+    setSaveNote(noteText);
+    fetch("/__api/prefs")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        applyPrefs(data.preferences);
+        applyStatus(data);
+        if (opKey(data.lastOp) !== baselineKey) {
+          onDone(data.lastOp);
+          return;
+        }
+        retry();
+      })
+      .catch(retry); // connection refused mid-teardown/mid-boot: expected, keep polling
+    function retry() {
+      if (attempt >= RECONNECT_MAX_ATTEMPTS) {
+        onDone(null);
+        return;
+      }
+      setTimeout(function () {
+        waitForOpOutcome(baselineKey, noteText, onDone, attempt + 1);
+      }, RECONNECT_INTERVAL_MS);
+    }
   }
 
   function applyPrefs(p) {
@@ -319,18 +379,30 @@
     els.rebootBtn.disabled = true;
     var prevLabel = els.rebootBtn.textContent;
     els.rebootBtn.textContent = "Restarting…";
+    var baselineKey = opKey(currentLastOp);
     fetch("/__api/prefs/reboot", { method: "POST" })
       .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
       .then(function (res) {
-        els.rebootBtn.disabled = false;
-        els.rebootBtn.textContent = prevLabel;
-        if (res.body.ok) {
-          els.reboot.hidden = true;
-          setSaveNote("Restarted — settings applied.", 4000);
-          load();
-        } else {
+        if (!res.body.ok) {
+          els.rebootBtn.disabled = false;
+          els.rebootBtn.textContent = prevLabel;
           setSaveNote("Restart failed: " + (res.body.error || "unknown error"));
+          return;
         }
+        // 202 Accepted — the actual restart is happening in the background;
+        // this origin is about to disappear and come back. Poll for it.
+        waitForOpOutcome(baselineKey, "Restarting the local stack…", function (lastOp) {
+          els.rebootBtn.disabled = false;
+          els.rebootBtn.textContent = prevLabel;
+          if (!lastOp) {
+            setSaveNote("Still waiting for the local stack to come back — try reloading the page.");
+          } else if (lastOp.op === "reboot" && !lastOp.ok) {
+            setSaveNote("Restart failed: " + (lastOp.error || "unknown error"));
+          } else {
+            els.reboot.hidden = true;
+            setSaveNote("Restarted — settings applied.", 4000);
+          }
+        });
       })
       .catch(function () {
         els.rebootBtn.disabled = false;
@@ -352,6 +424,7 @@
     }
     els.switchBtn.disabled = true;
     setSwitchNote("Switching vaults…");
+    var baselineKey = opKey(currentLastOp);
     fetch("/__api/prefs/vault", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -359,13 +432,24 @@
     })
       .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
       .then(function (res) {
-        els.switchBtn.disabled = false;
-        if (res.body.ok) {
-          setSwitchNote("Switched vault.");
-          load();
-        } else {
+        if (!res.body.ok) {
+          els.switchBtn.disabled = false;
           setSwitchNote("Switch failed: " + (res.body.error || "unknown error"));
+          return;
         }
+        // 202 Accepted — the switch runs in the background against the new
+        // vault; this origin is about to disappear and come back. Poll for it.
+        waitForOpOutcome(baselineKey, "Switching vaults — the local stack is restarting…", function (lastOp) {
+          els.switchBtn.disabled = false;
+          if (!lastOp) {
+            setSwitchNote("Still waiting for the local stack to come back — try reloading the page.");
+          } else if (lastOp.op === "vaultSwitch" && !lastOp.ok) {
+            setSwitchNote("Switch failed: " + (lastOp.error || "unknown error"));
+          } else {
+            setSwitchNote("Switched vault.");
+            load();
+          }
+        });
       })
       .catch(function () {
         els.switchBtn.disabled = false;

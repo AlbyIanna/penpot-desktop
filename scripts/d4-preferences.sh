@@ -58,6 +58,17 @@
 #       `POST /__api/prefs/reboot`: `enable-plugins` is gone (exact
 #       whitespace-split token match, not a substring) and the CSP response
 #       header is absent.
+#   (h) a FAILED Preferences-initiated vault switch is OBSERVABLE, not
+#       silently swallowed — the risk this fix introduces: `/vault` and
+#       `/reboot` now ACK with a 202 and run the real switch/reboot in a
+#       detached task, so a failure inside it can no longer ride the HTTP
+#       response back to the caller (prefs_http.rs's module doc). Switch to
+#       a target that cannot become a vault (a plain FILE, so `ensure_vault`'s
+#       `create_dir_all` fails BEFORE any teardown — the running stack must
+#       never even go down for this): `GET /__api/prefs`'s `lastOp` must
+#       report `ok:false` with a non-empty `error`, and the active vault must
+#       be UNCHANGED afterward (the failure short-circuited before touching
+#       anything live).
 #
 # Dedicated ports: proxy 9054, backend 6516, postgres 5589, valkey 6532. A
 # fifth, D4-local port is NOT needed (unlike D3/N5's control-server addition)
@@ -145,6 +156,21 @@ cleanup() {
 trap cleanup EXIT
 
 json_field() { python3 -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
+
+# json_path <dotted.path>: reads JSON from stdin, prints the value at the
+# dotted path (e.g. "lastOp.error"), or empty string if any segment is
+# missing/null — used for (h)'s nested `lastOp.error`/`ok` checks below,
+# where a flat `grep` would false-positive on the ALWAYS-present "error" key
+# (present as `null` even on success).
+json_path() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for part in sys.argv[1].split('.'):
+    d = d.get(part) if isinstance(d, dict) else None
+print(d if d is not None else '')
+" "$1"
+}
 
 ports_free() {
     local p
@@ -583,6 +609,36 @@ if [ "$POST_CSP" = "no|" ]; then
     pass "(g) AFTER the reboot: /index.html no longer carries a Content-Security-Policy response header"
 else
     fail "(g) AFTER the reboot: /index.html still carries a CSP header (got '$POST_CSP') — cspEnabled:false did not take effect"
+fi
+
+# =========================================================================
+# (h) a FAILED Preferences-initiated vault switch is observable, not silent —
+# the new risk the 202-ack-then-detach fix introduces (the HTTP response can
+# no longer carry a pass/fail verdict, since it is sent before the work even
+# starts). Target a plain FILE: `ensure_vault`'s `create_dir_all` fails on it
+# BEFORE `switch_to` touches the running stack at all, so this must NOT bring
+# the stack down — the strongest version of "still up, just tell me it
+# failed".
+# =========================================================================
+echo "-- (h) a FAILED vault switch is observable rather than silent"
+BAD_TARGET="$WORK_DIR/not-a-vault.file"
+: >"$BAD_TARGET"
+BEFORE_H="$(d4helper get)"
+BEFORE_VAULT_PATH="$(echo "$BEFORE_H" | json_path vault.path)"
+RESP="$(d4helper vault "$BAD_TARGET" 30 2>"$WORK_DIR/vault-bad.err")"
+RESP_OK="$(echo "$RESP" | json_path ok)"
+RESP_ERR="$(echo "$RESP" | json_path lastOp.error)"
+if [ "$RESP_OK" = "False" ] && [ -n "$RESP_ERR" ]; then
+    pass "(h) switch to an unusable target (a plain file) reports ok:false with a non-empty lastOp.error — $RESP"
+else
+    fail "(h) a failed switch was NOT observable (expected ok:false + a non-empty lastOp.error): $RESP $(cat "$WORK_DIR/vault-bad.err" 2>/dev/null)"
+fi
+AFTER_H="$(d4helper get)"
+AFTER_VAULT_PATH="$(echo "$AFTER_H" | json_path vault.path)"
+if [ -n "$BEFORE_VAULT_PATH" ] && [ "$AFTER_VAULT_PATH" = "$BEFORE_VAULT_PATH" ]; then
+    pass "(h) the active vault is UNCHANGED after the failed switch ($AFTER_VAULT_PATH) — the running stack was never touched by a switch that failed before it started"
+else
+    fail "(h) active vault changed despite the switch failing before any teardown: before='$BEFORE_VAULT_PATH' after='$AFTER_VAULT_PATH'"
 fi
 
 # --- final shutdown ----------------------------------------------------------
