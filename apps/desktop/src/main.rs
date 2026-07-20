@@ -478,6 +478,19 @@ fn main() {
                                 (Some(status), Some(control)) => {
                                     bridge.attach(status, control);
                                     tracing::info!("tray bound to the sync daemon");
+                                    // D5 Task 6: retitle an open file window
+                                    // when its file is renamed/moved while
+                                    // open. Subscribes to `bridge`'s OWN
+                                    // channel (not the daemon's directly) so
+                                    // this keeps working across a later N5
+                                    // vault switch, which re-`attach`es the
+                                    // SAME bridge to the new daemon — see
+                                    // `watch_rename_titles`'s doc comment.
+                                    menubar::watch_rename_titles(
+                                        handle.clone(),
+                                        menu_ctx_boot.clone(),
+                                        bridge.subscribe(),
+                                    );
                                 }
                                 _ => tracing::warn!(
                                     "sync daemon not running; tray stays in its idle state"

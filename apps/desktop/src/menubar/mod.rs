@@ -494,6 +494,106 @@ pub fn open_document<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, raw_path: &P
 }
 
 // ---------------------------------------------------------------------------
+// D5 Task 6: the window title tracks a rename
+// ---------------------------------------------------------------------------
+
+/// Pure decision: given the currently open windows and a freshly re-read
+/// manifest, which windows need `set_title` because their file's on-disk
+/// name/location moved since the window opened (or was last retitled)?
+/// Reuses [`docopen::display_title`] — the SAME `<project>/<name>.penpot`
+/// -> `<name>` rule [`open_document`]/[`open_file_window`] already apply at
+/// open time, so a rename can never disagree with what a fresh open of the
+/// same file would show. Windows with no `file_id` (the home window) and
+/// file ids not (yet) in `manifest` are skipped, not errored — a file id
+/// briefly missing from a stale-mid-reload manifest just means the next
+/// signal retries with a fresher read.
+pub fn title_updates_for_rename(
+    open_windows: &[OpenWindow],
+    manifest: &sync_core::Manifest,
+) -> Vec<(String, String)> {
+    open_windows
+        .iter()
+        .filter_map(|w| {
+            let file_id = w.file_id.as_deref()?;
+            let entry = manifest.files.get(file_id)?;
+            let new_title = docopen::display_title(&entry.path);
+            (new_title != w.title).then(|| (w.label.clone(), new_title))
+        })
+        .collect()
+}
+
+/// Apply [`title_updates_for_rename`]'s decisions: `window.set_title` for
+/// each affected label, and re-`insert` the registry entry with the new
+/// title so the Window menu (built from `ctx.registry.list()`) and the next
+/// diff both see it too — mirrors how [`open_file_window`] inserts on
+/// create.
+fn apply_title_updates<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, updates: Vec<(String, String)>) {
+    if updates.is_empty() {
+        return;
+    }
+    let open_windows = ctx.registry.list();
+    for (label, new_title) in updates {
+        if let Some(w) = app.get_webview_window(&label) {
+            if let Err(e) = w.set_title(&new_title) {
+                tracing::warn!(label, "failed to retitle window after rename: {e}");
+            }
+        }
+        if let Some(existing) = open_windows.iter().find(|w| w.label == label) {
+            ctx.registry.insert(OpenWindow {
+                label: label.clone(),
+                file_id: existing.file_id.clone(),
+                title: new_title,
+            });
+        }
+    }
+    on_window_set_changed(app, ctx);
+}
+
+/// D5 Task 6 — subscribe to the sync daemon's status watch (the SAME
+/// channel already driving the tray icon and the home page's activity
+/// strip — see `status.rs`'s module doc) and retitle any open file window
+/// whose file changed name/location on disk. This reacts to an EXISTING
+/// signal instead of adding a new poll loop, per the task's own
+/// constraint: the daemon already ticks this channel
+/// (`watch::Sender::send_if_modified`) on every sync cycle that actually
+/// changed something, and a rename/move is exactly such a change (D2's
+/// relocation logic re-keys the affected file's manifest entry AND its
+/// `SyncStatusSnapshot.files` entry in the same pass — see
+/// `engine.rs::relocate_file_if_needed`). So "the status channel just
+/// ticked" is a cheap, correct trigger to re-check window titles; the
+/// manifest read that follows is a plain disk read (the SAME one
+/// `open_document`/`open_picked_folder` already do), not a timer of its
+/// own.
+///
+/// Survives an N5 vault switch without resubscribing: `status_rx` is bound
+/// to [`crate::status::DaemonStatusBridge`]'s own channel, which a switch's
+/// `attach` call re-points at the new daemon (see that module's doc) — so
+/// this loop keeps working against whichever vault is active, reading
+/// `ctx.live`/`ctx.registry` (both `Arc`-shared) fresh on every iteration.
+pub fn watch_rename_titles<R: Runtime>(
+    app: AppHandle<R>,
+    ctx: MenuCtx,
+    mut status_rx: tokio::sync::watch::Receiver<sync_daemon::SyncStatusSnapshot>,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if status_rx.changed().await.is_err() {
+                // The bridge's sender only drops at app shutdown — nothing
+                // left to watch.
+                break;
+            }
+            let vault_root = live_snapshot(&ctx.live).vault_root;
+            if vault_root.as_os_str().is_empty() {
+                continue;
+            }
+            let Some(manifest) = load_manifest(&vault_root) else { continue };
+            let updates = title_updates_for_rename(&ctx.registry.list(), &manifest);
+            apply_title_updates(&app, &ctx, updates);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch: id -> Command -> the real implementation
 // ---------------------------------------------------------------------------
 
@@ -1037,5 +1137,83 @@ mod tests {
             action,
             DocumentAction::Reject { reason: "notes is not a directory".into() }
         );
+    }
+
+    // -----------------------------------------------------------------
+    // D5 Task 6 — `title_updates_for_rename`'s pure decision: which open
+    // windows need `set_title` because their file's manifest path moved.
+    // Mirrors `docopen::tests`' manifest-construction shape.
+    // -----------------------------------------------------------------
+
+    fn manifest_with(entries: &[(&str, &str)]) -> sync_core::Manifest {
+        let mut m = sync_core::Manifest::default();
+        for (id, path) in entries {
+            m.files.insert(
+                (*id).to_string(),
+                sync_core::manifest::ManifestEntry {
+                    path: (*path).to_string(),
+                    project_id: "p".into(),
+                    project_name: "P".into(),
+                    revn: 1,
+                    db_modified_at: String::new(),
+                    last_synced_hash: "h".into(),
+                    last_synced_at: "2026-07-20T00:00:00Z".into(),
+                },
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn a_renamed_file_s_window_gets_a_title_update() {
+        let manifest = manifest_with(&[("fid1", "Client A/new-name.penpot")]);
+        let windows = [OpenWindow {
+            label: "file-fid1".into(),
+            file_id: Some("fid1".into()),
+            title: "old-name".into(),
+        }];
+        let updates = title_updates_for_rename(&windows, &manifest);
+        assert_eq!(updates, vec![("file-fid1".to_string(), "new-name".to_string())]);
+    }
+
+    #[test]
+    fn an_unchanged_file_s_window_needs_no_update() {
+        let manifest = manifest_with(&[("fid1", "Client A/same-name.penpot")]);
+        let windows = [OpenWindow {
+            label: "file-fid1".into(),
+            file_id: Some("fid1".into()),
+            title: "same-name".into(),
+        }];
+        assert!(title_updates_for_rename(&windows, &manifest).is_empty());
+    }
+
+    #[test]
+    fn the_home_window_and_a_file_missing_from_the_manifest_are_skipped() {
+        // The home window has no `file_id` (nothing to look up); a file
+        // dropped from the manifest (briefly true mid-vault-switch, before
+        // the new manifest loads) has nothing to compare against yet —
+        // both are "not my job this round", not an update, and never a
+        // panic.
+        let manifest = manifest_with(&[]);
+        let windows = [
+            OpenWindow { label: HOME_LABEL.into(), file_id: None, title: "Penpot Local".into() },
+            OpenWindow { label: "file-gone".into(), file_id: Some("gone".into()), title: "Ghost".into() },
+        ];
+        assert!(title_updates_for_rename(&windows, &manifest).is_empty());
+    }
+
+    #[test]
+    fn a_move_to_a_different_project_updates_the_title_from_the_new_basename() {
+        // A move (not just a rename) changes the whole `path`, but the
+        // TITLE only ever reflects the basename (`docopen::display_title`)
+        // — moving "Client A/home.penpot" to "Client B/home.penpot" is a
+        // no-op for the title even though the manifest path changed.
+        let manifest = manifest_with(&[("fid1", "Client B/home.penpot")]);
+        let windows = [OpenWindow {
+            label: "file-fid1".into(),
+            file_id: Some("fid1".into()),
+            title: "home".into(),
+        }];
+        assert!(title_updates_for_rename(&windows, &manifest).is_empty());
     }
 }
