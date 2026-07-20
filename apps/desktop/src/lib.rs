@@ -9,6 +9,7 @@
 pub mod checkpoint;
 pub mod control;
 pub mod dialog;
+pub mod docopen;
 pub mod gitinit;
 pub mod home;
 pub mod installer;
