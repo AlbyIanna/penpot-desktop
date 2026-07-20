@@ -45,12 +45,19 @@
 //! cancel a switch/reboot partway through; an interrupted switch is exactly
 //! the failure `vault-switch.json`'s crash marker exists to recover from.
 //! Because the caller can no longer receive a pass/fail verdict in the HTTP
-//! response, the detached task's outcome is logged loudly AND recorded in
-//! `PrefsState::last_op` (a single `Option<LastOpStatus>`, overwritten by
-//! whichever of switch/reboot finishes next — no history, just "what
-//! happened last", which is all a caller polling `GET /__api/prefs` needs to
-//! notice a failure instead of it being silently swallowed). `GET
-//! /__api/prefs` reports it back as `lastOp`.
+//! response, the detached task's outcome is logged loudly AND recorded via
+//! `crate::last_op` — a small JSON file (`last-op.json`) in the app DATA dir,
+//! NOT an in-memory field on `PrefsState`. It has to be a file: a successful
+//! switch/reboot tears down the very router this state lives on and `boot()`
+//! constructs a fresh `PrefsState` for the new one, so anything kept only in
+//! memory here reverts to "nothing happened" the instant the operation it
+//! was supposed to report actually succeeds — see `last_op.rs`'s module doc
+//! for the full story, including why the record is written only AFTER the
+//! new stack has finished booting and how a poller tells a fresh record apart
+//! from a stale one (its `seq`). Overwritten by whichever of switch/reboot
+//! finishes next — no history, just "what happened last", which is all a
+//! caller polling `GET /__api/prefs` needs to notice a failure instead of it
+//! being silently swallowed. `GET /__api/prefs` reports it back as `lastOp`.
 //!
 //! This module never writes to the vault: every route here either touches
 //! `preferences.json` (in the app DATA dir, never the vault — see
@@ -58,7 +65,7 @@
 //! vault-touching machinery itself.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::{Html, IntoResponse, Response};
@@ -69,6 +76,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::control::RunnerSlot;
+use crate::last_op;
 use crate::prefs::{self, Preferences};
 
 const PREFERENCES_PAGE_HTML: &str = include_str!("preferences.html");
@@ -80,49 +88,31 @@ struct PrefsState {
     /// `control::RunnerSlot`'s doc) — `None` only in the brief window before
     /// boot finishes installing it.
     runner: RunnerSlot,
-    /// Outcome of the most recently FINISHED detached switch/reboot task (see
-    /// module doc for why this can't just ride the HTTP response). `None`
-    /// until the first switch/reboot completes since this process started.
-    /// Deliberately just the last one, not a log — `GET /__api/prefs` only
-    /// needs enough to notice "the thing I just kicked off failed", and a
-    /// `std::sync::Mutex` is enough since nothing here ever holds the lock
-    /// across an `.await`.
-    last_op: StdMutex<Option<LastOpStatus>>,
 }
 
-/// See `PrefsState::last_op`.
-#[derive(Debug, Clone, serde::Serialize)]
-struct LastOpStatus {
-    /// `"vaultSwitch"` or `"reboot"`.
-    op: &'static str,
-    ok: bool,
-    error: Option<String>,
-    /// UTC, same stamp format `vault::SwitchMarker` uses elsewhere in this
-    /// codebase — not parsed by anything here, just for a human glancing at
-    /// `GET /__api/prefs` to see how stale it is.
-    at: String,
-}
-
-/// Record a detached switch/reboot's outcome where `GET /__api/prefs` can
-/// find it, and log it loudly — this is the ONLY place a caller can still
-/// learn whether it failed, since the HTTP response that kicked it off was
-/// already sent as a `202` before the work even started.
-fn record_last_op(state: &PrefsState, op: &'static str, result: Result<(), String>) {
-    let (ok, error) = match result {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e)),
-    };
-    let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    *state.last_op.lock().expect("last_op mutex") = Some(LastOpStatus { op, ok, error, at });
+/// Record a detached switch/reboot's outcome to `crate::last_op`'s on-disk
+/// store (`<data_dir>/last-op.json`) where `GET /__api/prefs` — served by
+/// whichever `PrefsState` happens to be current, old or new — can find it,
+/// and log it loudly. This is the ONLY place a caller can still learn whether
+/// the operation it kicked off failed, since the HTTP response that started
+/// it was already sent as a `202` before the work even began. See
+/// `last_op.rs`'s module doc for why this has to be a file rather than a
+/// field on `PrefsState`, and for the write-ordering guarantee (always called
+/// AFTER the switch/reboot future resolves, success or failure).
+fn record_last_op(state: &PrefsState, op: &str, result: Result<(), String>) {
+    if let Err(e) = last_op::record(&state.data_dir, op, result) {
+        // The switch/reboot itself already succeeded or failed and was
+        // logged above by the caller; a failure to persist ITS outcome must
+        // not be conflated with that — log separately so `lastOp` merely
+        // stays whatever it was before instead of the app treating this as
+        // fatal.
+        tracing::error!(error = %e, op, "D4: failed to persist last-op record");
+    }
 }
 
 /// Build the D4 Preferences routes for the proxy's extra router.
 pub fn router(data_dir: impl Into<PathBuf>, runner: RunnerSlot) -> Router {
-    let state = Arc::new(PrefsState {
-        data_dir: data_dir.into(),
-        runner,
-        last_op: StdMutex::new(None),
-    });
+    let state = Arc::new(PrefsState { data_dir: data_dir.into(), runner });
     Router::new()
         .route("/__preferences", get(preferences_page))
         .route("/__api/prefs", get(get_prefs).post(post_prefs))
@@ -184,7 +174,12 @@ async fn get_prefs(State(state): State<Arc<PrefsState>>) -> Response {
         None => (json!({ "path": "", "name": "" }), false, false),
     };
 
-    let last_op = state.last_op.lock().expect("last_op mutex").clone();
+    // D4 — read fresh from disk every call, exactly like `prefs::load` above:
+    // a successful switch/reboot replaces this whole `PrefsState`, so nothing
+    // cached in memory here could survive to report it. `None` means nothing
+    // has been recorded yet (ever, or since `last-op.json` was last cleared —
+    // there is no "since this process started" distinction anymore).
+    let last_op = last_op::load(&state.data_dir);
 
     Json(json!({
         "preferences": preferences,
@@ -192,10 +187,11 @@ async fn get_prefs(State(state): State<Arc<PrefsState>>) -> Response {
         "syncPaused": sync_paused,
         "rendersRunning": renders_running,
         // D4 — outcome of the most recently finished detached switch/reboot
-        // (see module doc + `PrefsState::last_op`); `null` if none has
-        // finished yet this process. This is how a caller of the
+        // (see module doc + `crate::last_op`). This is how a caller of the
         // ack-then-detach `/reboot` and `/vault` routes below finds out
-        // whether the thing it kicked off actually succeeded.
+        // whether the thing it kicked off actually succeeded, INCLUDING when
+        // it succeeded — the on-disk record survives the stack it reports on
+        // being replaced, which the old in-memory field could not.
         "lastOp": last_op,
     }))
     .into_response()
@@ -246,8 +242,8 @@ async fn post_reboot(State(state): State<Arc<PrefsState>>) -> Response {
     // ACK first, act second (see module doc) — `reboot_in_place` tears down
     // the proxy answering this very request, so a synchronous response can
     // never arrive. Detach into a task that outlives the request; its
-    // outcome lands in `state.last_op` for `GET /__api/prefs` to report,
-    // since it can no longer ride this response.
+    // outcome lands in `crate::last_op`'s on-disk record for `GET
+    // /__api/prefs` to report, since it can no longer ride this response.
     let state_for_task = state.clone();
     tokio::spawn(async move {
         match runner.reboot_in_place().await {
@@ -287,8 +283,8 @@ async fn post_vault(State(state): State<Arc<PrefsState>>, Json(req): Json<VaultS
     // arrive. Detach into a task that outlives the request (a dropped
     // connection must NOT cancel the switch partway through — that is
     // exactly the interrupted-switch case the crash marker inside
-    // `switch_to` exists to recover from), and record the outcome in
-    // `state.last_op` since it can no longer ride this response back.
+    // `switch_to` exists to recover from), and record the outcome via
+    // `crate::last_op` since it can no longer ride this response back.
     //
     // N5 — still delegates to `VaultRunner::switch_to` VERBATIM inside the
     // task. This route must never reimplement any part of the
@@ -452,6 +448,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn last_op_survives_a_fresh_prefs_state_the_way_a_reboot_replaces_it() {
+        // Simulates the exact defect this fixes: a successful switch/reboot
+        // tears down the old `PrefsState` and `boot()` builds a brand new one
+        // (a fresh `router(..)` call here) from the same data dir. Before the
+        // fix, `lastOp` would go back to `null`; after it, `GET /__api/prefs`
+        // on the NEW router must still see it, because it lives on disk.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // GET on a brand-new router before anything ran: nothing recorded.
+        let app = router(tmp.path().to_path_buf(), empty_runner_slot());
+        let resp = app
+            .oneshot(Request::get("/__api/prefs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        assert!(body["lastOp"].is_null(), "nothing recorded yet must read as null, not an error");
+
+        // The detached task's outcome, written the same way `record_last_op`
+        // does — directly to disk, not through the (now-torn-down) old state.
+        last_op::record(tmp.path(), "vaultSwitch", Ok(())).unwrap();
+
+        // A brand-new router/state, same data dir — exactly what `boot()`
+        // constructs after a successful switch/reboot.
+        let app2 = router(tmp.path().to_path_buf(), empty_runner_slot());
+        let resp = app2
+            .oneshot(Request::get("/__api/prefs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        assert_eq!(body["lastOp"]["op"], "vaultSwitch");
+        assert_eq!(body["lastOp"]["ok"], true);
+        assert_eq!(body["lastOp"]["seq"], 1);
     }
 
     #[tokio::test]

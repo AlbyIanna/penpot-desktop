@@ -104,7 +104,15 @@ FIRST_BOOT_TIMEOUT="${D4_FIRST_BOOT_TIMEOUT:-900}"   # fresh data dir, pg instal
 RESTART_TIMEOUT="${D4_RESTART_TIMEOUT:-300}"
 SYNC_TIMEOUT="${D4_SYNC_TIMEOUT:-180}"
 EXPORT_TIMEOUT="${D4_EXPORT_TIMEOUT:-180}"
-SWITCH_TIMEOUT="${D4_SWITCH_TIMEOUT:-600}"            # a vault switch = full teardown+reboot
+# A vault switch = full teardown + DB/index wipe + reboot. `lastOp` is now
+# persisted (`crate::last_op`, apps/desktop/src/last_op.rs) instead of an
+# in-memory field a successful switch used to reset to null before this
+# helper could ever observe it — the poll signal (`lastOp.seq` changing;
+# scripts/d4_prefs_helper.py's `_wait_for_op_outcome`) now actually arrives
+# the moment the new stack is up, so this no longer needs ten minutes of
+# margin against a signal that might never come; same order as
+# REBOOT_TIMEOUT plus room for the wipe.
+SWITCH_TIMEOUT="${D4_SWITCH_TIMEOUT:-300}"
 REBOOT_TIMEOUT="${D4_REBOOT_TIMEOUT:-300}"             # in-place reboot (same vault, no wipe)
 LIVE_APPLY_TIMEOUT="${D4_LIVE_APPLY_TIMEOUT:-20}"      # POST /__api/prefs applies live-fields synchronously; short poll is a safety margin, not a real wait
 

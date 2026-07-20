@@ -33,13 +33,26 @@ Subcommands:
       detached task that outlives the request — it tears down the very
       proxy serving the request, so a synchronous response can never arrive
       (see apps/desktop/src/prefs_http.rs's module doc). This subcommand
-      hides that: it records the `lastOp` in effect before the POST, sends
-      it, then polls GET /__api/prefs (tolerating connection failures —
-      expected while the stack is down) until `lastOp` changes, and prints a
-      JSON object shaped like the old synchronous response
+      hides that: it records the `lastOp.seq` in effect before the POST,
+      sends it, then polls GET /__api/prefs (tolerating connection failures —
+      expected while the stack is down) until `lastOp.seq` changes, and
+      prints a JSON object shaped like the old synchronous response
       (`{"ok": <real outcome>, "accepted": true, "lastOp": {...}, "vault":
       {...}}`) so callers keep grepping `"ok": true`/`"ok": false` for the
       REAL result, not just the 202 ack.
+
+      `lastOp` is now `crate::last_op`'s ON-DISK record
+      (`<data_dir>/last-op.json`, apps/desktop/src/last_op.rs), not an
+      in-memory field — it has to be, because a successful switch/reboot
+      replaces the whole `PrefsState` it used to live on. That also means the
+      GET right after the POST can, for the FIRST TIME, observe a lastOp that
+      was already non-null before this operation even started (e.g. left by
+      an earlier switch/reboot in the same gate run) — polling for "any
+      lastOp at all" would false-positive on that stale record the instant
+      the new stack comes back up, well before the detached task has
+      actually finished. `seq` (a counter persisted IN the record, `next =
+      previous + 1`) is what makes "a NEW outcome was recorded" distinct from
+      "an old one is still sitting there" — see `last_op.rs`'s module doc.
   vault <path> [timeout-s]
       POST /__api/prefs/vault {"path": path}. Same ack-then-poll shape as
       `reboot` above, delegating to `switch_to` in the detached task.
@@ -132,23 +145,39 @@ def _get_lenient(path, per_call_timeout=5):
 
 def _last_op_key(data):
     """A value that changes iff a NEW detached switch/reboot has finished and
-    been recorded — `(op, at)`, or `None` before anything has ever finished.
-    See `_wait_for_op_outcome` for why this, not just "a GET succeeded", is
+    been recorded — `lastOp.seq`, or `None` before anything has EVER finished
+    (empty `<data_dir>/last-op.json`).
+
+    `lastOp` is now a file (`crate::last_op`, apps/desktop/src/last_op.rs),
+    not an in-memory field that a successful switch/reboot used to reset back
+    to `null` (that reset was the D4 bug this replaces — see that module's
+    doc). That means it can ALREADY be non-null before this operation even
+    starts (a prior switch/reboot in the same run), so `op`/`at` alone is not
+    enough to prove freshness — two consecutive ops on the same `op` can, in
+    principle, land in the same wall-clock second (`at`'s resolution). `seq`
+    is a counter persisted IN the record (`next = previous + 1`) specifically
+    so two back-to-back, identical-looking outcomes are still distinguishable
+    — see `_wait_for_op_outcome` for why this, not just "a GET succeeded", is
     the readiness signal."""
     op = (data or {}).get("lastOp")
-    return (op.get("op"), op.get("at")) if op else None
+    return op.get("seq") if op else None
 
 
 def _wait_for_op_outcome(baseline_key, timeout):
-    """Poll GET /__api/prefs until `lastOp` differs from `baseline_key` (the
-    op in effect right before the switch/reboot was kicked off) — NOT just
-    until any GET succeeds. A GET can succeed against the OLD stack too:
+    """Poll GET /__api/prefs until `lastOp.seq` differs from `baseline_key`
+    (the seq in effect right before the switch/reboot was kicked off) — NOT
+    just until any GET succeeds. A GET can succeed against the OLD stack too:
     there is a brief window before the detached task has torn anything down
     yet, and some failures (e.g. an unusable target path) are caught before
     the stack is touched at all, so the origin never actually goes away
-    either. `lastOp` changing is the one signal that holds in every case,
-    because only the detached task itself writes it, and only once it is
-    completely done — success or failure alike."""
+    either. `lastOp.seq` changing is the one signal that holds in every case,
+    because only the detached task itself writes it (via `crate::last_op`,
+    ALWAYS after `switch_to`/`reboot_in_place` has fully resolved — success or
+    failure alike), and by the time it does, if the operation succeeded, the
+    NEW stack's proxy has already finished binding (see `last_op.rs`'s module
+    doc on write ordering) — so the moment this poll observes a fresh `seq`,
+    the server behind `BASE` is the one actually worth talking to next, not
+    one still mid-boot."""
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -219,7 +248,7 @@ def cmd_reboot(timeout="300"):
     print(json.dumps(_post_then_wait("/__api/prefs/reboot", None, float(timeout)), sort_keys=True))
 
 
-def cmd_vault(path, timeout="600"):
+def cmd_vault(path, timeout="300"):
     print(json.dumps(_post_then_wait("/__api/prefs/vault", {"path": path}, float(timeout)), sort_keys=True))
 
 
