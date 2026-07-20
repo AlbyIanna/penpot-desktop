@@ -147,7 +147,7 @@ expected items and accelerators, and that **every menu action's underlying comma
 — menus cannot be clicked in CI, so the command layer is tested directly and the menu wiring is
 asserted to map onto those commands (no orphaned or dead menu items). Green twice.
 
-### D4 — Native Preferences + native dialogs
+### D4 — Native Preferences + native dialogs — ✅ DONE
 Goal: a native Preferences window standing in for `/settings`: vault location and switching (through
 the proven N5 path), sync on/off + status, thumbnails/exporter toggle, plugin + CSP toggles,
 about/updates. Native open/save dialogs for import/export.
