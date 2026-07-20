@@ -10,7 +10,9 @@
 //! invariant (DB is a disposable cache, the folder tree is truth) does not
 //! apply to a module that never mutates either side of it.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sync_core::manifest::Manifest;
 
@@ -112,6 +114,84 @@ pub fn display_title(rel_path: &str) -> String {
     base.strip_suffix(".penpot").unwrap_or(base).to_string()
 }
 
+// ---------------------------------------------------------------------------
+// D5 Task 5: offering to import an `External` (or finishing a
+// `PendingImport`) `.penpot` — the two pure decisions pulled out of the
+// Tauri glue in `menubar/mod.rs`, same split as `Resolved`/`resolve` above.
+// ---------------------------------------------------------------------------
+
+/// Fixed top-level vault folder every externally-imported `.penpot` lands
+/// under, regardless of where it lived outside the vault. One fixed folder
+/// (rather than trying to mirror the source location, which the vault may
+/// have no equivalent of) keeps this deterministic and gives the daemon's
+/// Direction B `import_as_new` exactly one DB project to create/reuse
+/// (`sync-daemon::engine::import_as_new` derives the project NAME from a
+/// new file's top-level on-disk folder) — every import this way accumulates
+/// in one "Imported" project rather than spawning a fresh ad hoc one per
+/// file.
+pub const IMPORT_PROJECT_DIR: &str = "Imported";
+
+/// Vault-relative destination for a `.penpot` named `source_name` (e.g.
+/// `"Loose Ideas.penpot"`) being copied in from outside the vault, under
+/// [`IMPORT_PROJECT_DIR`]. `taken` is the set of vault-relative paths
+/// already occupied there — the caller reads that from disk (or the
+/// manifest) and passes it in, so THIS function stays pure and
+/// deterministic: the same `source_name`/`taken` pair always produces the
+/// same answer, no filesystem access or randomness of its own. Collisions
+/// (an `Imported/Loose Ideas.penpot` that already exists) get a numeric
+/// suffix rather than overwriting anything.
+pub fn import_target_rel_path(source_name: &str, taken: &HashSet<String>) -> String {
+    // Reuses the daemon's own path-component sanitizer rather than a second,
+    // hand-rolled one — the destination component must be exactly as safe as
+    // anything the daemon itself would ever write, since after the copy
+    // lands the daemon treats this path no differently from a file it
+    // created.
+    let stem = sync_daemon::paths::sanitize_component(
+        source_name.strip_suffix(".penpot").unwrap_or(source_name),
+    );
+    let mut candidate = format!("{IMPORT_PROJECT_DIR}/{stem}.penpot");
+    let mut n = 2;
+    while taken.contains(&candidate) {
+        candidate = format!("{IMPORT_PROJECT_DIR}/{stem}-{n}.penpot");
+        n += 1;
+    }
+    candidate
+}
+
+/// Outcome of one manifest poll while waiting for the sync daemon's
+/// Direction B to notice a `.penpot` on disk and assign it a file id — used
+/// for both `External` (after the copy lands) and `PendingImport` (already
+/// on disk, nothing to copy). `Ready`'s id is owned (not borrowed) so the
+/// caller can act on it after the manifest snapshot it came from is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollOutcome {
+    /// The manifest now has an id for the path — open it.
+    Ready(String),
+    /// Not yet, and there is still time left — poll again.
+    Waiting,
+    /// `elapsed` has reached the caller's timeout with no id assigned.
+    /// Bounds the poll: the caller must surface this and stop, never spin
+    /// forever.
+    TimedOut,
+}
+
+/// Pure decision for one poll iteration: given whether THIS read of the
+/// manifest found an id for the path, and how long the caller has been
+/// polling, what should happen next? Takes the read's result and the
+/// elapsed/timeout durations rather than doing the read or the waiting
+/// itself — those are I/O and belong to the loop in `menubar/mod.rs`; this
+/// function only interprets one iteration's result.
+pub fn poll_outcome(found_file_id: Option<&str>, elapsed: Duration, timeout: Duration) -> PollOutcome {
+    if let Some(id) = found_file_id {
+        return PollOutcome::Ready(id.to_string());
+    }
+    if elapsed >= timeout {
+        PollOutcome::TimedOut
+    } else {
+        PollOutcome::Waiting
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +267,95 @@ mod tests {
         let m = vault_with(root, "Proj/Home.penpot", "fid1");
         let sneaky = root.join("Proj").join("..").join("Proj").join("Home.penpot");
         assert!(matches!(resolve(&sneaky, root, &m), Resolved::InVault { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // D5 Task 5 — `import_target_rel_path`: pure, deterministic given
+    // `source_name` and the `taken` set (no filesystem, no randomness).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_name_lands_directly_under_the_imported_folder() {
+        let taken = HashSet::new();
+        assert_eq!(
+            import_target_rel_path("Loose Ideas.penpot", &taken),
+            "Imported/Loose Ideas.penpot"
+        );
+    }
+
+    #[test]
+    fn a_taken_name_gets_a_numeric_suffix_deterministically() {
+        let mut taken = HashSet::new();
+        taken.insert("Imported/Loose Ideas.penpot".to_string());
+        assert_eq!(
+            import_target_rel_path("Loose Ideas.penpot", &taken),
+            "Imported/Loose Ideas-2.penpot"
+        );
+    }
+
+    #[test]
+    fn the_suffix_walk_skips_every_already_taken_candidate() {
+        let mut taken = HashSet::new();
+        taken.insert("Imported/dup.penpot".to_string());
+        taken.insert("Imported/dup-2.penpot".to_string());
+        taken.insert("Imported/dup-3.penpot".to_string());
+        assert_eq!(import_target_rel_path("dup.penpot", &taken), "Imported/dup-4.penpot");
+    }
+
+    #[test]
+    fn a_name_without_the_penpot_suffix_is_still_handled() {
+        // Defensive: `docopen::resolve` only ever passes a name that already
+        // ends in `.penpot`, but this function does not depend on that.
+        let taken = HashSet::new();
+        assert_eq!(import_target_rel_path("bare", &taken), "Imported/bare.penpot");
+    }
+
+    #[test]
+    fn a_path_separator_in_the_source_name_cannot_escape_the_imported_folder() {
+        // `sanitize_component` (reused from the daemon) maps `/` to `-`, so
+        // a maliciously/weirdly named source can never produce a rel path
+        // with more than the one `Imported/` component this function
+        // controls.
+        let taken = HashSet::new();
+        let rel = import_target_rel_path("../../etc/passwd.penpot", &taken);
+        assert_eq!(rel.matches('/').count(), 1, "expected exactly one path separator: {rel}");
+        assert!(rel.starts_with("Imported/"), "{rel}");
+    }
+
+    // -----------------------------------------------------------------
+    // D5 Task 5 — `poll_outcome`: pure, deterministic given one iteration's
+    // read result and how long the caller has already been polling.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_found_id_is_ready_regardless_of_elapsed_time() {
+        assert_eq!(
+            poll_outcome(Some("fid1"), Duration::from_secs(0), Duration::from_secs(20)),
+            PollOutcome::Ready("fid1".to_string())
+        );
+        assert_eq!(
+            poll_outcome(Some("fid1"), Duration::from_secs(999), Duration::from_secs(20)),
+            PollOutcome::Ready("fid1".to_string())
+        );
+    }
+
+    #[test]
+    fn no_id_yet_and_time_left_means_keep_waiting() {
+        assert_eq!(
+            poll_outcome(None, Duration::from_secs(3), Duration::from_secs(20)),
+            PollOutcome::Waiting
+        );
+    }
+
+    #[test]
+    fn no_id_and_the_timeout_reached_gives_up() {
+        assert_eq!(
+            poll_outcome(None, Duration::from_secs(20), Duration::from_secs(20)),
+            PollOutcome::TimedOut
+        );
+        assert_eq!(
+            poll_outcome(None, Duration::from_secs(21), Duration::from_secs(20)),
+            PollOutcome::TimedOut
+        );
     }
 }

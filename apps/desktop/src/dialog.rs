@@ -60,6 +60,68 @@ pub fn native_info_dialog(title: &str, message: &str) {
     show(title, message, "note");
 }
 
+/// D5 Task 5: the affirmative button on [`native_confirm_dialog`] — a fixed
+/// label (not a parameter) because there is exactly one confirm flow in this
+/// app today (offer to import an external `.penpot`); a second call site
+/// with a different verb is a "parameterize it then" problem, not a
+/// speculative one now.
+const CONFIRM_AFFIRMATIVE: &str = "Import";
+
+/// D5 Task 5: pure AppleScript builder for the two-button confirm dialog
+/// (`"Cancel"` / [`CONFIRM_AFFIRMATIVE`]). Mirrors `choose_file_script`'s
+/// split from its `Command`-spawning caller below — `message` routinely
+/// embeds a user's own filename (see [`native_confirm_dialog`]'s call site),
+/// and this codebase has already been bitten once (D3-review finding 4, see
+/// `applescript_escape`'s doc) by a filename breaking out of the AppleScript
+/// string literal, so the escaping is exercised here, pure and unit-tested,
+/// not just trusted to work.
+pub fn confirm_dialog_script(title: &str, message: &str) -> String {
+    format!(
+        "button returned of (display dialog \"{}\" with title \"{}\" \
+         buttons {{\"Cancel\", \"{CONFIRM_AFFIRMATIVE}\"}} \
+         default button \"{CONFIRM_AFFIRMATIVE}\" with icon note)",
+        applescript_escape(message),
+        applescript_escape(title),
+    )
+}
+
+/// Native confirm dialog: "Cancel" vs. [`CONFIRM_AFFIRMATIVE`] ("Import").
+/// Blocks until the user picks. Returns `true` only if the affirmative
+/// button was clicked.
+///
+/// Fails CLOSED, not open: clicking "Cancel" (or pressing Escape, or closing
+/// the dialog) raises AppleScript's -128 "User canceled" error, which
+/// `osascript` surfaces as a non-zero exit — so `status.success()` alone
+/// already means the affirmative button was the one clicked; the stdout
+/// check is belt-and-suspenders. Anything that stops the dialog from being
+/// shown at all (non-macOS, `osascript` missing) also returns `false` — with
+/// nobody able to see the prompt there is no "yes" to have been given, so
+/// the safe default for an irreversible-feeling action like importing a copy
+/// into the vault is to do nothing, not to proceed silently.
+#[cfg(target_os = "macos")]
+pub fn native_confirm_dialog(title: &str, message: &str) -> bool {
+    let script = confirm_dialog_script(title, message);
+    match Command::new("osascript").arg("-e").arg(script).output() {
+        Ok(output) => {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == CONFIRM_AFFIRMATIVE
+        }
+        Err(e) => {
+            tracing::warn!("native confirm dialog unavailable (osascript spawn failed: {e})");
+            false
+        }
+    }
+}
+
+/// Non-macOS stub: no native confirm dialog available; fails closed (see
+/// [`native_confirm_dialog`]'s doc for why `false`, not a panic or a silent
+/// "assume yes").
+#[cfg(not(target_os = "macos"))]
+pub fn native_confirm_dialog(_title: &str, _message: &str) -> bool {
+    tracing::info!("native_confirm_dialog: native dialogs only implemented on macOS");
+    false
+}
+
 /// N5: native "choose folder" picker (blocks until the user picks or cancels).
 /// Returns the chosen POSIX path, or `None` on cancel / any error. macOS only
 /// (via `osascript`); other platforms return `None` — the GUI picker is a
@@ -216,6 +278,34 @@ mod tests {
         for s in [applescript_escape("line1\nline2"), applescript_escape("a\rb\tc")] {
             assert!(!s.contains('\n') && !s.contains('\r'), "escaped string still breaks the literal: {s:?}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // D5 Task 5 — `confirm_dialog_script`, same escaping discipline as the
+    // pickers above.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn confirm_dialog_script_offers_cancel_and_import() {
+        let s = confirm_dialog_script("Penpot Local — Import", "Import this file?");
+        assert!(s.contains(r#"{"Cancel", "Import"}"#), "{s}");
+        assert!(s.contains(r#"default button "Import""#), "{s}");
+    }
+
+    #[test]
+    fn confirm_dialog_script_escapes_a_quoted_filename_in_the_message() {
+        // The message routinely embeds a user's own filename (the whole
+        // point of the dialog is "import THIS file?") — a raw quote in it
+        // must not break out of the AppleScript literal.
+        let s = confirm_dialog_script("Import", r#"Import "Loose Ideas".penpot?"#);
+        assert!(!s.contains(r#""Loose Ideas""#), "unescaped quote breaks out of the AppleScript literal: {s}");
+        assert!(s.contains(r#"\"Loose Ideas\""#), "expected escaped quotes in: {s}");
+    }
+
+    #[test]
+    fn confirm_dialog_script_stays_a_single_line_even_with_newlines_in_the_message() {
+        let s = confirm_dialog_script("Import", "weird\nname.penpot");
+        assert_eq!(s.lines().count(), 1, "script must stay a single AppleScript line: {s:?}");
     }
 
     #[test]

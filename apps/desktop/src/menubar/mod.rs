@@ -36,6 +36,7 @@
 
 pub mod model;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -437,13 +438,13 @@ pub fn document_action(resolved: docopen::Resolved) -> DocumentAction {
 ///
 /// `InVault` opens exactly like every other "open a file" path —
 /// [`open_file_window`], same reuse-or-create, same navigation policy,
-/// nothing forked. `OfferImport`/`WaitForImport` are NOT wired to anything
-/// destructive yet (Task 5 adds the copy-in + poll): this task's brief is to
-/// log clearly what was skipped, never stub silently. `Reject` also raises a
-/// native error dialog — every call site that reaches `open_document` today
-/// is itself a direct user gesture (a CLI argument, a second launch, a
-/// Finder open), so there is no "quiet background rescan" case here that a
-/// dialog would spam.
+/// nothing forked. `OfferImport` confirms with the user then copies the
+/// `.penpot` INTO the vault ([`offer_import`]); `WaitForImport` skips
+/// straight to polling ([`poll_until_imported_and_open`]) since the dir is
+/// already on disk. `Reject` raises a native error dialog — every call site
+/// that reaches `open_document` today is itself a direct user gesture (a CLI
+/// argument, a second launch, a Finder open), so there is no "quiet
+/// background rescan" case here that a dialog would spam.
 pub fn open_document<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, raw_path: &Path) {
     let live = live_snapshot(&ctx.live);
     if live.vault_root.as_os_str().is_empty() {
@@ -472,16 +473,17 @@ pub fn open_document<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, raw_path: &P
             }
         }
         DocumentAction::OfferImport { path } => {
-            tracing::info!(
-                path = %path.display(),
-                "open_document: external .penpot skipped — import offer not wired yet (Task 5)"
-            );
+            let app = app.clone();
+            let ctx = ctx.clone();
+            tauri::async_runtime::spawn(async move { offer_import(&app, &ctx, path).await });
         }
         DocumentAction::WaitForImport { rel_path } => {
-            tracing::info!(
-                rel_path,
-                "open_document: vault-internal .penpot pending import skipped — poll not wired yet (Task 5)"
-            );
+            let app = app.clone();
+            let ctx = ctx.clone();
+            let vault_root = live.vault_root.clone();
+            tauri::async_runtime::spawn(async move {
+                poll_until_imported_and_open(&app, &ctx, &vault_root, &rel_path).await;
+            });
         }
         DocumentAction::Reject { reason } => {
             tracing::warn!(path = %raw_path.display(), reason, "open_document: not a Penpot document");
@@ -489,6 +491,216 @@ pub fn open_document<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, raw_path: &P
                 "Penpot Local — Open",
                 &format!("{} is not a Penpot document.\n\n{reason}", raw_path.display()),
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D5 Task 5: offer to import an external `.penpot`, and the poll-until-id
+// tail shared with `PendingImport`
+// ---------------------------------------------------------------------------
+
+/// How long [`poll_until_imported_and_open`] keeps re-reading the manifest
+/// before giving up. The daemon's own filesystem debounce is ~2s
+/// (`sync_daemon::SyncConfig::fs_debounce`'s default) before Direction B
+/// even STARTS the `import-binfile` RPC round trip that assigns the file its
+/// id — this timeout has to clear that plus real network/DB time with
+/// margin, not just edge past 2s. 20s is several debounce cycles' worth.
+const IMPORT_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How often [`poll_until_imported_and_open`] re-reads the manifest between
+/// [`IMPORT_POLL_TIMEOUT`] checks. Cheap (one small JSON file off disk), so
+/// sub-second is fine — this is not the daemon's own poll loop, just this
+/// window waiting on it.
+const IMPORT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Blocking I/O: recursively copy `src` into a FRESH directory at `dst`
+/// (`dst` must not already exist — `create_dir` fails closed if it does).
+/// Symlinks are skipped rather than followed, so a symlink inside a
+/// `.penpot` tree can never smuggle content from outside `src` into the
+/// vault. Always called with `dst` a `.penpot.tmp-*` staging sibling (never
+/// the final `.penpot` name directly) — see [`copy_into_vault`].
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else if file_type.is_symlink() {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "skipping a symlink while copying a .penpot into the vault"
+            );
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Blocking I/O: copy `source` (named `source_name`) into the active vault
+/// under [`docopen::IMPORT_PROJECT_DIR`], returning the vault-relative path
+/// it now lives at.
+///
+/// **Core invariant, not just a nicety:** the copy is built ENTIRELY inside
+/// a `.penpot.tmp-*` staging sibling via the SAME two-phase swap primitives
+/// (`sync_core::stage_path_for`/`commit_dir_swap`) Direction A's own export
+/// path uses — never written straight to the final `.penpot` name. The
+/// staging name is already invisible to the daemon's filesystem watcher (see
+/// `watcher.rs`'s `.penpot.tmp-`/`.penpot.old-` ignore rules), so a crash or
+/// I/O failure partway through the copy leaves only an ignored, orphaned
+/// staging dir — never a half-written tree sitting under a REAL `.penpot`
+/// name where the daemon could import it half-formed. `commit_dir_swap`'s
+/// final rename is what makes the directory visible under its real name at
+/// all, and that rename is a single filesystem operation, not a partial one.
+/// A leftover staging dir from a failed copy is swept by the daemon's own
+/// startup `cleanup_orphans` sweep, same as any other interrupted swap.
+fn copy_into_vault(vault_root: &Path, source: &Path, source_name: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    let project_dir = vault_root.join(docopen::IMPORT_PROJECT_DIR);
+    std::fs::create_dir_all(&project_dir)
+        .with_context(|| format!("creating {}", project_dir.display()))?;
+
+    // What's already there, so `import_target_rel_path` never overwrites an
+    // existing import. A plain directory listing (not the manifest): a
+    // just-copied sibling from a prior import may not have an id yet.
+    let taken: HashSet<String> = std::fs::read_dir(&project_dir)
+        .with_context(|| format!("reading {}", project_dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| format!("{}/{n}", docopen::IMPORT_PROJECT_DIR))
+        })
+        .collect();
+    let rel_path = docopen::import_target_rel_path(source_name, &taken);
+    let target = vault_root.join(&rel_path);
+
+    let staged = sync_core::stage_path_for(&target);
+    if let Err(e) = copy_dir_recursive(source, &staged) {
+        // Best-effort cleanup of a partial staging copy; it would otherwise
+        // just sit there until the next startup sweep.
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(e).with_context(|| format!("copying {} into the vault", source.display()));
+    }
+    sync_core::commit_dir_swap(&staged, &target)
+        .with_context(|| format!("moving the copy into place at {}", target.display()))?;
+    Ok(rel_path)
+}
+
+/// `DocumentAction::OfferImport`: confirm with the user (native dialog,
+/// fails closed on "no"/dismiss — see [`crate::dialog::native_confirm_dialog`]),
+/// then COPY (never move — `source` is the user's own file, left untouched)
+/// the `.penpot` into the active vault, then hand off to
+/// [`poll_until_imported_and_open`] for the daemon to pick it up on its own
+/// schedule. `live.vault_root` is read fresh from `ctx.live` right here, not
+/// captured earlier — the same zero-cross-vault-spill discipline every other
+/// command in this module already follows (an N5 vault switch mid-flow must
+/// never make this land in the vault that was active when the user clicked,
+/// only the one active when the copy actually happens).
+async fn offer_import<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, source: PathBuf) {
+    let live = live_snapshot(&ctx.live);
+    if live.vault_root.as_os_str().is_empty() {
+        tracing::info!(path = %source.display(), "import offer requested before boot completed; ignoring");
+        return;
+    }
+    let Some(source_name) = source.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+        crate::dialog::native_error_dialog(
+            "Penpot Local — Import",
+            &format!("{} has no usable file name.", source.display()),
+        );
+        return;
+    };
+
+    let message = format!(
+        "\"{source_name}\" is outside your Penpot Local vault.\n\n\
+         Import a COPY into your vault? The original file is left untouched."
+    );
+    let confirmed = tauri::async_runtime::spawn_blocking(move || {
+        crate::dialog::native_confirm_dialog("Penpot Local — Import", &message)
+    })
+    .await
+    .unwrap_or(false); // a panicked confirm task is exactly a "no", not a crash
+    if !confirmed {
+        return;
+    }
+
+    let vault_root = live.vault_root.clone();
+    let copy_result = tauri::async_runtime::spawn_blocking({
+        let source = source.clone();
+        let source_name = source_name.clone();
+        move || copy_into_vault(&vault_root, &source, &source_name)
+    })
+    .await;
+    let rel_path = match copy_result {
+        Ok(Ok(rel_path)) => rel_path,
+        Ok(Err(e)) => {
+            crate::dialog::native_error_dialog("Penpot Local — Import failed", &format!("{e:#}"));
+            return;
+        }
+        Err(e) => {
+            crate::dialog::native_error_dialog("Penpot Local — Import failed", &format!("{e}"));
+            return;
+        }
+    };
+
+    poll_until_imported_and_open(app, ctx, &live.vault_root, &rel_path).await;
+}
+
+/// Poll the vault's manifest for `rel_path` until the sync daemon assigns it
+/// a file id (bounded by [`IMPORT_POLL_TIMEOUT`]), then open it — the shared
+/// tail of `OfferImport` (called once the copy has landed) and
+/// `WaitForImport` (called directly; there is nothing to copy, the dir is
+/// already on disk). Never hangs: [`docopen::poll_outcome`] is the pure
+/// decision of when to give up, this loop only supplies the read and the
+/// sleep. On timeout this surfaces a clear, non-alarming message and
+/// returns — the daemon has NOT failed, it just hasn't gotten there yet, and
+/// the file will appear on Home (or a later Open attempt will succeed) the
+/// moment it does.
+async fn poll_until_imported_and_open<R: Runtime>(
+    app: &AppHandle<R>,
+    ctx: &MenuCtx,
+    vault_root: &Path,
+    rel_path: &str,
+) {
+    let title = docopen::display_title(rel_path);
+    let started = tokio::time::Instant::now();
+    loop {
+        let vault_root_owned = vault_root.to_path_buf();
+        let rel_path_owned = rel_path.to_string();
+        let found_file_id = tauri::async_runtime::spawn_blocking(move || {
+            sync_core::Manifest::load(&vault_root_owned)
+                .ok()
+                .flatten()
+                .and_then(|m| m.entry_by_path(&rel_path_owned).map(|(id, _)| id.to_string()))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        match docopen::poll_outcome(found_file_id.as_deref(), started.elapsed(), IMPORT_POLL_TIMEOUT) {
+            docopen::PollOutcome::Ready(file_id) => {
+                if let Err(e) = open_file_window(app, ctx, &file_id, None, &title) {
+                    tracing::error!("open_file_window failed: {e}");
+                }
+                return;
+            }
+            docopen::PollOutcome::Waiting => {
+                tokio::time::sleep(IMPORT_POLL_INTERVAL).await;
+            }
+            docopen::PollOutcome::TimedOut => {
+                crate::dialog::native_info_dialog(
+                    "Penpot Local — Import",
+                    &format!(
+                        "\"{title}\" is still importing — it'll appear on your \
+                         home shortly."
+                    ),
+                );
+                return;
+            }
         }
     }
 }
@@ -1215,5 +1427,95 @@ mod tests {
             title: "home".into(),
         }];
         assert!(title_updates_for_rename(&windows, &manifest).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // D5 Task 5 — `copy_dir_recursive`/`copy_into_vault`: real filesystem
+    // I/O (no Tauri needed), so these run against a `tempfile::tempdir`
+    // rather than mocking anything.
+    // -----------------------------------------------------------------
+
+    /// Build a tiny `.penpot` fixture: a couple of files, one nested dir —
+    /// enough to prove the copy is recursive and byte-faithful, not a
+    /// realistic binfile.
+    fn make_fixture_penpot(dir: &Path) {
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{\"ok\":true}").unwrap();
+        std::fs::write(dir.join("files/page1.json"), b"{\"shapes\":[]}").unwrap();
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_files_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("Loose.penpot");
+        make_fixture_penpot(&src);
+        let dst = tmp.path().join("staged");
+
+        copy_dir_recursive(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("manifest.json")).unwrap(), b"{\"ok\":true}");
+        assert_eq!(std::fs::read(dst.join("files/page1.json")).unwrap(), b"{\"shapes\":[]}");
+        // The source is untouched — this is a COPY, never a move.
+        assert!(src.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn copy_dir_recursive_skips_symlinks_rather_than_following_them() {
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("Loose.penpot");
+            make_fixture_penpot(&src);
+            let outside_secret = tmp.path().join("outside-secret.json");
+            std::fs::write(&outside_secret, b"not part of the vault").unwrap();
+            std::os::unix::fs::symlink(&outside_secret, src.join("sneaky-link.json")).unwrap();
+
+            let dst = tmp.path().join("staged");
+            copy_dir_recursive(&src, &dst).unwrap();
+
+            assert!(!dst.join("sneaky-link.json").exists(), "a symlink must not be followed into the vault");
+            assert!(dst.join("manifest.json").exists(), "real files still copy");
+        }
+    }
+
+    #[test]
+    fn copy_into_vault_lands_under_the_imported_project_folder() {
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("Loose Ideas.penpot");
+        make_fixture_penpot(&src);
+
+        let rel = copy_into_vault(vault.path(), &src, "Loose Ideas.penpot").unwrap();
+
+        assert_eq!(rel, "Imported/Loose Ideas.penpot");
+        let dest = vault.path().join(&rel);
+        assert!(dest.is_dir(), "the copy must land at the returned rel path");
+        assert_eq!(std::fs::read(dest.join("manifest.json")).unwrap(), b"{\"ok\":true}");
+        // The copy landed via a rename into the FINAL name — no `.tmp-*`
+        // staging sibling left behind in the project folder.
+        let leftovers: Vec<_> = std::fs::read_dir(vault.path().join(docopen::IMPORT_PROJECT_DIR))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["Loose Ideas.penpot".to_string()]);
+        // Source untouched (copy, not move).
+        assert!(src.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn copy_into_vault_deconflicts_a_second_import_of_the_same_name() {
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src = outside.path().join("dup.penpot");
+        make_fixture_penpot(&src);
+
+        let first = copy_into_vault(vault.path(), &src, "dup.penpot").unwrap();
+        let second = copy_into_vault(vault.path(), &src, "dup.penpot").unwrap();
+
+        assert_eq!(first, "Imported/dup.penpot");
+        assert_eq!(second, "Imported/dup-2.penpot");
+        assert!(vault.path().join(&first).is_dir());
+        assert!(vault.path().join(&second).is_dir());
     }
 }
