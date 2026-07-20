@@ -21,6 +21,7 @@ pub mod overlay;
 pub mod packages;
 pub mod preflight;
 pub mod prefs;
+pub mod prefs_http;
 pub mod recent;
 pub mod reveal;
 pub mod status;
@@ -858,7 +859,12 @@ fn should_pause_sync_at_boot(prefs: &prefs::Preferences) -> bool {
 /// embedded Postgres binaries (network needed once); a packaged install with
 /// a bundled `postgres/` is fully offline from the very first boot. Also
 /// registers the single user; afterwards everything is offline and idempotent.
-pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
+///
+/// `runner_slot` is D4's late-bound handle to the owning
+/// [`control::VaultRunner`] (see [`control::RunnerSlot`]'s doc) — threaded
+/// through so the Preferences routes this function mounts can call back into
+/// the runner that wraps the very stack being built here, once it exists.
+pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow::Result<RunningApp> {
     // M5 pre-flight (PLAN.md risk 8): refuse non-BMP (emoji) characters in
     // any load-bearing path BEFORE the supervisor spawns anything — the JDK
     // cannot load the backend jar from such a path and would crash-loop.
@@ -1019,6 +1025,14 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     });
     let manage_routes = manage::router(manage_state);
 
+    // --- D4 Preferences page + routes ---------------------------------------
+    // `/__preferences` + `/__api/prefs*`, mounted exactly like `/__home` above.
+    // `prefs_http` re-reads `prefs::load`/`save` itself on every request rather
+    // than closing over the `prefs` value loaded earlier in this function —
+    // that copy goes stale the instant a save happens, and staleness here
+    // would mean the page lies about its own settings.
+    let prefs_routes = prefs_http::router(config.data_dir.clone(), runner_slot.clone());
+
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
         .merge(home_routes)
@@ -1026,6 +1040,7 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         .merge(templates_routes)
         .merge(packages_routes)
         .merge(manage_routes)
+        .merge(prefs_routes)
         .merge(navprobe::router());
 
     let mut proxy_config = proxy::ProxyConfig::new(

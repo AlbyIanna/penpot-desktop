@@ -55,6 +55,25 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::vault::{self, SwitchMarker, VaultRef, VaultRegistry};
 use crate::{boot, AppConfig, RunningApp};
 
+/// D4 — a late-bound handle to the owning [`VaultRunner`], threaded through
+/// [`boot`] so routes built there (the Preferences page, `prefs_http.rs`) can
+/// call back into the very runner that wraps the stack being built —
+/// `POST /__api/prefs/reboot` needs [`VaultRunner::reboot_in_place`] and
+/// `POST /__api/prefs/vault` needs [`VaultRunner::switch_to`], but neither
+/// exists yet at the point `boot()` constructs its router (a `VaultRunner`
+/// only comes into being by WRAPPING the [`RunningApp`] `boot()` returns).
+///
+/// [`boot_active_vault`] creates this slot empty, passes it into the first
+/// `boot()` call (so the very first proxy's router captures the same `Arc`),
+/// then fills it in immediately after `VaultRunner::new` returns. Every later
+/// reboot/switch (`stop_then_boot`) reuses that already-filled slot — the
+/// `VaultRunner` itself never changes identity across a switch or reboot,
+/// only the [`RunningApp`] it wraps does, so nothing needs re-filling.
+/// `None` only in the brief window between the first `boot()` returning and
+/// that fill-in; routes see this the same way the palette/menu bar's
+/// late-bound slots do — a "still starting" response, never a panic.
+pub type RunnerSlot = Arc<AsyncMutex<Option<Arc<VaultRunner>>>>;
+
 /// Env var: the localhost control port. Unset ⇒ no control server (every
 /// pre-N5 flow is byte-identical; nothing new binds).
 pub const CONTROL_PORT_ENV: &str = "PENPOT_LOCAL_CONTROL_PORT";
@@ -134,10 +153,20 @@ pub struct VaultRunner {
     active: Mutex<VaultRef>,
     /// Serializes switches (only one teardown/reboot at a time).
     switch_lock: AsyncMutex<()>,
+    /// D4 — the same late-bound slot this runner was constructed with (see
+    /// [`RunnerSlot`]'s doc). Every reboot/switch re-passes it into `boot()`
+    /// unchanged, so the Preferences routes built by a later boot keep
+    /// resolving to this exact runner.
+    runner_slot: RunnerSlot,
 }
 
 impl VaultRunner {
-    fn new(app: RunningApp, base_config: AppConfig, active: VaultRef) -> Arc<Self> {
+    fn new(
+        app: RunningApp,
+        base_config: AppConfig,
+        active: VaultRef,
+        runner_slot: RunnerSlot,
+    ) -> Arc<Self> {
         let data_dir = base_config.data_dir.clone();
         Arc::new(VaultRunner {
             app: AsyncMutex::new(Some(app)),
@@ -145,6 +174,7 @@ impl VaultRunner {
             data_dir,
             active: Mutex::new(active),
             switch_lock: AsyncMutex::new(()),
+            runner_slot,
         })
     }
 
@@ -273,7 +303,9 @@ impl VaultRunner {
         tracing::info!(vault = %target_root.display(), ?op, "booting");
         let mut cfg = self.base_config.clone();
         cfg.designs_dir = target_root.to_path_buf();
-        let app = boot(cfg).await.context("booting the vault failed")?;
+        let app = boot(cfg, self.runner_slot.clone())
+            .await
+            .context("booting the vault failed")?;
         *self.app.lock().await = Some(app);
         Ok(())
     }
@@ -407,11 +439,15 @@ pub async fn boot_active_vault(base_config: AppConfig) -> Result<Arc<VaultRunner
     registry.set_active(&vref.path);
     registry.save(&data_dir).context("cannot persist the vault registry")?;
 
-    // Boot the resolved vault.
+    // Boot the resolved vault. D4: the runner slot starts empty — `boot()`'s
+    // Preferences router captures this SAME `Arc` and only sees it filled in
+    // a few lines below, once `VaultRunner::new` exists to fill it with (see
+    // `RunnerSlot`'s doc for why the ordering has to be this way round).
+    let runner_slot: RunnerSlot = Arc::new(AsyncMutex::new(None));
     let mut config = base_config.clone();
     config.designs_dir = vref.root();
     tracing::info!(vault = %vref.path, id = %vref.id, "opening vault");
-    let app = boot(config).await?;
+    let app = boot(config, runner_slot.clone()).await?;
 
     // Recovery landed → clear the marker.
     if recovering {
@@ -419,7 +455,9 @@ pub async fn boot_active_vault(base_config: AppConfig) -> Result<Arc<VaultRunner
         tracing::info!(vault = %vref.path, "vault switch recovery: complete (single consistent vault)");
     }
 
-    Ok(VaultRunner::new(app, base_config, vref))
+    let runner = VaultRunner::new(app, base_config, vref, runner_slot.clone());
+    *runner_slot.lock().await = Some(runner.clone());
+    Ok(runner)
 }
 
 // ---------------------------------------------------------------------------

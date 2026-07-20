@@ -46,3 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+# D4: HTTP-level tests for prefs_http.rs (`Router::oneshot`) — no other
+# module in this crate needs axum's request/response cycle driven directly,
+# every earlier one only unit-tests its pure logic (see prefs_http's own
+# module doc for why this route set is different: it must prove the save
+# round-trip and needsReboot flag through the real routes, not just the
+# `prefs::` functions they call).
+tower = { version = "0.5", features = ["util"] }
