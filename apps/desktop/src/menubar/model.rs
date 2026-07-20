@@ -33,6 +33,8 @@ pub enum Command {
     FocusWindow(String),
     About,
     KnownLimits,
+    /// D4 — open (or focus) the native Preferences window.
+    Preferences,
 }
 
 /// One clickable (or disabled-informational) menu row.
@@ -135,6 +137,10 @@ const WINDOW_FOCUS_PREFIX: &str = "window.focus:";
 
 pub const ABOUT_ID: &str = "help.about";
 pub const KNOWN_LIMITS_ID: &str = "help.known-limits";
+
+/// D4 — the Preferences item's id, in the application section (see
+/// [`app_section`]) where macOS users expect it, carrying `CmdOrCtrl+,`.
+pub const PREFERENCES_ID: &str = "app.preferences";
 
 fn file_section(recent: &[RecentEntry], key_has_file: bool) -> MenuSection {
     let mut entries = vec![
@@ -239,21 +245,34 @@ fn edit_section() -> MenuSection {
     }
 }
 
-/// The application submenu: About / Services / Hide family / Quit — every
-/// entry is `Predefined` (OS-native), so this section carries no `Command`s
-/// of its own. This is the CRITICAL D3-review fix: `mod.rs` installs the
-/// whole menu bar wholesale via `AppHandle::set_menu`, which on macOS
-/// REPLACES the OS-default application menu rather than merging with it —
-/// without this section, the app has no About/Services/Hide/Quit, ⌘Q is
-/// dead, and macOS renders "File" in the application-name slot. Must stay the
-/// FIRST section [`build_menu_model`] returns (macOS treats the menu bar's
-/// first submenu as the application menu); [`app_section_is_first`] below
-/// pins that order so this cannot silently regress.
+/// The application submenu: About / Preferences… / Services / Hide family /
+/// Quit. This is the CRITICAL D3-review fix: `mod.rs` installs the whole menu
+/// bar wholesale via `AppHandle::set_menu`, which on macOS REPLACES the
+/// OS-default application menu rather than merging with it — without this
+/// section, the app has no About/Services/Hide/Quit, ⌘Q is dead, and macOS
+/// renders "File" in the application-name slot. Must stay the FIRST section
+/// [`build_menu_model`] returns (macOS treats the menu bar's first submenu as
+/// the application menu); [`app_section_is_first`] below pins that order so
+/// this cannot silently regress.
+///
+/// D4 adds Preferences here, between About and Services — exactly where
+/// macOS users expect `CmdOrCtrl+,` to live. It is the one real `Item` (with
+/// a `Command`) in an otherwise all-`Predefined` section; D3 deliberately
+/// left this slot empty (see `preferences_is_present_in_d4`'s doc for the
+/// history) because the window it opens did not exist yet.
 fn app_section() -> MenuSection {
     MenuSection {
         title: APP_NAME.into(),
         entries: vec![
             Entry::Predefined(Predefined::About),
+            Entry::Separator,
+            Entry::Item(Item {
+                id: PREFERENCES_ID.into(),
+                label: "Preferences…".into(),
+                accelerator: Some("CmdOrCtrl+,".into()),
+                enabled: true,
+                command: Some(Command::Preferences),
+            }),
             Entry::Separator,
             Entry::Predefined(Predefined::Services),
             Entry::Predefined(Predefined::Hide),
@@ -351,10 +370,13 @@ fn help_section() -> MenuSection {
 /// The pure builder: current windows + the recent-files store + the key
 /// (frontmost) window's label (if any) → the full menu model.
 ///
-/// **No Preferences item and no `CmdOrCtrl+,`** — D4 owns Preferences; a
-/// pre-D4 entry with nothing behind it would violate the "no orphaned or
-/// dead menu items" rule the gate enforces (see `preferences_is_absent_in_d3`
-/// below).
+/// **Preferences (D4):** the application section carries a real `Preferences…`
+/// item with `CmdOrCtrl+,`, dispatching `Command::Preferences` — see
+/// [`app_section`] and `preferences_is_present_in_d4` below. D3 deliberately
+/// shipped without it (there was no window yet to open); adding a menu entry
+/// with nothing behind it would have violated the "no orphaned or dead menu
+/// items" rule the gate enforces just as much as omitting it once the window
+/// exists would.
 ///
 /// **Context-sensitivity:** Export… and Reveal in Finder are meaningless
 /// unless the key window is a file. `key_label` is looked up against
@@ -453,13 +475,36 @@ mod tests {
         assert_eq!(acc("view.search"), Some("CmdOrCtrl+F".into()));
     }
 
+    /// Flips `preferences_is_absent_in_d3` (D3 shipped without Preferences —
+    /// there was no window yet to open; a menu entry with nothing behind it
+    /// would have broken the no-orphaned-items rule just as much as omitting
+    /// it now that the window exists would). D4 adds a real Preferences item
+    /// carrying `CmdOrCtrl+,`, sitting in the application section (the first
+    /// section — see `app_section_is_first_and_carries_quit`) right where
+    /// macOS users expect it, between About and Services.
     #[test]
-    fn preferences_is_absent_in_d3() {
-        // D4 adds it together with the window it opens. A dead item would
-        // break the no-orphaned-items rule the gate enforces.
+    fn preferences_is_present_in_d4() {
         let m = build_menu_model(&[], &[], None);
-        assert!(all_items(&m).iter().all(|i| !i.id.contains("preferences")));
-        assert!(all_items(&m).iter().all(|i| i.accelerator.as_deref() != Some("CmdOrCtrl+,")));
+        let prefs_item = all_items(&m)
+            .into_iter()
+            .find(|i| i.id == PREFERENCES_ID)
+            .expect("a Preferences item must exist");
+        assert_eq!(prefs_item.label, "Preferences…");
+        assert_eq!(prefs_item.accelerator.as_deref(), Some("CmdOrCtrl+,"));
+        assert!(prefs_item.enabled);
+        assert_eq!(prefs_item.command, Some(Command::Preferences));
+
+        // It lives in the application section specifically, not just
+        // somewhere in the model.
+        let first = &m.sections[0];
+        assert_eq!(first.title, APP_NAME);
+        assert!(
+            first.entries.iter().any(
+                |e| matches!(e, Entry::Item(i) if i.id == PREFERENCES_ID)
+            ),
+            "Preferences must sit in the application section: {:?}",
+            first.entries
+        );
     }
 
     #[test]
@@ -598,6 +643,7 @@ mod tests {
             focus_window: bool,
             about: bool,
             known_limits: bool,
+            preferences: bool,
         }
         let mut seen = Seen::default();
         for m in &models {
@@ -622,6 +668,7 @@ mod tests {
                         Command::FocusWindow(_) => seen.focus_window = true,
                         Command::About => seen.about = true,
                         Command::KnownLimits => seen.known_limits = true,
+                        Command::Preferences => seen.preferences = true,
                     }
                 }
             }
@@ -642,5 +689,6 @@ mod tests {
         assert!(seen.focus_window, "Command::FocusWindow never produced by any model build");
         assert!(seen.about, "Command::About never produced by any model build");
         assert!(seen.known_limits, "Command::KnownLimits never produced by any model build");
+        assert!(seen.preferences, "Command::Preferences never produced by any model build");
     }
 }

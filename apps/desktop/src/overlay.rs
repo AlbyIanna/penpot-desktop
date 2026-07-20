@@ -14,6 +14,11 @@
 //! a local exit criterion — tauri-driver has no macOS support — so they ride a
 //! manual-QA checklist (docs/milestones/n4.md); everything they *reach* (the
 //! ranked `/__api/vault/palette`, the `/__palette` page) is HTTP-gateable.
+//!
+//! D4 adds [`open_preferences`], the same "reuse-if-already-open by label"
+//! shape as [`toggle_palette`], for the native Preferences window
+//! (`/__preferences`) — see that function's doc for the one behavioral
+//! difference (it never hides on a second call).
 
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +26,9 @@ use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 
 /// The palette overlay window label.
 pub const PALETTE_LABEL: &str = "palette";
+
+/// D4 — the Preferences window label.
+pub const PREFERENCES_LABEL: &str = "preferences";
 
 /// A late-bound holder for the proxy origin (e.g. `http://localhost:8686`),
 /// shared by the shortcut handler and the tray. Filled once boot completes.
@@ -132,6 +140,47 @@ pub fn toggle_palette<R: Runtime>(app: &AppHandle<R>, proxy_slot: &ProxyUrlSlot)
             }
         }
         Err(e) => tracing::error!(url = %url, "bad palette url: {e}"),
+    }
+}
+
+/// D4 — open (or focus, if already open) the Preferences window at
+/// `/__preferences`. Reuse-if-already-open BY LABEL, the same mechanism
+/// [`toggle_palette`] uses to avoid duplicating the palette window. Unlike
+/// the palette this always SHOWS + FOCUSES rather than hiding on a second
+/// call: Preferences is opened from a plain menu command
+/// (`File > Preferences…` / `CmdOrCtrl+,`), not a toggle shortcut, so
+/// invoking it again while the window is already open should bring it
+/// forward, never hide it. A no-op (logged) if the proxy origin is not known
+/// yet (boot still in progress) — same posture as `toggle_palette`.
+pub fn open_preferences<R: Runtime>(app: &AppHandle<R>, proxy_slot: &ProxyUrlSlot) {
+    let origin = proxy_slot.lock().ok().and_then(|g| g.clone());
+    let Some(origin) = origin else {
+        tracing::info!("preferences requested before boot completed; ignoring");
+        return;
+    };
+    if let Some(win) = app.get_webview_window(PREFERENCES_LABEL) {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        return;
+    }
+    let url = format!("{}/__preferences", origin.trim_end_matches('/'));
+    match url.parse() {
+        Ok(parsed) => {
+            match WebviewWindowBuilder::new(app, PREFERENCES_LABEL, WebviewUrl::External(parsed))
+                .title("Preferences")
+                .inner_size(600.0, 640.0)
+                .min_inner_size(440.0, 420.0)
+                .resizable(true)
+                .decorations(true)
+                .focused(true)
+                .build()
+            {
+                Ok(_) => tracing::info!(url = %url, "preferences window opened"),
+                Err(e) => tracing::error!("failed to open preferences window: {e}"),
+            }
+        }
+        Err(e) => tracing::error!(url = %url, "bad preferences url: {e}"),
     }
 }
 

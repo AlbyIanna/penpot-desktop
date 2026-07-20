@@ -304,7 +304,7 @@ strip_ansi <"$CARGO_TEST_LOG" >"$CARGO_TEST_STRIPPED"
 # cross-reference this script against model.rs to know what a name proves.
 REQUIRED_TESTS=(
     "menubar::model::tests::app_section_is_first_and_carries_quit|the application submenu (About/Services/Hide/Quit) must be FIRST or macOS has no ⌘Q"
-    "menubar::model::tests::preferences_is_absent_in_d3|no dead Preferences item before D4 owns it"
+    "menubar::model::tests::preferences_is_present_in_d4|D4 flips D3's absence pin: Preferences now exists, carries CmdOrCtrl+,, and sits in the application section"
     "menubar::model::tests::every_enabled_item_carries_a_command|no-dead-items direction 1: every enabled row dispatches something"
     "menubar::model::tests::every_command_variant_is_produced_by_some_model_build|no-dead-items direction 2: every Command is reachable from some model build"
     "menubar::model::tests::item_ids_are_unique|duplicate ids would make command_for_id silently dispatch the wrong action"
