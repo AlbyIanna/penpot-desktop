@@ -6,6 +6,7 @@ license.workspace = true
 description = "Pure library for Penpot Local sync: normalization, semantic tree hash, manifest, two-phase dir swap, deterministic zip. No network, no processes."
 
 [dependencies]
+anyhow = { workspace = true }
 serde = { workspace = true }
 # float_roundtrip is REQUIRED for Python parity: without it serde_json parses
 # decimal floats with up to ~1 ulp error, so shortest-repr round-trips drift.

@@ -25,6 +25,7 @@ pub mod lock;
 pub mod manifest;
 pub mod normalize;
 pub mod swap;
+pub mod trash;
 mod util;
 pub mod ziputil;
 

@@ -36,8 +36,8 @@ pub mod query;
 mod http;
 
 pub use boards::{
-    assemble_cards, exports_rel_path, load_stem_map, resolve_thumb_path, thumb_url, BoardCard,
-    BoardListing, FileMeta, Sort,
+    assemble_cards, exports_rel_path, first_page_id, load_stem_map, resolve_thumb_path, thumb_url,
+    BoardCard, BoardListing, CardKind, FileMeta, Sort,
 };
 pub use contract::{
     diff_contracts, extract_contracts, Bump, Classification, Contract, FieldDelta, LibraryContract,

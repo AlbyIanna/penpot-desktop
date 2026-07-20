@@ -13,6 +13,7 @@ pub mod gitinit;
 pub mod home;
 pub mod installer;
 pub mod layout;
+pub mod manage;
 pub mod navprobe;
 pub mod navwatch;
 pub mod overlay;
@@ -931,12 +932,39 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     });
     let packages_routes = packages::router(packages_state.clone());
 
+    // --- D2 manage routes (create/rename/move/delete) -----------------------
+    // Create/rename/move are pure RPC passthroughs behind
+    // `/__api/vault/manage/*`: they change the DB and the sync daemon carries
+    // the result to the folder tree on its normal poll. Delete additionally
+    // touches the vault and must pause the daemon across the operation (see
+    // `manage.rs`'s module docs), which needs a live `SyncControl` — but the
+    // daemon (below) is not spawned yet at this point in `boot`, and this
+    // router is handed to axum as an immutable `Arc<ManageState>` right here.
+    // So `sync` late-binds through a shared `OnceLock`: this state starts
+    // with it empty, and the moment the daemon spawns below we `.set()` the
+    // same cell (mirrors `home.rs`'s late-bound `strip_rx` watch channel —
+    // just a one-shot cell instead of a stream, since there's only one value
+    // to hand over). A delete that lands before that `.set()` is rejected by
+    // `manage::delete_file`, not silently un-paused — see the `sync` field
+    // doc on `ManageState`.
+    let manage_sync = Arc::new(std::sync::OnceLock::<sync_daemon::SyncControl>::new());
+    let manage_state = Arc::new(manage::ManageState {
+        backend_base: readiness.backend_base_url.clone(),
+        token: credentials.access_token.clone(),
+        team_id: team_id.clone(),
+        vault_root: config.designs_dir.clone(),
+        sync: manage_sync.clone(),
+        delete_lock: tokio::sync::Mutex::new(()),
+    });
+    let manage_routes = manage::router(manage_state);
+
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
         .merge(home_routes)
         .merge(checkpoint_routes)
         .merge(templates_routes)
         .merge(packages_routes)
+        .merge(manage_routes)
         .merge(navprobe::router());
 
     let mut proxy_config = proxy::ProxyConfig::new(
@@ -984,6 +1012,13 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
                 "starting sync daemon"
             );
             let handle = sync_daemon::spawn(rpc, sync_config);
+            // Late-bind the D2 delete route's pause/resume handle now that a
+            // real one exists — see the long comment at `manage_sync`'s
+            // definition above. `.set()` can only fail if it's already been
+            // set, which never happens (this runs once, here).
+            if manage_sync.set(handle.control()).is_err() {
+                tracing::error!("manage_sync OnceLock was already set — this should be unreachable");
+            }
             // E3 boot re-link reconcile: the daemon resurrects vault files by id
             // (M2), but each lock link's DB-side file_library_rel does NOT ride
             // the binfile — re-derive it once its endpoints are live. Idempotent;

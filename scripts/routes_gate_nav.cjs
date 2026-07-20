@@ -10,7 +10,12 @@
  *      /#/workspace?team-id&file-id&page-id deep link the card advertised
  *      (read from its data-deeplink attribute — same string the
  *      /__api/vault/boards payload emitted).
- *   2. Trigger the escape hatch, assert the landed URL is /#/dashboard/recent.
+ *   2. (D2) Assert the escape hatch to the upstream dashboard is ABSENT from
+ *      /__home. navwatch.rs now cancels #/dashboard unconditionally and
+ *      redirects back here, so the link was removed rather than left as a
+ *      visible control the navigation policy silently cancels. This leg used
+ *      to click the hatch and assert it landed on /#/dashboard/recent; it now
+ *      asserts the inverse so the hatch cannot be reintroduced unnoticed.
  *   3. (N4) Build the viewer deep link for the first board from the
  *      /__api/vault/boards payload (file-id, page-id, frame-id=board-id,
  *      section=interactions — the Peek "Present" route) and assert it commits
@@ -86,41 +91,37 @@ function fail(msg) {
       );
     }
 
-    // --- (2) escape hatch -> /#/dashboard/recent -------------------------
+    // --- (2) escape hatch is ABSENT (D2 closed the dashboard) ------------
     await page.goto(BASE + "/__home", { waitUntil: "domcontentloaded" });
-    const hatch = await page.waitForSelector("#escape-hatch", { timeout: NAV_TIMEOUT });
-    const hatchHref = await hatch.getAttribute("href");
-    const expectedDash = BASE + "/#/dashboard/recent";
-    if (hatchHref !== "/#/dashboard/recent") {
-      fail("escape hatch href is " + hatchHref + ", expected /#/dashboard/recent");
-    }
-    await Promise.all([
-      page.waitForURL((u) => u.toString().includes("#/dashboard/recent"), {
-        waitUntil: "commit",
-        timeout: NAV_TIMEOUT,
-      }),
-      hatch.click(),
-    ]);
-    const landedDash = page.url();
-    result.dashboard = {
-      expected: expectedDash,
-      landed: landedDash,
-      pass: landedDash === expectedDash,
-    };
+    // Give the page a moment to finish its initial render before asserting
+    // absence — otherwise a slow-to-render page could false-pass.
+    await page.waitForSelector("#grid", { timeout: NAV_TIMEOUT });
+    const hatchCount = await page.locator("#escape-hatch").count();
+    result.dashboard = { hatchCount: hatchCount, pass: hatchCount === 0 };
     if (!result.dashboard.pass) {
-      fail("escape hatch landed on " + landedDash + " but expected " + expectedDash);
+      fail("#escape-hatch is present on /__home (" + hatchCount + " match(es)) — it must stay removed now that #/dashboard is cancelled unconditionally");
     }
 
     // --- (3) N4 viewer route -> /#/view (Peek "Present") -----------------
+    // MUST be a real board (kind === "board"), never D2's placeholder file
+    // card (kind === "file", boardId = "file:<uuid>", vault-index's
+    // `CardKind::File` — see crates/vault-index/src/boards.rs). frame-id in
+    // the viewer URL below is that boardId: a placeholder's synthetic
+    // "file:<uuid>" still commits as a /#/view navigation (Penpot doesn't
+    // validate frame-id exists before routing), which would make this leg
+    // pass while pointing at a frame that does not exist — "could not find a
+    // board to test with" must never read as "the test passed", so this
+    // fails loudly instead of silently falling back to the first card.
     await page.goto(BASE + "/__home", { waitUntil: "domcontentloaded" });
     const board = await page.evaluate(async () => {
       const r = await fetch("/__api/vault/boards");
       if (!r.ok) return null;
       const j = await r.json();
-      return (j.boards && j.boards[0]) || null;
+      const boards = (j.boards || []).filter((b) => b && b.kind === "board");
+      return boards[0] || null;
     });
     if (!board || !board.fileId || !board.pageId || !board.boardId) {
-      fail("could not read a board from /__api/vault/boards for the viewer leg");
+      fail("could not find a real board to test with (only placeholder file cards, if any, were indexed)");
     }
     const viewerLink =
       "/#/view?file-id=" + encodeURIComponent(board.fileId) +

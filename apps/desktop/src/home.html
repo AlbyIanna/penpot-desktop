@@ -1,8 +1,12 @@
 <!--
   N3 lighttable home — the vault's front door. Plain HTML + vanilla JS, no
   framework, served same-origin at /__home (auth cookie already set by
-  /__bootstrap). Card clicks deep-link into the SPA at /#/workspace?…; the
-  escape hatch drops to the upstream dashboard at /#/dashboard/recent.
+  /__bootstrap). Card clicks deep-link into the SPA at /#/workspace?….
+
+  D2: the escape hatch to the upstream dashboard (/#/dashboard/recent) is
+  gone — navwatch.rs now cancels #/dashboard unconditionally and redirects
+  back here, so a visible link the navigation policy would silently cancel
+  is worse than no link at all. This page is the only front door now.
 
   N4 (grid fix + Peek): the board grid refreshes by keyed DIFF/PATCH — never
   `innerHTML=""` on the interval or on filter — so scroll position AND the
@@ -10,6 +14,16 @@
   arrow keys move a persistent focus between cards; Space opens a full-size
   preview served from the board's .exports; arrows flip through siblings; Esc
   closes; "Present" opens the upstream viewer (/#/view?…).
+
+  D2 gap fix: a file created through this page's "New file" has a page but no
+  board yet, so `/__api/vault/boards` now carries a placeholder card for it
+  (`kind: "file"`) alongside the real board cards — otherwise a file the user
+  just created here would be invisible and its rename/duplicate/move/delete
+  buttons (the only way to reach those verbs since the dashboard closed)
+  unreachable. Placeholder cards carry the SAME `data-file-id`/
+  `data-project-id` action-button contract as a board card; they're keyed by
+  a synthetic `"file:"`-prefixed id (never colliding with a real board uuid)
+  so the keyed diff/patch grid below needs no separate code path for them.
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -56,11 +70,14 @@
     padding: 5px 11px; border-radius: 7px; background: var(--bg); white-space: nowrap; cursor: pointer;
   }
   button.bar:hover { border-color: var(--accent); }
-  a.escape {
-    text-decoration: none; color: var(--accent); border: 1px solid var(--border);
-    padding: 5px 11px; border-radius: 7px; background: var(--bg); white-space: nowrap;
+
+  .card-actions { display: flex; gap: 6px; padding: 6px 8px 8px; flex-wrap: wrap; }
+  .card-action {
+    font: inherit; font-size: 12px; padding: 2px 8px; cursor: pointer;
+    color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px;
   }
-  a.escape:hover { border-color: var(--accent); }
+  .card-action:hover { border-color: var(--accent); }
 
   main { padding: 18px; }
   #grid {
@@ -81,6 +98,10 @@
     aspect-ratio: 4 / 3; background: var(--placeholder); position: relative;
     display: flex; align-items: center; justify-content: center; overflow: hidden;
   }
+  /* D2 gap fix: a file-without-boards card is subtly distinct — same card
+     shape, same CSS-variable vocabulary, just a dashed thumb edge instead of
+     a solid one, so it reads as "not yet a board" rather than "broken". */
+  a.board-card.file-card .thumb { border-bottom: 1px dashed var(--border); }
   .thumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .thumb .placeholder {
     color: var(--muted); font-size: 12px; text-align: center; padding: 8px;
@@ -117,6 +138,7 @@
     background: transparent; border-radius: 7px; padding: 4px 10px;
   }
   #peek .peekbar button.present { border-color: var(--accent); color: #fff; }
+  #peek .peekbar button:disabled { opacity: .4; cursor: not-allowed; }
   #peek .hint { margin-top: 10px; color: #8a94a0; font-size: 12px; }
 
   /* activity / conflict strip */
@@ -148,6 +170,23 @@
   }
   #strip .paused { color: var(--pending); font-weight: 600; }
   #strip .spacer { margin-left: auto; }
+
+  /* D2: tiny picker dialog — replaces window.prompt("...project id?") with a
+     <select> over the real project list. Not a modal framework: one overlay,
+     one purpose, same plain-DOM idiom as #peek. */
+  #project-picker {
+    position: fixed; inset: 0; z-index: 25; background: rgba(8,10,13,.5);
+    display: none; align-items: center; justify-content: center;
+  }
+  #project-picker.open { display: flex; }
+  #project-picker .dialog {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px; min-width: 280px; box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  #project-picker .dialog-title { font-weight: 600; }
+  #project-picker select { width: 100%; }
+  #project-picker .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 </style>
 </head>
 <body>
@@ -166,13 +205,14 @@
       </label>
       <input type="search" id="filter" placeholder="Filter by name…" />
       <button class="bar" id="checkpoint-btn" title="One labeled git commit of the vault">Checkpoint now</button>
-      <a class="escape" id="escape-hatch" href="/#/dashboard/recent">Open dashboard ↗</a>
+      <button class="bar" id="new-project" type="button">New project</button>
+      <button class="bar" id="new-file" type="button">New file</button>
     </div>
   </header>
 
   <main>
     <div id="grid"></div>
-    <div class="empty" id="empty" hidden>No boards in this vault yet. Create one from the dashboard, then it appears here.</div>
+    <div class="empty" id="empty" hidden>Your vault is empty. Click "New project" above, then "New file" to create your first one — it appears here right away.</div>
   </main>
 
   <!-- Peek overlay (N4 pillar 5) -->
@@ -185,6 +225,18 @@
       <button id="peek-close" type="button">Close</button>
     </div>
     <div class="hint">← → flip boards · Esc close · Enter open</div>
+  </div>
+
+  <!-- D2: project picker dialog (Move to project / etc.) -->
+  <div id="project-picker" aria-hidden="true">
+    <div class="dialog">
+      <div class="dialog-title" id="picker-title">Choose a project</div>
+      <select id="picker-select"></select>
+      <div class="dialog-actions">
+        <button class="card-action" type="button" id="picker-cancel">Cancel</button>
+        <button class="card-action" type="button" id="picker-ok">OK</button>
+      </div>
+    </div>
   </div>
 
   <div id="strip"><span class="line">Loading activity…</span></div>
@@ -200,6 +252,8 @@
   var filterInput = document.getElementById("filter");
   var stripEl = document.getElementById("strip");
   var checkpointBtn = document.getElementById("checkpoint-btn");
+  var newProjectBtn = document.getElementById("new-project");
+  var newFileBtn = document.getElementById("new-file");
 
   var allBoards = [];
   // Keyed card cache: boardId -> { el, data, imgSrc }. THE grid-fix substrate:
@@ -209,11 +263,36 @@
   var shownBoards = [];       // the currently-visible boards, in order
   var focusedId = null;       // boardId of the persistent focused card
 
+  // D2: the project <select>'s option list is now populated from
+  // /__api/vault/manage/projects (authoritative — reads the DB, includes
+  // projects with zero files) instead of from the board-derived list the
+  // /__api/vault/boards response carries. That board-derived list is
+  // disk-only by design (crates/vault-index): a project the user just
+  // created has no synced files yet, therefore no folder on disk, therefore
+  // it never appeared in the old picker. `projectsList` is [{id, name}],
+  // kept only for the picker + the "Move" dialog; `lastProjectIdsKey` lets
+  // loadProjects() skip rebuilding the <select> DOM (and so leave the user's
+  // current selection untouched) when the id set hasn't actually changed —
+  // this runs on every 5s poll, and a control that resets itself every poll
+  // is unusable.
+  var projectsList = [];
+  var lastProjectIdsKey = null;
+
   function placeholderSvg() {
     return '<span class="placeholder">' +
       '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">' +
       '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 15l5-4 4 3 5-5 4 4"/>' +
       '<circle cx="8.5" cy="8.5" r="1.5"/></svg><span>No preview yet</span></span>';
+  }
+
+  // D2 gap fix: a distinct placeholder for a file that has no boards yet at
+  // all (vs. a board that simply hasn't been rendered yet) — a plain-file
+  // icon instead of the board-grid one, same muted styling.
+  function fileCardPlaceholderSvg() {
+    return '<span class="placeholder">' +
+      '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">' +
+      '<path d="M6 2h9l4 4v16H6z"/><path d="M15 2v4h4"/>' +
+      '</svg><span>No boards yet</span></span>';
   }
 
   function fillThumb(thumb, b) {
@@ -225,19 +304,59 @@
       img.onerror = function () { thumb.innerHTML = placeholderSvg(); };
       thumb.appendChild(img);
     } else {
-      thumb.innerHTML = placeholderSvg();
+      thumb.innerHTML = b.kind === "file" ? fileCardPlaceholderSvg() : placeholderSvg();
     }
+  }
+
+  // Card subtitle: project name, plus an explicit "page not found yet" note
+  // for the rare placeholder card whose deep link had to omit page-id (see
+  // vault-index's `boards::first_page_id` — it never guesses one). Making
+  // this visible is the point: a card that silently linked to a page-less
+  // URL would look broken with no explanation.
+  function subText(b) {
+    var extra = (b.kind === "file" && !b.pageId) ? " · page not found yet" : "";
+    return b.project + extra;
+  }
+
+  function fallbackName(b) {
+    return b.kind === "file" ? "(untitled file)" : "(unnamed board)";
+  }
+
+  // Every button below carries data-file-id (+ data-project-id for actions
+  // that need it) so the ONE delegated grid listener always acts on the
+  // right board, never a stale one left over from a recycled card.
+  function cardActionsEl(b) {
+    var actions = document.createElement("div");
+    actions.className = "card-actions";
+    [
+      ["rename", "Rename"],
+      ["duplicate", "Duplicate"],
+      ["move", "Move to project"],
+      ["delete", "Move to trash"],
+    ].forEach(function (pair) {
+      var btn = document.createElement("button");
+      btn.className = "card-action";
+      btn.type = "button";
+      btn.setAttribute("data-action", pair[0]);
+      btn.setAttribute("data-file-id", b.fileId);
+      btn.setAttribute("data-project-id", b.projectId);
+      btn.title = pair[1];
+      btn.textContent = pair[1];
+      actions.appendChild(btn);
+    });
+    return actions;
   }
 
   function cardEl(b) {
     var a = document.createElement("a");
-    a.className = "board-card";
+    a.className = "board-card" + (b.kind === "file" ? " file-card" : "");
     a.href = b.deepLink;
     a.tabIndex = 0;
     a.setAttribute("data-deeplink", b.deepLink);
     a.setAttribute("data-board-id", b.boardId);
     a.setAttribute("data-project", b.project);
     a.setAttribute("data-name", b.name);
+    a.setAttribute("data-kind", b.kind);
 
     var thumb = document.createElement("div");
     thumb.className = "thumb";
@@ -247,15 +366,16 @@
     meta.className = "meta";
     var bn = document.createElement("div");
     bn.className = "bname";
-    bn.textContent = b.name || "(unnamed board)";
+    bn.textContent = b.name || fallbackName(b);
     var bs = document.createElement("div");
     bs.className = "bsub";
-    bs.textContent = b.project;
+    bs.textContent = subText(b);
     meta.appendChild(bn);
     meta.appendChild(bs);
 
     a.appendChild(thumb);
     a.appendChild(meta);
+    a.appendChild(cardActionsEl(b));
 
     a.addEventListener("focus", function () { focusedId = b.boardId; });
     return a;
@@ -263,6 +383,9 @@
 
   // Update a reused card's mutable bits in place (name, project, deep link,
   // thumbnail) without recreating the node — preserves focus + scroll.
+  // `kind` is NOT patched here: it is intrinsic to the card's key (boardId
+  // for a board, "file:"+fileId for a placeholder) and never changes for a
+  // given key across refreshes.
   function patchCard(el, b, prev) {
     if (!prev || prev.deepLink !== b.deepLink) {
       el.href = b.deepLink;
@@ -270,11 +393,11 @@
     }
     if (!prev || prev.name !== b.name) {
       el.setAttribute("data-name", b.name);
-      el.querySelector(".bname").textContent = b.name || "(unnamed board)";
+      el.querySelector(".bname").textContent = b.name || fallbackName(b);
     }
-    if (!prev || prev.project !== b.project) {
+    if (!prev || prev.project !== b.project || prev.pageId !== b.pageId) {
       el.setAttribute("data-project", b.project);
-      el.querySelector(".bsub").textContent = b.project;
+      el.querySelector(".bsub").textContent = subText(b);
     }
     // Only rebuild the thumbnail if its URL actually changed (avoid flicker).
     if (!prev || prev.thumb !== b.thumb) {
@@ -282,12 +405,25 @@
       thumb.innerHTML = "";
       fillThumb(thumb, b);
     }
+    // Cards are recycled by the keyed diff (reused DOM node, same boardId
+    // slot). If the owning file or project ever changed under that slot, a
+    // stale data-file-id/data-project-id left on the action buttons would
+    // fire the next click against the wrong file — refresh them too.
+    if (!prev || prev.fileId !== b.fileId || prev.projectId !== b.projectId) {
+      var actionBtns = el.querySelectorAll(".card-action");
+      for (var i = 0; i < actionBtns.length; i++) {
+        actionBtns[i].setAttribute("data-file-id", b.fileId);
+        actionBtns[i].setAttribute("data-project-id", b.projectId);
+      }
+    }
     el.__data = b;
   }
 
   function dataChanged(a, b) {
     return !a || a.name !== b.name || a.project !== b.project ||
-      a.deepLink !== b.deepLink || a.thumb !== b.thumb;
+      a.deepLink !== b.deepLink || a.thumb !== b.thumb ||
+      a.fileId !== b.fileId || a.projectId !== b.projectId ||
+      a.pageId !== b.pageId;
   }
 
   // Keyed diff/patch reconciliation. Never clears the grid; reuses nodes so
@@ -330,7 +466,10 @@
       prevEl = entry.el;
     });
 
-    countEl.textContent = shownBoards.length + (shownBoards.length === 1 ? " board" : " boards");
+    // "items" not "boards": the grid now mixes real board cards with D2 gap-
+    // fix placeholder cards for boardless files, so a literal board count
+    // would undercount what's actually shown.
+    countEl.textContent = shownBoards.length + (shownBoards.length === 1 ? " item" : " items");
     emptyEl.hidden = shownBoards.length !== 0;
 
     // Restore focus to the tracked card if it is still shown (moves via
@@ -342,27 +481,77 @@
     }
   }
 
+  // `/__api/vault/boards?project=` filters by project NAME (it matches
+  // against the manifest's project_name — see vault-index's boards.rs), not
+  // id. The picker's <select> is keyed by id now (see loadProjects below),
+  // so resolve the selected id back to a name here rather than changing the
+  // boards route's filter contract.
+  function selectedProjectName() {
+    var id = projectSel.value;
+    if (!id) return null;
+    for (var i = 0; i < projectsList.length; i++) {
+      if (projectsList[i].id === id) return projectsList[i].name;
+    }
+    return null;
+  }
+
   function loadBoards() {
     var params = new URLSearchParams();
-    if (projectSel.value) params.set("project", projectSel.value);
+    var name = selectedProjectName();
+    if (name) params.set("project", name);
     params.set("sort", sortSel.value);
     fetch("/__api/vault/boards?" + params.toString())
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (data) {
         allBoards = data.boards || [];
-        var cur = projectSel.value;
-        projectSel.innerHTML = '<option value="">All projects</option>';
-        (data.projects || []).forEach(function (p) {
-          var o = document.createElement("option");
-          o.value = p; o.textContent = p;
-          if (p === cur) o.selected = true;
-          projectSel.appendChild(o);
-        });
+        // NOTE: data.projects (board-derived project names) is deliberately
+        // ignored here — the picker's option list now comes from
+        // loadProjects()/manage/projects, the authoritative source. Keeping
+        // this response's own board-derived filtering behaviour (the
+        // `project` query param above) intact is the point; only where the
+        // <select>'s OPTIONS come from changed.
         render();
       })
       .catch(function () {
         countEl.textContent = "index warming up…";
         setTimeout(loadBoards, 1500);
+      });
+  }
+
+  // `GET /__api/vault/manage/projects` — the authoritative project list
+  // (reads the Penpot DB directly, so it includes a project the instant it's
+  // created, before any file syncs to disk). Rebuilds the <select> options
+  // only when the id set actually changed (lastProjectIdsKey), and otherwise
+  // leaves the control alone — repopulating on every 5s poll must not reset
+  // whatever the user currently has selected. Pass `selectId` to force that
+  // project selected once the fetch lands (used right after "New project" so
+  // "New file" works immediately, without waiting for anything to sync).
+  function loadProjects(selectId) {
+    return fetch("/__api/vault/manage/projects")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        projectsList = (data.projects || []).slice().sort(function (a, b) {
+          return a.name.localeCompare(b.name);
+        });
+        var key = projectsList.map(function (p) { return p.id; }).join(" ");
+        var cur = projectSel.value;
+        if (key !== lastProjectIdsKey) {
+          lastProjectIdsKey = key;
+          projectSel.innerHTML = '<option value="">All projects</option>';
+          projectsList.forEach(function (p) {
+            var o = document.createElement("option");
+            o.value = p.id; o.textContent = p.name;
+            projectSel.appendChild(o);
+          });
+        }
+        var target = selectId || cur;
+        if (target && projectsList.some(function (p) { return p.id === target; })) {
+          projectSel.value = target;
+        }
+      })
+      .catch(function () {
+        // Transient failure (e.g. token not issued yet during provisioning).
+        // Leave the picker as-is; the 5s poll below retries.
       });
   }
 
@@ -402,7 +591,7 @@
     if (i < 0 || i >= shownBoards.length) return;
     peekIndex = i;
     var b = shownBoards[i];
-    peekName.textContent = b.name || "(unnamed board)";
+    peekName.textContent = b.name || fallbackName(b);
     peekSub.textContent = b.project + (b.relPath ? " · " + b.relPath : "");
     peekFrame.innerHTML = "";
     if (b.thumb) {
@@ -413,10 +602,18 @@
         peekFrame.innerHTML = '<div class="placeholder">No render yet for this board.<br>It will appear once the exporter renders it.</div>';
       };
       peekFrame.appendChild(img);
+    } else if (b.kind === "file") {
+      peekFrame.innerHTML = '<div class="placeholder">This file has no boards yet.<br>Add one in the editor to get a preview here.</div>';
     } else {
       peekFrame.innerHTML = '<div class="placeholder">No render yet for this board.<br>It will appear once the exporter renders it.</div>';
     }
-    peekPresent.onclick = function () { window.location.assign(presentLink(b)); };
+    // There is no board/frame to present for a boardless placeholder card —
+    // disable rather than build a "presentLink" that 404s silently.
+    peekPresent.disabled = b.kind === "file";
+    peekPresent.onclick = function () {
+      if (b.kind === "file") return;
+      window.location.assign(presentLink(b));
+    };
     peekOpen.onclick = function () { window.location.assign(b.deepLink); };
     peek.classList.add("open");
     peek.setAttribute("aria-hidden", "false");
@@ -439,6 +636,12 @@
   peek.addEventListener("click", function (e) { if (e.target === peek) closePeek(); });
 
   document.addEventListener("keydown", function (e) {
+    // The project picker dialog is modal when open (defined further down;
+    // `picker` is a hoisted `var` so this closure sees it once assigned).
+    if (picker.classList.contains("open")) {
+      if (e.key === "Escape") { e.preventDefault(); closePicker(null); }
+      return;
+    }
     // Peek is modal when open.
     if (peek.classList.contains("open")) {
       if (e.key === "Escape") { e.preventDefault(); closePeek(); }
@@ -489,8 +692,33 @@
     return b;
   }
 
+  // Short-lived message shown in the strip (e.g. a failed create/rename/
+  // duplicate/move/delete). No such helper existed before this — reused
+  // rather than alert(), and cleared automatically once it expires or a
+  // newer message replaces it.
+  var tempMsg = null;         // { text: string, until: epoch-ms } | null
+  var lastStripModel = null;  // last model from pollStrip, so a message can
+                               // repaint the strip immediately without
+                               // waiting for the next poll tick.
+
+  function setStripMessage(text) {
+    tempMsg = { text: text, until: Date.now() + 5000 };
+    renderStrip(lastStripModel || { rows: [] });
+  }
+
   function renderStrip(m) {
     stripEl.innerHTML = "";
+    if (tempMsg) {
+      if (Date.now() > tempMsg.until) {
+        tempMsg = null;
+      } else {
+        var tm = document.createElement("span");
+        tm.className = "line";
+        tm.id = "strip-message";
+        tm.textContent = tempMsg.text;
+        stripEl.appendChild(tm);
+      }
+    }
     var conflicts = (m.rows || []).filter(function (r) { return r.isConflict; });
     conflicts.forEach(function (r) {
       var box = document.createElement("span");
@@ -565,7 +793,7 @@
   function pollStrip() {
     fetch("/__api/vault/strip")
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
-      .then(renderStrip)
+      .then(function (m) { lastStripModel = m; renderStrip(m); })
       .catch(function () { /* keep last render */ });
   }
 
@@ -586,16 +814,146 @@
       });
   });
 
+  // ---- D2: create / rename / duplicate / move / delete -------------------
+  async function post(path, body) {
+    var res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    return data;
+  }
+
+  // D2: a small picker dialog over `projectsList`, replacing the raw
+  // "Target project id?" window.prompt with an actual list of projects —
+  // asking a human to type a UUID is not a real workflow. Promise-based so
+  // the one grid click handler below can `await` it like any other step;
+  // resolves the chosen project id, or null on cancel / empty list.
+  var picker = document.getElementById("project-picker");
+  var pickerTitle = document.getElementById("picker-title");
+  var pickerSelect = document.getElementById("picker-select");
+  var pickerOk = document.getElementById("picker-ok");
+  var pickerCancel = document.getElementById("picker-cancel");
+  var pickerResolve = null;
+
+  function closePicker(result) {
+    picker.classList.remove("open");
+    picker.setAttribute("aria-hidden", "true");
+    var resolve = pickerResolve;
+    pickerResolve = null;
+    if (resolve) resolve(result);
+  }
+
+  function chooseProject(title, excludeProjectId) {
+    return new Promise(function (resolve) {
+      var options = projectsList.filter(function (p) { return p.id !== excludeProjectId; });
+      if (!options.length) { resolve(null); return; }
+      pickerTitle.textContent = title;
+      pickerSelect.innerHTML = "";
+      options.forEach(function (p) {
+        var o = document.createElement("option");
+        o.value = p.id; o.textContent = p.name;
+        pickerSelect.appendChild(o);
+      });
+      pickerResolve = resolve;
+      picker.classList.add("open");
+      picker.setAttribute("aria-hidden", "false");
+      pickerSelect.focus();
+    });
+  }
+
+  pickerOk.addEventListener("click", function () { closePicker(pickerSelect.value || null); });
+  pickerCancel.addEventListener("click", function () { closePicker(null); });
+  picker.addEventListener("click", function (e) { if (e.target === picker) closePicker(null); });
+
+  // One delegated listener: cards are recycled by the keyed patch path, so
+  // per-card handlers would leak and could fire against a stale file id.
+  grid.addEventListener("click", async function (ev) {
+    var btn = ev.target.closest(".card-action");
+    if (!btn) return;
+    ev.preventDefault();           // the card itself is an <a>; don't navigate
+    ev.stopPropagation();
+    var fileId = btn.getAttribute("data-file-id");
+    var action = btn.getAttribute("data-action");
+    if (!fileId) return;
+    try {
+      if (action === "rename") {
+        var newName = window.prompt("New name?");
+        if (!newName) return;
+        await post("/__api/vault/manage/rename", { kind: "file", id: fileId, name: newName });
+      } else if (action === "duplicate") {
+        var copyName = window.prompt("Name for the copy?");
+        if (!copyName) return;
+        await post("/__api/vault/manage/duplicate", {
+          fileId: fileId, name: copyName, projectId: btn.getAttribute("data-project-id"),
+        });
+      } else if (action === "move") {
+        if (!projectsList.length) {
+          setStripMessage("Projects not loaded yet — try again in a moment.");
+          return;
+        }
+        var targetProjectId = await chooseProject("Move to which project?", btn.getAttribute("data-project-id"));
+        if (!targetProjectId) return;
+        await post("/__api/vault/manage/move", { fileIds: [fileId], projectId: targetProjectId });
+      } else if (action === "delete") {
+        if (!window.confirm("Move this file to the vault trash?")) return;
+        await post("/__api/vault/manage/delete", { fileId: fileId });
+      }
+      // No optimistic update: the daemon polls on its own cadence and the
+      // vault index lags one poll further behind that, so loadBoards() here
+      // will often still show the pre-action state. That's expected — the
+      // existing 5s interval below converges once the daemon and index catch
+      // up.
+      loadBoards();
+    } catch (e) {
+      setStripMessage("Action failed: " + e.message);
+    }
+  });
+
+  newProjectBtn.addEventListener("click", async function () {
+    var name = window.prompt("Project name?");
+    if (!name) return;
+    try {
+      var res = await post("/__api/vault/manage/project", { name: name });
+      // The create response already carries the new project's id — use it to
+      // both refresh the picker from the authoritative endpoint AND select
+      // the new project, so "New file" works immediately without waiting for
+      // anything to sync to disk first (the bug this route exists to fix).
+      await loadProjects(res.projectId);
+      loadBoards();
+    }
+    catch (e) { setStripMessage("Could not create the project: " + e.message); }
+  });
+
+  newFileBtn.addEventListener("click", async function () {
+    var projectId = projectSel.value;
+    if (!projectId) {
+      setStripMessage("Pick a project first, then New file.");
+      return;
+    }
+    var name = window.prompt("File name?");
+    if (!name) return;
+    try { await post("/__api/vault/manage/file", { projectId: projectId, name: name }); loadBoards(); }
+    catch (e) { setStripMessage("Could not create the file: " + e.message); }
+  });
+
   projectSel.addEventListener("change", loadBoards);
   sortSel.addEventListener("change", loadBoards);
   filterInput.addEventListener("input", render);
 
+  loadProjects();
   loadBoards();
   pollStrip();
   setInterval(pollStrip, 1200);
   // Refresh the grid periodically so card thumbnails/recency reflect syncs.
   // This now diff/patches (scroll + focus preserved) instead of rebuilding.
-  setInterval(loadBoards, 5000);
+  // loadProjects() rides along so a project created/deleted elsewhere (or
+  // whose deletedAt just landed) eventually shows up here too — it only
+  // touches the <select>'s DOM when the id set actually changed, so this
+  // does not reset the user's current selection every 5s.
+  setInterval(function () { loadProjects(); loadBoards(); }, 5000);
 })();
 </script>
 </body>

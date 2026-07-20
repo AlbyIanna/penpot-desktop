@@ -97,6 +97,7 @@ async fn list_palette(
                     id.clone(),
                     FileMeta {
                         project: e.project_name.clone(),
+                        project_id: e.project_id.clone(),
                         rel_path: e.path.clone(),
                         last_synced_at: e.last_synced_at.clone(),
                     },
@@ -174,6 +175,7 @@ async fn list_boards(
                     id.clone(),
                     FileMeta {
                         project: e.project_name.clone(),
+                        project_id: e.project_id.clone(),
                         rel_path: e.path.clone(),
                         last_synced_at: e.last_synced_at.clone(),
                     },
@@ -201,6 +203,13 @@ async fn list_boards(
                     .join(boards::exports_rel_path(&m.rel_path))
                     .join(format!("{}.png", stem_map.get(board_id).unwrap()));
                 png.is_file().then(|| boards::thumb_url(&m.rel_path, board_id))
+            },
+            // D2 gap fix: a placeholder card's deep link, when derivable —
+            // one small `read_dir` (no JSON parse), and only for files with
+            // zero indexed boards (a shrinking set as boards get created).
+            |owner| {
+                let m = meta.get(owner)?;
+                boards::first_page_id(&vault_root, &m.rel_path, owner)
             },
             project.as_deref(),
             sort,

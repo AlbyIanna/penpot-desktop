@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -226,6 +227,7 @@ pub(crate) async fn run(
     mut shutdown: watch::Receiver<bool>,
     status: StatusHub,
     mut pause_rx: watch::Receiver<bool>,
+    idle_ack: Arc<watch::Sender<()>>,
 ) {
     let poll_interval = cfg.poll_interval;
     let mut engine = match Engine::new(client, cfg, status) {
@@ -257,6 +259,12 @@ pub(crate) async fn run(
             return;
         }
         if *pause_rx.borrow() {
+            // Reached this line without calling `reconcile()` below, so
+            // nothing is mid-write right now — safe to ack a caller blocked
+            // in `pause_and_wait_idle` (D2 delete can otherwise land while
+            // this pre-loop is retrying reconciliation forever against a
+            // still-settling backend).
+            let _ = idle_ack.send(());
             tokio::select! {
                 _ = shutdown.changed() => return,
                 _ = pause_rx.changed() => {}
@@ -307,7 +315,16 @@ pub(crate) async fn run(
                     engine.sweep_deadline = None;
                     tracing::info!("sync paused");
                 } else {
-                    tracing::info!("sync resumed; rescanning the sync root");
+                    // Reload the manifest FIRST: something may have rewritten
+                    // `.penpot-sync.json` on disk while we were paused (D2
+                    // delete's `trash_file` runs exactly there), and our
+                    // in-memory copy has no way to know. Without this, the
+                    // next unrelated `manifest.save()` (any export) would
+                    // silently write a trashed entry back to disk. Mirrors
+                    // `rescan_disk` below, which does the same "trust
+                    // nothing we cached" thing for the FS side.
+                    tracing::info!("sync resumed; reloading the manifest and rescanning the sync root");
+                    engine.reload_manifest();
                     engine.rescan_disk();
                 }
             }
@@ -326,6 +343,16 @@ pub(crate) async fn run(
                     engine.poll_cycle().await;
                 }
             }
+        }
+        // Every branch above runs its work to completion before `select!`
+        // returns, so reaching here while paused means no export/import/
+        // reconcile is mid-flight right now — safe to ack a caller blocked
+        // in `pause_and_wait_idle`. Sent every idle iteration (each tick,
+        // not just on the transition into pause), which is what lets a
+        // `pause_and_wait_idle` call that starts mid-pause still get an ack
+        // promptly instead of waiting for the next pause/resume edge.
+        if *pause_rx.borrow() {
+            let _ = idle_ack.send(());
         }
     }
 }
@@ -396,6 +423,37 @@ impl Engine {
     /// every file in a pure-E2 vault.
     fn is_linked(&self, file_id: &str) -> bool {
         self.linked_file_ids.contains(file_id)
+    }
+
+    /// Re-read `self.manifest` from disk, discarding the in-memory copy.
+    ///
+    /// Called on every resume (see `run`, above): the manifest is a plain
+    /// JSON file in the user's own folder tree, and D2 delete's
+    /// `sync_core::trash::trash_file` rewrites it directly, out of band,
+    /// while the daemon is paused. Without this, the engine's stale
+    /// in-memory copy would still list the just-trashed entry — the next
+    /// unrelated `manifest.save()` (any export) would write it right back to
+    /// disk, and the stale `entry_by_path` could re-key a future file
+    /// dropped at that path onto the dead id. A read failure is logged and
+    /// the in-memory copy is KEPT (never silently reset — mirrors
+    /// `Engine::new`'s policy for a corrupt manifest): running on slightly
+    /// stale state is safer than discarding everything we know because of
+    /// one bad read.
+    fn reload_manifest(&mut self) {
+        match Manifest::load(&self.cfg.sync_root) {
+            Ok(Some(m)) => self.manifest = m,
+            Ok(None) => tracing::warn!(
+                "manifest missing from disk on resume; keeping the in-memory copy"
+            ),
+            Err(e) => {
+                tracing::error!(
+                    error = format!("{e:#}"),
+                    "failed to reload manifest on resume; keeping the in-memory copy"
+                );
+                self.status
+                    .set_last_error(format!("manifest reload on resume failed: {e:#}"));
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1296,8 +1354,56 @@ impl Engine {
     // Export pipeline (DB → disk), shared by poll loop and reconciliation
     // ------------------------------------------------------------------
 
+    /// D2: follow a DB rename/move on disk. Thin wrapper around
+    /// [`paths::relocate_tracked_file`] (the actual decision + fs move,
+    /// unit-tested directly in `paths.rs`) that persists the manifest on
+    /// success and logs every outcome. Errors are swallowed on purpose: a
+    /// relocation is a best-effort courtesy — if it fails the file simply
+    /// stays at its old (still valid, still synced) path and export
+    /// continues normally; the next poll tries again.
+    fn relocate_file_if_needed(&mut self, db: &DbFileState, project_dir: &str) {
+        let result = paths::relocate_tracked_file(
+            &mut self.manifest,
+            &self.cfg.sync_root,
+            &db.id,
+            project_dir,
+            &db.name,
+        );
+        match result {
+            Ok(paths::RelocationOutcome::NotNeeded) => {}
+            Ok(paths::RelocationOutcome::Moved { from, to }) => {
+                match self.manifest.save(&self.cfg.sync_root) {
+                    Ok(()) => tracing::info!(file = %db.id, from = %from, to = %to, "relocated on disk to follow a DB rename/move"),
+                    Err(e) => tracing::error!(file = %db.id, error = %e, "relocated on disk but failed to persist the manifest; will retry next poll"),
+                }
+            }
+            Ok(paths::RelocationOutcome::Retargeted { to }) => {
+                match self.manifest.save(&self.cfg.sync_root) {
+                    Ok(()) => tracing::debug!(file = %db.id, to = %to, "no on-disk copy yet; manifest path retargeted to the new location"),
+                    Err(e) => tracing::error!(file = %db.id, error = %e, "retargeted manifest path but failed to persist it; will retry next poll"),
+                }
+            }
+            Ok(paths::RelocationOutcome::SkippedLocalChanges) => {
+                tracing::debug!(file = %db.id, "skipping relocation: on-disk tree has local changes (or is unreadable) since last sync; the conflict guard will handle it at the old path");
+            }
+            Ok(paths::RelocationOutcome::SkippedDestinationTaken) => {
+                tracing::warn!(file = %db.id, "skipping relocation: destination path is already taken; will retry next poll");
+            }
+            Err(e) => {
+                tracing::error!(file = %db.id, error = %e, "relocation failed; file stays at its old path");
+            }
+        }
+    }
+
     async fn export_file(&mut self, db: &DbFileState) -> anyhow::Result<ExportOutcome> {
         let project_dir = paths::project_dir_name(&self.manifest, &db.project_id, &db.project_name);
+        // D2: rename/move are first-class verbs — if this tracked file's
+        // current name/project imply a different path than its manifest
+        // entry, follow it on disk BEFORE allocating/exporting, so the rest
+        // of this function (and the conflict guard below) already operates
+        // on the new location. A no-op for untracked files and for the
+        // common "nothing changed" case.
+        self.relocate_file_if_needed(db, &project_dir);
         let rel = paths::allocate_file_path(
             &self.manifest,
             &self.cfg.sync_root,
@@ -2051,5 +2157,86 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let got = walk_penpot_dirs(&tmp.path().join("nope")).unwrap();
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn reload_manifest_picks_up_an_out_of_band_rewrite() {
+        // Mirrors D2 delete: `sync_core::trash::trash_file` rewrites
+        // `.penpot-sync.json` on disk directly, behind the engine's back,
+        // while the daemon is paused. `reload_manifest` is what makes the
+        // engine's in-memory copy notice.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut seed = Manifest::default();
+        seed.files.insert(
+            "f1".to_string(),
+            ManifestEntry {
+                path: "Proj/a.penpot".to_string(),
+                project_id: "p1".into(),
+                project_name: "Proj".into(),
+                revn: 1,
+                db_modified_at: String::new(),
+                last_synced_hash: "h1".into(),
+                last_synced_at: "2026-07-19T00:00:00Z".into(),
+            },
+        );
+        seed.save(root).unwrap();
+
+        let client = PenpotClient::new("http://127.0.0.1:9");
+        let (hub, _rx) = StatusHub::new();
+        let mut engine =
+            Engine::new(client, SyncConfig::new(root, "team"), hub).expect("engine loads the seeded manifest");
+        assert!(engine.manifest.files.contains_key("f1"), "sanity: loaded at construction");
+
+        // Out-of-band rewrite: a second, independent writer drops the entry
+        // — the engine's in-memory copy has no way to know on its own.
+        let mut rewritten = Manifest::load(root).unwrap().unwrap();
+        rewritten.files.remove("f1");
+        rewritten.save(root).unwrap();
+        assert!(
+            engine.manifest.files.contains_key("f1"),
+            "sanity: the in-memory copy is stale until reload_manifest runs"
+        );
+
+        engine.reload_manifest();
+        assert!(
+            !engine.manifest.files.contains_key("f1"),
+            "reload_manifest must pick up the out-of-band rewrite"
+        );
+    }
+
+    #[test]
+    fn reload_manifest_keeps_the_in_memory_copy_on_a_read_failure() {
+        // A manifest that fails to parse must never be treated as "reset to
+        // empty" — that would silently forget every file the daemon knows
+        // about. `reload_manifest` must leave the last-known-good copy alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut seed = Manifest::default();
+        seed.files.insert(
+            "f1".to_string(),
+            ManifestEntry {
+                path: "Proj/a.penpot".to_string(),
+                project_id: "p1".into(),
+                project_name: "Proj".into(),
+                revn: 1,
+                db_modified_at: String::new(),
+                last_synced_hash: "h1".into(),
+                last_synced_at: "2026-07-19T00:00:00Z".into(),
+            },
+        );
+        seed.save(root).unwrap();
+
+        let client = PenpotClient::new("http://127.0.0.1:9");
+        let (hub, _rx) = StatusHub::new();
+        let mut engine =
+            Engine::new(client, SyncConfig::new(root, "team"), hub).expect("engine loads the seeded manifest");
+
+        std::fs::write(Manifest::path_in(root), b"not json").unwrap();
+        engine.reload_manifest();
+        assert!(
+            engine.manifest.files.contains_key("f1"),
+            "a corrupt on-disk manifest must not wipe the in-memory copy"
+        );
     }
 }
