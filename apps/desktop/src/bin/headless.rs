@@ -46,11 +46,16 @@ async fn main() -> anyhow::Result<()> {
     let runner = control::boot_active_vault(config).await?;
 
     // N5: optional localhost control server (test/automation), driving
-    // `File > Open Vault` switches without the GUI dialog.
+    // `File > Open Vault` switches without the GUI dialog. D5 Task 2 adds
+    // `GET /windows`; the headless runner has no Tauri, so no window ever
+    // opens here — an empty, never-populated `WindowRegistry` is honest:
+    // `/windows` answers `{"windows":[]}`, which is the truth for this
+    // binary (the GUI shell wires its REAL registry through the same call).
     if let Some(port) = control::control_port_from_env() {
         let runner_ctl = runner.clone();
+        let windows = penpot_desktop::windows::WindowRegistry::new();
         tokio::spawn(async move {
-            if let Err(e) = control::serve_control(runner_ctl, port).await {
+            if let Err(e) = control::serve_control(runner_ctl, windows, port).await {
                 tracing::error!("vault control server exited: {e:#}");
             }
         });

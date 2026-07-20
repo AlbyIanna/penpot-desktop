@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{FromRef, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -53,6 +53,7 @@ use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::vault::{self, SwitchMarker, VaultRef, VaultRegistry};
+use crate::windows::{OpenWindow, WindowRegistry};
 use crate::{boot, AppConfig, RunningApp};
 
 /// D4 — a late-bound handle to the owning [`VaultRunner`], threaded through
@@ -508,26 +509,82 @@ async fn control_open(
     }
 }
 
+/// D5 Task 2 — one `OpenWindow` in the documented `GET /windows` shape.
+fn window_json(w: &OpenWindow) -> serde_json::Value {
+    // `fileId` is `null` for the home window (no file), a string otherwise —
+    // `Option<String>`'s `Serialize` gives us exactly that via `json!`.
+    json!({ "label": w.label, "fileId": w.file_id, "title": w.title })
+}
+
+/// D5 Task 2 — the `{"windows":[...]}` body, pulled out of the handler so
+/// the shape is testable without going through an HTTP request (mirrors
+/// `vault_json`/the `vault_json_shape` test above).
+fn windows_json(reg: &WindowRegistry) -> serde_json::Value {
+    let windows: Vec<serde_json::Value> = reg.list().iter().map(window_json).collect();
+    json!({ "windows": windows })
+}
+
+/// D5 Task 2 — `GET /windows`: the open-window set, so the gate can observe
+/// that opening a document actually raised a window for it (see the module
+/// doc's `RunnerSlot`-style reasoning: a shell cannot reach into the Tauri
+/// process's `WindowRegistry` any other way). Read-only; never mutates.
+async fn control_windows(State(windows): State<WindowRegistry>) -> Response {
+    Json(windows_json(&windows)).into_response()
+}
+
+/// D5 Task 2 — the control router's combined state: the vault runner (the
+/// existing `/health`/`/active`/`/list`/`/open` routes) plus the window
+/// registry (`/windows`, new here). Handlers keep extracting whichever piece
+/// they need via `State<Arc<VaultRunner>>` / `State<WindowRegistry>`
+/// unchanged — `FromRef` below is what makes both work off one `with_state`
+/// call, the standard axum shape for "more than one thing in state" rather
+/// than forking this into two servers or two ports.
+#[derive(Clone)]
+struct ControlState {
+    runner: Arc<VaultRunner>,
+    windows: WindowRegistry,
+}
+
+impl FromRef<ControlState> for Arc<VaultRunner> {
+    fn from_ref(state: &ControlState) -> Self {
+        state.runner.clone()
+    }
+}
+
+impl FromRef<ControlState> for WindowRegistry {
+    fn from_ref(state: &ControlState) -> Self {
+        state.windows.clone()
+    }
+}
+
 /// The control routes (own server — localhost only).
-pub fn control_router(runner: Arc<VaultRunner>) -> Router {
+pub fn control_router(runner: Arc<VaultRunner>, windows: WindowRegistry) -> Router {
     Router::new()
         .route("/health", get(control_health))
         .route("/active", get(control_active))
         .route("/list", get(control_list))
         .route("/open", post(control_open))
-        .with_state(runner)
+        .route("/windows", get(control_windows))
+        .with_state(ControlState { runner, windows })
 }
 
 /// Serve the control routes on `127.0.0.1:<port>` until the process exits.
 /// Localhost-only by construction. Spawn this only when
 /// [`CONTROL_PORT_ENV`] is set (the N5 gate sets it).
-pub async fn serve_control(runner: Arc<VaultRunner>, port: u16) -> Result<()> {
+///
+/// `windows` is the live [`WindowRegistry`] backing `GET /windows` (D5 Task
+/// 2). The headless runner (no Tauri, no windows ever open) passes an empty
+/// registry it never populates — `/windows` there always answers
+/// `{"windows":[]}`, which is honest: nothing IS open. The GUI shell passes
+/// the SAME registry the menu bar / window-per-file machinery populates, so
+/// `/windows` reflects reality there.
+pub async fn serve_control(runner: Arc<VaultRunner>, windows: WindowRegistry, port: u16) -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("control server cannot bind {addr}"))?;
     tracing::info!(%addr, "vault control server listening (test/automation)");
-    axum::serve(listener, control_router(runner))
+    axum::serve(listener, control_router(runner, windows))
         .await
         .context("control server error")?;
     Ok(())
@@ -575,6 +632,45 @@ mod tests {
         let j = vault_json(&v);
         assert_eq!(j["id"], "id-a");
         assert_eq!(j["path"], "/vaults/a");
+    }
+
+    // -----------------------------------------------------------------
+    // D5 Task 2 — `GET /windows`'s documented shape:
+    // `{"windows":[{"label","fileId":<opt>,"title"},...]}`. Tested at the
+    // serialization function directly (no HTTP round trip needed — mirrors
+    // `vault_json_shape` above) so it stays fast and doesn't need a real
+    // `VaultRunner` (heavy: only `boot()` can build one).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn windows_json_has_the_documented_shape_and_both_entries() {
+        let reg = WindowRegistry::new();
+        // One home window (no file), one file window — exactly the two
+        // shapes `OpenWindow` can take.
+        reg.insert(OpenWindow {
+            label: "main".into(),
+            file_id: None,
+            title: "Penpot Local".into(),
+        });
+        reg.insert(OpenWindow {
+            label: "file-fid1".into(),
+            file_id: Some("fid1".into()),
+            title: "Home".into(),
+        });
+
+        let body = windows_json(&reg);
+        let windows = body["windows"].as_array().expect("windows is an array");
+        assert_eq!(windows.len(), 2);
+
+        // `list()` sorts home first, then files by title — see
+        // `WindowRegistry::list`'s doc.
+        assert_eq!(windows[0]["label"], "main");
+        assert!(windows[0]["fileId"].is_null(), "home window has no file id");
+        assert_eq!(windows[0]["title"], "Penpot Local");
+
+        assert_eq!(windows[1]["label"], "file-fid1");
+        assert_eq!(windows[1]["fileId"], "fid1");
+        assert_eq!(windows[1]["title"], "Home");
     }
 
     // -----------------------------------------------------------------
