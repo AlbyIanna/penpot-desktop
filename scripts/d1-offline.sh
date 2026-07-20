@@ -46,15 +46,21 @@
 #       nothing in the shipped product ever sets, so the policy this gate
 #       cited as the reason "registration present" is tolerable was actually
 #       DORMANT by default — see .superpowers/sdd/task-6-report.md finding 1.
-#       `#/dashboard`/`#/settings` are UNCHANGED: still measurement-only,
-#       still gated behind that env var, because their native replacement
-#       doesn't exist until D2/D3.) This leg runs the EXISTING Rust unit
+#       `#/dashboard` (D2) and `#/settings` (D4) have SINCE moved into the
+#       same unconditional-cancel class as `#/auth` — D1 originally left both
+#       open as measurement-only because neither had a native replacement yet;
+#       `#/dashboard` closed once `/__home` shipped, `#/settings` closed once
+#       D4's Preferences window (`/__preferences`, `prefs_http.rs`) shipped.
+#       The gated-by-env-var class (`GATED_WEB_ROUTE_PREFIXES`) is empty as of
+#       D4 — kept as a mechanism for whatever future web route needs the same
+#       staged rollout, not deleted.) This leg runs the EXISTING Rust unit
 #       tests (`cargo test -p penpot-desktop navwatch::tests::`) and requires
 #       the SPECIFIC tests that pin the unconditional `#/auth` contract with
-#       the env var OFF (the product's actual default) — not just "the suite
-#       passed". If this leg ever goes red, the registration surface is no
-#       longer closed by anything and (b)'s "present is fine" tolerance above
-#       stops being true.
+#       the env var OFF (the product's actual default), PLUS the tests that
+#       pin `#/dashboard` and `#/settings` now closing the same way — not
+#       just "the suite passed". If this leg ever goes red, the registration
+#       surface is no longer closed by anything and (b)'s "present is fine"
+#       tolerance above stops being true.
 #   (c) ZERO NON-LOOPBACK EGRESS, both sides, sampled AFTER a realistic
 #       session (create a file, edit it, export it via `export-binfile`) so
 #       the socket check isn't just watching an idle boot:
@@ -342,10 +348,11 @@ fi
 if [ "$NAVWATCH_RC" -eq 0 ] &&
     grep -q "test navwatch::tests::auth_family_is_cancelled_even_with_redirect_disabled ... ok" "$NAVWATCH_LOG" &&
     grep -q "test navwatch::tests::auth_family_is_cancelled_with_redirect_enabled_too ... ok" "$NAVWATCH_LOG" &&
-    grep -q "test navwatch::tests::dashboard_and_settings_are_allowed_with_redirect_disabled ... ok" "$NAVWATCH_LOG" &&
+    grep -q "test navwatch::tests::dashboard_is_cancelled_even_with_redirect_disabled ... ok" "$NAVWATCH_LOG" &&
+    grep -q "test navwatch::tests::settings_is_cancelled_with_redirect_disabled_in_d4 ... ok" "$NAVWATCH_LOG" &&
     grep -q "test navwatch::tests::prefix_match_still_redirects_exact_and_subpath ... ok" "$NAVWATCH_LOG" &&
     grep -q "test navwatch::tests::prefix_match_has_boundary_check ... ok" "$NAVWATCH_LOG"; then
-    pass "(navwatch) navwatch::decide cancels-and-redirects the #/auth family UNCONDITIONALLY (no env var), while #/dashboard and #/settings stay open by default as measurement-only"
+    pass "(navwatch) navwatch::decide cancels-and-redirects the #/auth family UNCONDITIONALLY (no env var); #/dashboard (D2) and #/settings (D4) now close the same unconditional way, each once its native replacement shipped"
     echo "     NOTE: no test is literally named \"register\" — decide()'s boundary-checked prefix"
     echo "     match on the #/auth family (exact match OR a \"/\" subpath) is the SAME code path for"
     echo "     #/auth/login and #/auth/register, and auth_family_is_cancelled_even_with_redirect_disabled"
@@ -355,8 +362,10 @@ if [ "$NAVWATCH_RC" -eq 0 ] &&
     echo "     effect of disable-login-with-password (upstream could take it back), and because the"
     echo "     backend signup RPC stays live by necessity — our own provisioning calls it on every"
     echo "     DB wipe. The route is closed in the webview regardless of what the SPA renders."
+    echo "     #/settings is pinned CLOSED here too (D4): unlike D1-D3, there is no longer an open,"
+    echo "     measurement-only web route left in this policy for this gate to describe as tolerated."
 else
-    fail "(navwatch) cargo test -p penpot-desktop navwatch::tests:: did not confirm the unconditional #/auth redirect policy (rc=$NAVWATCH_RC) — see $NAVWATCH_LOG"
+    fail "(navwatch) cargo test -p penpot-desktop navwatch::tests:: did not confirm the unconditional #/auth, #/dashboard, and #/settings redirect policy (rc=$NAVWATCH_RC) — see $NAVWATCH_LOG"
 fi
 
 # --- (c/spa) ZERO NON-LOOPBACK EGRESS — SPA side (same session as (b)) -----

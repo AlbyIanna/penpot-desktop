@@ -137,7 +137,7 @@ full file lifecycle (new project → new file → rename → move → open in wo
 through our surfaces, asserts `/dashboard` is **never loaded** in the session, and asserts the vault on
 disk reflects every operation (folder-is-truth holds through the new verbs). Green twice.
 
-### D3 — Native menu bar, shortcuts, Open Recent
+### D3 — Native menu bar, shortcuts, Open Recent — ✅ DONE
 Goal: a real menu bar wired to real commands. **File** (New File, New Project, Open…, Open Recent,
 Open Vault…, Import…, Export…, Reveal in Finder), **Edit** (delegating to the webview), **View** (Home,
 Search, Palette, Packages, Templates), **Window**, **Help** (About, Known Limits). Desktop

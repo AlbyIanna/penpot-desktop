@@ -25,6 +25,17 @@
 //! (`PENPOT_LOCAL_CONTROL_PORT`) so the N5 gate can drive switches WITHOUT the
 //! GUI dialog. It is a test/automation affordance: the GUI's File > Open Vault
 //! calls [`VaultRunner::switch_to`] directly, no HTTP involved.
+//!
+//! D4 adds [`VaultRunner::reboot_in_place`] — the same stop→boot dance
+//! ([`VaultRunner::stop_then_boot`], factored out so the two operations never
+//! drift into two copies of the boot sequence) run against the SAME vault, to
+//! apply preferences that are baked in at boot (plugins/CSP live in
+//! `config.js`, read once at script load; the supervisor cannot hot-add the
+//! exporter child). The one fact that must differ between the two callers —
+//! whether the disposable DB/index gets wiped — is pulled out into the pure
+//! [`wipes_disposable_state`], and whether the crash marker gets written into
+//! [`writes_switch_marker`], so both decisions are unit-testable without
+//! booting a stack. See their doc comments for the reasoning.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -44,6 +55,25 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::vault::{self, SwitchMarker, VaultRef, VaultRegistry};
 use crate::{boot, AppConfig, RunningApp};
 
+/// D4 — a late-bound handle to the owning [`VaultRunner`], threaded through
+/// [`boot`] so routes built there (the Preferences page, `prefs_http.rs`) can
+/// call back into the very runner that wraps the stack being built —
+/// `POST /__api/prefs/reboot` needs [`VaultRunner::reboot_in_place`] and
+/// `POST /__api/prefs/vault` needs [`VaultRunner::switch_to`], but neither
+/// exists yet at the point `boot()` constructs its router (a `VaultRunner`
+/// only comes into being by WRAPPING the [`RunningApp`] `boot()` returns).
+///
+/// [`boot_active_vault`] creates this slot empty, passes it into the first
+/// `boot()` call (so the very first proxy's router captures the same `Arc`),
+/// then fills it in immediately after `VaultRunner::new` returns. Every later
+/// reboot/switch (`stop_then_boot`) reuses that already-filled slot — the
+/// `VaultRunner` itself never changes identity across a switch or reboot,
+/// only the [`RunningApp`] it wraps does, so nothing needs re-filling.
+/// `None` only in the brief window between the first `boot()` returning and
+/// that fill-in; routes see this the same way the palette/menu bar's
+/// late-bound slots do — a "still starting" response, never a panic.
+pub type RunnerSlot = Arc<AsyncMutex<Option<Arc<VaultRunner>>>>;
+
 /// Env var: the localhost control port. Unset ⇒ no control server (every
 /// pre-N5 flow is byte-identical; nothing new binds).
 pub const CONTROL_PORT_ENV: &str = "PENPOT_LOCAL_CONTROL_PORT";
@@ -60,6 +90,55 @@ fn test_switch_delay() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+/// Which stop→boot operation is running. The only two the supervisor knows:
+/// changing vaults, or rebooting the same one in place to apply a boot-time
+/// preference. Kept as data (not just two call sites) so the property that
+/// matters most — a reboot must never pay a switch's cost — is a pure
+/// function a test can assert directly, without booting a stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackOp {
+    /// Changing which vault is open.
+    Switch,
+    /// Same vault, re-reading preferences that only take effect at boot.
+    RebootInPlace,
+}
+
+/// Whether `op` must wipe the disposable Penpot DB cluster + index
+/// ([`vault::reset_disposable_state`]) before booting.
+///
+/// A switch changes vaults, so invariant 2 (P0, zero cross-vault spill)
+/// requires zero residue of the old vault before the new one reconciles —
+/// wiping is the mechanism. A reboot in place keeps the SAME vault: nothing
+/// crossed a vault boundary, so there is nothing to scrub. Wiping anyway
+/// would force a full re-import of every file just to apply a settings
+/// change — correct (the invariant would still hold), but the wrong cost for
+/// flipping a checkbox.
+pub fn wipes_disposable_state(op: StackOp) -> bool {
+    matches!(op, StackOp::Switch)
+}
+
+/// Whether `op` needs the crash-safety marker (`vault-switch.json`,
+/// [`vault::SwitchMarker`]) written before it starts.
+///
+/// The marker exists because a switch moves the registry's `active` pointer
+/// from one vault to another WHILE the DB is briefly wiped in between: a
+/// SIGKILL in that window could leave the registry pointing at a target
+/// whose DB was never reconciled, or — worse — leave it still pointing at
+/// the previous vault after that vault's DB is already gone. The marker
+/// records the intended target so the next boot completes the switch
+/// forward instead of guessing.
+///
+/// A reboot in place never repoints the registry and never wipes anything —
+/// it is the same vault before and after. The worst an interrupted reboot
+/// leaves behind is a stopped stack for that one, unchanged vault with its
+/// DB fully intact — exactly what a completely ordinary boot (no marker, no
+/// wipe, `StartupMode::Normal`) already resolves correctly. There is no
+/// half-changed pointer to recover, so a marker would guard against a
+/// failure mode that structurally cannot occur here.
+pub fn writes_switch_marker(op: StackOp) -> bool {
+    matches!(op, StackOp::Switch)
+}
+
 /// Owns the live stack and performs vault switches. Cheap to `clone` the
 /// `Arc` and share between the control server, the signal loop and the GUI.
 pub struct VaultRunner {
@@ -74,10 +153,20 @@ pub struct VaultRunner {
     active: Mutex<VaultRef>,
     /// Serializes switches (only one teardown/reboot at a time).
     switch_lock: AsyncMutex<()>,
+    /// D4 — the same late-bound slot this runner was constructed with (see
+    /// [`RunnerSlot`]'s doc). Every reboot/switch re-passes it into `boot()`
+    /// unchanged, so the Preferences routes built by a later boot keep
+    /// resolving to this exact runner.
+    runner_slot: RunnerSlot,
 }
 
 impl VaultRunner {
-    fn new(app: RunningApp, base_config: AppConfig, active: VaultRef) -> Arc<Self> {
+    fn new(
+        app: RunningApp,
+        base_config: AppConfig,
+        active: VaultRef,
+        runner_slot: RunnerSlot,
+    ) -> Arc<Self> {
         let data_dir = base_config.data_dir.clone();
         Arc::new(VaultRunner {
             app: AsyncMutex::new(Some(app)),
@@ -85,6 +174,7 @@ impl VaultRunner {
             data_dir,
             active: Mutex::new(active),
             switch_lock: AsyncMutex::new(()),
+            runner_slot,
         })
     }
 
@@ -124,6 +214,19 @@ impl VaultRunner {
         self.app.lock().await.as_ref().and_then(|a| a.export_status())
     }
 
+    /// D4 — live "stop renders" control, delegating to
+    /// [`RunningApp::set_renders_enabled`]. `false` both when the running
+    /// stack refused the request (turning renders back on with no exporter
+    /// child spawned — see that method's docs) AND in the brief mid-switch
+    /// window where there is no stack at all to ask; either way `false` means
+    /// the caller must reboot to get renders running.
+    pub async fn set_renders_enabled(&self, on: bool) -> bool {
+        match self.app.lock().await.as_ref() {
+            Some(app) => app.set_renders_enabled(on).await,
+            None => false,
+        }
+    }
+
     /// The active vault's default team id, if the stack is up. D3's menu bar
     /// needs this to build workspace deep links (`vault_index::
     /// workspace_deep_link`) when dispatching File > Open… / Open Recent —
@@ -154,11 +257,64 @@ impl VaultRunner {
         }
     }
 
+    /// The shared stop→(optional wipe)→(hook)→boot dance behind both
+    /// [`switch_to`](Self::switch_to) and
+    /// [`reboot_in_place`](Self::reboot_in_place) — the ONE place that
+    /// sequence is written, so the two operations can never drift into two
+    /// hand-copied (and silently divergent) boot dances.
+    ///
+    /// Stops the current stack, wipes the disposable DB/index iff `op` calls
+    /// for it ([`wipes_disposable_state`] — the single, pure, testable
+    /// decision), then runs `between_wipe_and_boot` (a switch uses it to
+    /// repoint the registry at the new vault; a reboot passes a no-op — same
+    /// vault, nothing to repoint), then boots `target_root` and installs the
+    /// result as the live stack. Leaves `self.app` empty on a boot failure,
+    /// same as before this was factored out — callers own recovery
+    /// (`switch_to` leaves its marker in place; a reboot has none to leave).
+    async fn stop_then_boot(
+        &self,
+        op: StackOp,
+        target_root: &Path,
+        between_wipe_and_boot: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.shutdown().await;
+        tracing::info!(?op, "stack stopped");
+
+        if wipes_disposable_state(op) {
+            // `wipes_disposable_state` is only true for `StackOp::Switch`, so
+            // this branch only ever fires for a switch — the literal text
+            // below is load-bearing: the N5 gate (`scripts/n5-vaults.sh`)
+            // greps the log for exactly "vault switch: wiping DB" to catch
+            // the widened SIGKILL window.
+            tracing::info!(?op, "vault switch: wiping DB (Penpot cache + index reset)");
+            vault::reset_disposable_state(&self.data_dir)
+                .context("cannot wipe the disposable Penpot DB / index")?;
+        }
+
+        // Test-only widened SIGKILL window (used by the N5 switch gate; the
+        // env var is switch-specific, so this is a no-op for a reboot).
+        if let Some(delay) = test_switch_delay() {
+            tracing::warn!(ms = delay.as_millis(), ?op, "TEST delay (widened crash window)");
+            tokio::time::sleep(delay).await;
+        }
+
+        between_wipe_and_boot()?;
+
+        tracing::info!(vault = %target_root.display(), ?op, "booting");
+        let mut cfg = self.base_config.clone();
+        cfg.designs_dir = target_root.to_path_buf();
+        let app = boot(cfg, self.runner_slot.clone())
+            .await
+            .context("booting the vault failed")?;
+        *self.app.lock().await = Some(app);
+        Ok(())
+    }
+
     /// Open a different vault: the full reset+reconcile switch (see module
     /// docs). Returns the target's [`VaultRef`]. On a boot failure the switch
     /// marker is intentionally left in place so the next boot recovers.
     pub async fn switch_to(&self, target: &Path) -> Result<VaultRef> {
-        // Serialize: only one switch at a time.
+        // Serialize: only one switch/reboot at a time.
         let _guard = self.switch_lock.lock().await;
 
         let target_ref = vault::ensure_vault(target)
@@ -170,7 +326,9 @@ impl VaultRunner {
             "vault switch: begin"
         );
 
-        // (1) Marker BEFORE any wipe — crash safety.
+        // (1) Marker BEFORE any wipe — crash safety (see `writes_switch_marker`
+        // for why a switch needs this and a reboot in place does not).
+        debug_assert!(writes_switch_marker(StackOp::Switch));
         let marker = SwitchMarker {
             target: target_ref.path.clone(),
             target_id: target_ref.id.clone(),
@@ -181,44 +339,57 @@ impl VaultRunner {
         vault::write_switch_marker(&self.data_dir, &marker)
             .context("cannot write the switch marker")?;
 
-        // (2) Stop the current stack.
-        if let Some(app) = self.app.lock().await.take() {
-            app.shutdown().await;
-        }
-        tracing::info!("vault switch: previous stack stopped");
-
-        // (3) Wipe the disposable DB + index — zero residue of the old vault.
-        tracing::info!("vault switch: wiping DB (Penpot cache + index reset)");
-        vault::reset_disposable_state(&self.data_dir)
-            .context("cannot wipe the disposable Penpot DB / index")?;
-
-        // Test-only widened SIGKILL window (marker present, DB gone, no stack).
-        if let Some(delay) = test_switch_delay() {
-            tracing::warn!(ms = delay.as_millis(), "vault switch: TEST delay (widened crash window)");
-            tokio::time::sleep(delay).await;
-        }
-
-        // (4) Registry: active = target (record both vaults).
-        {
+        // (2)-(5): stop, wipe (invariant 2 — zero residue of the old vault),
+        // then — between the wipe and the boot — repoint the registry at the
+        // target, then boot it and reconcile from the new tree.
+        let target_ref_for_registry = target_ref.clone();
+        self.stop_then_boot(StackOp::Switch, &target_root, || {
             let mut reg = VaultRegistry::load(&self.data_dir).unwrap_or_default();
             reg.upsert(&previous);
-            reg.upsert(&target_ref);
-            reg.set_active(&target_ref.path);
-            reg.save(&self.data_dir).context("cannot persist the vault registry")?;
-        }
-
-        // (5) Boot the target: reconcile from the new tree.
-        tracing::info!(vault = %target_root.display(), "vault switch: booting target");
-        let mut cfg = self.base_config.clone();
-        cfg.designs_dir = target_root.clone();
-        let app = boot(cfg).await.context("booting the target vault failed")?;
-        *self.app.lock().await = Some(app);
+            reg.upsert(&target_ref_for_registry);
+            reg.set_active(&target_ref_for_registry.path);
+            reg.save(&self.data_dir).context("cannot persist the vault registry")
+        })
+        .await
+        .context("booting the target vault failed")?;
         *self.active.lock().expect("active mutex") = target_ref.clone();
 
         // (6) Clear the marker — the switch landed.
         vault::clear_switch_marker(&self.data_dir).context("cannot clear the switch marker")?;
         tracing::info!(vault = %target_root.display(), "vault switch: complete");
         Ok(target_ref)
+    }
+
+    /// D4 — reboot the supervised stack in place: stop it, then boot it
+    /// again against the SAME vault, so a freshly re-read `Preferences`
+    /// (`crate::prefs`) takes effect for the settings that are only read at
+    /// boot (plugins/CSP baked into `config.js` at script load; the
+    /// supervisor cannot hot-add the exporter child — see module docs).
+    ///
+    /// Deliberately does NOT wipe the disposable DB/index
+    /// ([`wipes_disposable_state`] returns `false` for
+    /// [`StackOp::RebootInPlace`]) and does NOT write the crash marker
+    /// ([`writes_switch_marker`], same reasoning) — see their docs. The
+    /// vault, the registry's `active` pointer, and `self.active` are all
+    /// unchanged by a reboot; only the running stack is torn down and
+    /// re-raised, via the same [`stop_then_boot`](Self::stop_then_boot) a
+    /// switch uses, with the wipe skipped and the registry hook a no-op.
+    pub async fn reboot_in_place(&self) -> Result<()> {
+        // Serialize with `switch_to` — only one stop/boot dance at a time.
+        let _guard = self.switch_lock.lock().await;
+
+        let active = self.active();
+        let vault_root = active.root();
+        tracing::info!(vault = %active.path, "reboot in place: begin");
+        debug_assert!(!wipes_disposable_state(StackOp::RebootInPlace));
+        debug_assert!(!writes_switch_marker(StackOp::RebootInPlace));
+
+        self.stop_then_boot(StackOp::RebootInPlace, &vault_root, || Ok(()))
+            .await
+            .context("rebooting the vault in place failed")?;
+
+        tracing::info!(vault = %active.path, "reboot in place: complete");
+        Ok(())
     }
 }
 
@@ -268,11 +439,15 @@ pub async fn boot_active_vault(base_config: AppConfig) -> Result<Arc<VaultRunner
     registry.set_active(&vref.path);
     registry.save(&data_dir).context("cannot persist the vault registry")?;
 
-    // Boot the resolved vault.
+    // Boot the resolved vault. D4: the runner slot starts empty — `boot()`'s
+    // Preferences router captures this SAME `Arc` and only sees it filled in
+    // a few lines below, once `VaultRunner::new` exists to fill it with (see
+    // `RunnerSlot`'s doc for why the ordering has to be this way round).
+    let runner_slot: RunnerSlot = Arc::new(AsyncMutex::new(None));
     let mut config = base_config.clone();
     config.designs_dir = vref.root();
     tracing::info!(vault = %vref.path, id = %vref.id, "opening vault");
-    let app = boot(config).await?;
+    let app = boot(config, runner_slot.clone()).await?;
 
     // Recovery landed → clear the marker.
     if recovering {
@@ -280,7 +455,9 @@ pub async fn boot_active_vault(base_config: AppConfig) -> Result<Arc<VaultRunner
         tracing::info!(vault = %vref.path, "vault switch recovery: complete (single consistent vault)");
     }
 
-    Ok(VaultRunner::new(app, base_config, vref))
+    let runner = VaultRunner::new(app, base_config, vref, runner_slot.clone());
+    *runner_slot.lock().await = Some(runner.clone());
+    Ok(runner)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,5 +575,39 @@ mod tests {
         let j = vault_json(&v);
         assert_eq!(j["id"], "id-a");
         assert_eq!(j["path"], "/vaults/a");
+    }
+
+    // -----------------------------------------------------------------
+    // D4 Task 3 — the riskiest property, pulled out into pure functions so
+    // it is testable without booting a stack (see module docs and the two
+    // functions' doc comments for the full reasoning).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_vault_switch_wipes_disposable_state() {
+        assert!(
+            wipes_disposable_state(StackOp::Switch),
+            "changing vaults must wipe the disposable DB/index (invariant 2, P0)"
+        );
+    }
+
+    #[test]
+    fn a_reboot_in_place_does_not_wipe_disposable_state() {
+        assert!(
+            !wipes_disposable_state(StackOp::RebootInPlace),
+            "same vault, no boundary crossed — wiping would force a needless full re-import"
+        );
+    }
+
+    #[test]
+    fn only_a_vault_switch_writes_the_crash_marker() {
+        // A switch moves the registry's active pointer across a DB wipe —
+        // an interrupted switch needs the marker to complete forward.
+        assert!(writes_switch_marker(StackOp::Switch));
+        // A reboot in place never repoints the registry and never wipes;
+        // an interrupted reboot self-heals via an entirely ordinary boot
+        // of the same, unchanged vault — there is no half-changed pointer
+        // for a marker to protect.
+        assert!(!writes_switch_marker(StackOp::RebootInPlace));
     }
 }

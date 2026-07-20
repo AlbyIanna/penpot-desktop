@@ -12,6 +12,7 @@ pub mod dialog;
 pub mod gitinit;
 pub mod home;
 pub mod installer;
+pub mod last_op;
 pub mod layout;
 pub mod manage;
 pub mod menubar;
@@ -20,6 +21,8 @@ pub mod navwatch;
 pub mod overlay;
 pub mod packages;
 pub mod preflight;
+pub mod prefs;
+pub mod prefs_http;
 pub mod recent;
 pub mod reveal;
 pub mod status;
@@ -574,15 +577,22 @@ const D1_CLOUD_SURFACE_FLAGS: &str = "disable-registration disable-dashboard-tem
      disable-google-fonts-provider disable-login-with-password";
 
 /// Compose the frontend flag string: the supervisor defaults + the plugins
-/// flag (E7 ships plugins enabled) + the D1 cloud-surface flags, plus any
+/// flag (E7 ships plugins enabled BY DEFAULT, but D4's `plugins_enabled`
+/// preference can turn it off — this is the one place `PLUGINS_FRONTEND_FLAG`
+/// is appended, so it is also the one place that has to honor the
+/// preference) + the D1 cloud-surface flags, plus any
 /// `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS` tokens appended verbatim.
-fn compose_frontend_flags(extra: Option<&str>) -> String {
-    let mut flags = format!(
-        "{} {} {}",
-        supervisor::DEFAULT_PENPOT_FLAGS,
-        PLUGINS_FRONTEND_FLAG,
-        D1_CLOUD_SURFACE_FLAGS
-    );
+fn compose_frontend_flags(plugins_enabled: bool, extra: Option<&str>) -> String {
+    let mut flags = if plugins_enabled {
+        format!(
+            "{} {} {}",
+            supervisor::DEFAULT_PENPOT_FLAGS,
+            PLUGINS_FRONTEND_FLAG,
+            D1_CLOUD_SURFACE_FLAGS
+        )
+    } else {
+        format!("{} {}", supervisor::DEFAULT_PENPOT_FLAGS, D1_CLOUD_SURFACE_FLAGS)
+    };
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         flags.push(' ');
         flags.push_str(extra);
@@ -652,14 +662,30 @@ fn default_html_csp(proxy_port: u16) -> String {
     .join("; ")
 }
 
-/// Resolve the proxy CSP header value: unset/empty `PENPOT_LOCAL_CSP` → the
-/// default (CSP ON — the shipped promise requires it); the sentinel `off` /
-/// `none` / `0` disables the header entirely (gates use it for the csp-off
-/// egress probe leg — the egress-containment promise does NOT hold there);
-/// any other value is used verbatim.
-fn resolve_html_csp(env_value: Option<&str>, proxy_port: u16) -> Option<String> {
+/// Resolve the proxy CSP header value.
+///
+/// Precedence (deliberate, DOCUMENTED HERE — env wins when set): `env_value`
+/// is `PENPOT_LOCAL_CSP`, which exists for gates and debugging (e.g. the
+/// e7-plugins-spike gate's csp-off egress probe leg passes
+/// `PENPOT_LOCAL_CSP=off` explicitly to witness containment failing with the
+/// header removed). A gate or developer reaching for that env var needs it to
+/// win outright, on whatever machine, regardless of whatever the LOCAL
+/// `preferences.json` on that machine happens to say — an env override that
+/// a stray persisted preference could silently defeat would make the escape
+/// hatch untrustworthy. So: `env_value` SET (non-empty after trim) always
+/// wins, whether it's the `off`/`none`/`0` sentinel or a verbatim policy
+/// string. Only when `env_value` is unset/empty does `csp_enabled` (D4's
+/// preference) get to decide: `true` → the default policy, `false` →
+/// disabled, same shape as the sentinel.
+fn resolve_html_csp(env_value: Option<&str>, csp_enabled: bool, proxy_port: u16) -> Option<String> {
     match env_value.map(str::trim) {
-        None | Some("") => Some(default_html_csp(proxy_port)),
+        None | Some("") => {
+            if csp_enabled {
+                Some(default_html_csp(proxy_port))
+            } else {
+                None
+            }
+        }
         Some(v)
             if v.eq_ignore_ascii_case("off")
                 || v.eq_ignore_ascii_case("none")
@@ -707,7 +733,13 @@ pub struct RunningApp {
     proxy_shutdown: Option<oneshot::Sender<()>>,
     proxy_task: Option<JoinHandle<anyhow::Result<()>>>,
     sync_daemon: Option<sync_daemon::SyncDaemonHandle>,
-    board_export: Option<board_export::BoardExportHandle>,
+    /// `std::sync::Mutex`, not a plain `Option`: [`RunningApp::set_renders_enabled`]
+    /// needs to stop (consume) the handle from behind `&self` — Preferences
+    /// calls it on a live, shared `RunningApp` without tearing down the rest
+    /// of the stack. A std (not tokio) mutex is enough because every access
+    /// here is a quick `lock()` + `take()`/`as_ref()`, never held across an
+    /// `.await` point.
+    board_export: std::sync::Mutex<Option<board_export::BoardExportHandle>>,
     vault_index: Option<vault_index::VaultIndexHandle>,
 }
 
@@ -734,7 +766,38 @@ impl RunningApp {
     pub fn export_status(
         &self,
     ) -> Option<tokio::sync::watch::Receiver<board_export::ExportStatusSnapshot>> {
-        self.board_export.as_ref().map(|b| b.status())
+        self.board_export
+            .lock()
+            .expect("board_export mutex")
+            .as_ref()
+            .map(|b| b.status())
+    }
+
+    /// D4 — live "stop renders" control: Preferences turning `exports_enabled`
+    /// off/on WITHOUT tearing down the rest of the stack.
+    ///
+    /// `on = false` stops the board-export poll loop in place
+    /// (`board_export::BoardExportHandle::stop`, the same call `shutdown`
+    /// makes) and always succeeds (stopping an already-stopped/never-started
+    /// exporter is a no-op success, not an error).
+    ///
+    /// `on = true` does NOT spawn a new exporter: the supervisor has no
+    /// hot-add (`AppConfig.exporter` / `sup_config.exporter` are wired only
+    /// at `boot()`), so if the child isn't already running there is nothing
+    /// this call can turn on. The return value tells the caller which
+    /// happened: `true` if renders were already running (turning "on" was a
+    /// no-op), `false` if they were not — which is exactly the signal
+    /// Preferences uses to offer "Apply & Restart" instead of silently
+    /// pretending the toggle worked.
+    pub async fn set_renders_enabled(&self, on: bool) -> bool {
+        if on {
+            return self.board_export.lock().expect("board_export mutex").is_some();
+        }
+        let handle = self.board_export.lock().expect("board_export mutex").take();
+        if let Some(handle) = handle {
+            handle.stop().await;
+        }
+        true
     }
 
     /// Orderly shutdown: stop the board-export service first (renders talk
@@ -747,7 +810,7 @@ impl RunningApp {
         if let Some(index) = self.vault_index.take() {
             index.stop().await;
         }
-        if let Some(exports) = self.board_export.take() {
+        if let Some(exports) = self.board_export.get_mut().expect("board_export mutex").take() {
             exports.stop().await;
         }
         if let Some(daemon) = self.sync_daemon.take() {
@@ -804,11 +867,28 @@ pub fn supervisor_config(
     sup_config
 }
 
+/// D4 — whether the sync daemon should start PAUSED, per persisted
+/// preferences. Pure (no I/O, no daemon handle) so boot's reapply-prefs step
+/// is unit-testable without booting a stack: `SyncControl` always starts
+/// unpaused (`sync_daemon::spawn` wires a fresh `watch::channel(false)`),
+/// so without consulting this, "sync off" would silently turn itself back on
+/// at every boot AND at every vault switch (`VaultRunner::switch_to` calls
+/// `boot()` again) — a preference that forgets itself is worse than no
+/// preference.
+fn should_pause_sync_at_boot(prefs: &prefs::Preferences) -> bool {
+    !prefs.sync_enabled
+}
+
 /// Run the full boot sequence. On first run in dev mode this downloads the
 /// embedded Postgres binaries (network needed once); a packaged install with
 /// a bundled `postgres/` is fully offline from the very first boot. Also
 /// registers the single user; afterwards everything is offline and idempotent.
-pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
+///
+/// `runner_slot` is D4's late-bound handle to the owning
+/// [`control::VaultRunner`] (see [`control::RunnerSlot`]'s doc) — threaded
+/// through so the Preferences routes this function mounts can call back into
+/// the runner that wraps the very stack being built here, once it exists.
+pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow::Result<RunningApp> {
     // M5 pre-flight (PLAN.md risk 8): refuse non-BMP (emoji) characters in
     // any load-bearing path BEFORE the supervisor spawns anything — the JDK
     // cannot load the backend jar from such a path and would crash-loop.
@@ -817,6 +897,14 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
 
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("cannot create data dir {}", config.data_dir.display()))?;
+
+    // D4: read persisted Preferences before spawning anything that a LIVE
+    // preference governs. `prefs::load` never fails (see its docs), so a
+    // corrupt preferences.json degrades to defaults (everything on) rather
+    // than blocking boot. `sync_enabled`/`exports_enabled` are applied below,
+    // right where the sync daemon / board-export service would otherwise
+    // unconditionally start — see `should_pause_sync_at_boot`.
+    let prefs = prefs::load(&config.data_dir);
 
     // One clear line per component: where it came from (env|bundle|dev).
     for line in config.layout.describe() {
@@ -853,11 +941,16 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     });
     // E7 — plugins ship ENABLED: `enable-plugins` on the FRONTEND flag string
     // only (config.js; backend PENPOT_FLAGS untouched) and the plugins
-    // whitelist pinned to the local proxy origins by default.
+    // whitelist pinned to the local proxy origins by default. D4: whether the
+    // flag is actually appended is now gated on `prefs.plugins_enabled` (see
+    // `compose_frontend_flags`) — this is BOOT-TIME only (see prefs.rs module
+    // docs: config.js is read once at SPA script load, so there is no live
+    // channel to push a changed flag into an already-loaded page).
     // `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS` appends extra frontend flags;
     // `PENPOT_LOCAL_PLUGINS_WHITELIST` (comma-separated origins) overrides
     // the whitelist pin.
     let frontend_flags = compose_frontend_flags(
+        prefs.plugins_enabled,
         std::env::var("PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS").ok().as_deref(),
     );
     let plugins_whitelist = std::env::var("PENPOT_LOCAL_PLUGINS_WHITELIST")
@@ -961,6 +1054,14 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     });
     let manage_routes = manage::router(manage_state);
 
+    // --- D4 Preferences page + routes ---------------------------------------
+    // `/__preferences` + `/__api/prefs*`, mounted exactly like `/__home` above.
+    // `prefs_http` re-reads `prefs::load`/`save` itself on every request rather
+    // than closing over the `prefs` value loaded earlier in this function —
+    // that copy goes stale the instant a save happens, and staleness here
+    // would mean the page lies about its own settings.
+    let prefs_routes = prefs_http::router(config.data_dir.clone(), runner_slot.clone());
+
     let extra = extra_router(bootstrap_state, config_js)
         .merge(vault_routes)
         .merge(home_routes)
@@ -968,6 +1069,7 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         .merge(templates_routes)
         .merge(packages_routes)
         .merge(manage_routes)
+        .merge(prefs_routes)
         .merge(navprobe::router());
 
     let mut proxy_config = proxy::ProxyConfig::new(
@@ -986,10 +1088,17 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     // text/html response, ON BY DEFAULT (the shipped egress-containment
     // promise requires it; plugin.js executes in a SES Compartment in the SPA
     // page context, so the SPA DOCUMENT's CSP is what governs its fetches).
+    // D4: `prefs.csp_enabled` (BOOT-TIME — see prefs.rs module docs: the
+    // header is chosen once here and wired into the router at bind time, so
+    // toggling it needs a fresh proxy bind) can also disable it. `env` wins
+    // over the preference when set — see `resolve_html_csp`'s doc for why.
     // `PENPOT_LOCAL_CSP` overrides the value; `PENPOT_LOCAL_CSP=off` disables
     // the header (gate probe legs only — the promise does not hold then).
-    proxy_config.html_csp =
-        resolve_html_csp(std::env::var("PENPOT_LOCAL_CSP").ok().as_deref(), config.proxy_port);
+    proxy_config.html_csp = resolve_html_csp(
+        std::env::var("PENPOT_LOCAL_CSP").ok().as_deref(),
+        prefs.csp_enabled,
+        config.proxy_port,
+    );
 
     let bound = proxy::Proxy::bind_with_router(proxy_config, extra)
         .await
@@ -1015,6 +1124,16 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
                 "starting sync daemon"
             );
             let handle = sync_daemon::spawn(rpc, sync_config);
+            // D4: `SyncControl` always starts unpaused (`sync_daemon::spawn`
+            // wires `watch::channel(false)` directly) — without this, "sync
+            // off" would silently turn itself back on at every boot AND at
+            // every vault switch (`VaultRunner::switch_to` calls `boot()`
+            // again). Re-apply the persisted preference immediately, before
+            // anything can observe an unpaused daemon.
+            if should_pause_sync_at_boot(&prefs) {
+                tracing::info!("sync daemon starting PAUSED (preferences: sync disabled)");
+                handle.control().pause();
+            }
             // Late-bind the D2 delete route's pause/resume handle now that a
             // real one exists — see the long comment at `manage_sync`'s
             // definition above. `.set()` can only fail if it's already been
@@ -1086,32 +1205,44 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     // talks to the sync daemon. Status is surfaced via tracing AND the
     // watch channel behind [`RunningApp::export_status`] — the tray's
     // "Exports:" row subscribes to it through status::ExportStatusBridge.
-    let board_export = match (&config.exporter, &credentials.access_token) {
-        (Some(exporter), Some(token)) => {
-            let rpc = PenpotClient::new(&readiness.backend_base_url)
-                .with_auth(Auth::Token(token.clone()));
-            let export_config = board_export::ExportConfig::new(
-                &config.designs_dir,
-                format!("http://127.0.0.1:{}", exporter.port),
-                &readiness.backend_base_url,
-                &credentials.email,
-                &credentials.password,
-                &profile.id,
-            );
-            tracing::info!(
-                root = %config.designs_dir.display(),
-                exporter_port = exporter.port,
-                "starting board-export service"
-            );
-            Some(board_export::spawn(rpc, export_config))
+    let board_export = if !prefs.exports_enabled {
+        // D4: the supervisor still starts the exporter CHILD per
+        // `config.exporter` (that's `PENPOT_LOCAL_EXPORTS`, a deploy-time
+        // capability toggle, not a user preference) — what this skips is
+        // spawning the board-export SERVICE that drives it. Turning
+        // `exports_enabled` back on needs a reboot (`prefs::needs_reboot`)
+        // precisely because this `boot()`-time decision is the only place
+        // the service ever gets spawned.
+        tracing::info!("board-export NOT started: disabled by preferences");
+        None
+    } else {
+        match (&config.exporter, &credentials.access_token) {
+            (Some(exporter), Some(token)) => {
+                let rpc = PenpotClient::new(&readiness.backend_base_url)
+                    .with_auth(Auth::Token(token.clone()));
+                let export_config = board_export::ExportConfig::new(
+                    &config.designs_dir,
+                    format!("http://127.0.0.1:{}", exporter.port),
+                    &readiness.backend_base_url,
+                    &credentials.email,
+                    &credentials.password,
+                    &profile.id,
+                );
+                tracing::info!(
+                    root = %config.designs_dir.display(),
+                    exporter_port = exporter.port,
+                    "starting board-export service"
+                );
+                Some(board_export::spawn(rpc, export_config))
+            }
+            (Some(_), None) => {
+                tracing::warn!(
+                    "board-export NOT started: exporter is enabled but no access token was provisioned"
+                );
+                None
+            }
+            (None, _) => None,
         }
-        (Some(_), None) => {
-            tracing::warn!(
-                "board-export NOT started: exporter is enabled but no access token was provisioned"
-            );
-            None
-        }
-        (None, _) => None,
     };
 
     Ok(RunningApp {
@@ -1122,7 +1253,7 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         proxy_shutdown: Some(shutdown_tx),
         proxy_task: Some(proxy_task),
         sync_daemon,
-        board_export,
+        board_export: std::sync::Mutex::new(board_export),
         vault_index: Some(vault_index),
     })
 }
@@ -1142,19 +1273,22 @@ mod tests {
 
     #[test]
     fn frontend_flags_include_plugins_by_default_and_append_extras() {
-        let flags = compose_frontend_flags(None);
+        let flags = compose_frontend_flags(true, None);
         assert!(flags.starts_with(supervisor::DEFAULT_PENPOT_FLAGS));
         assert!(flags.ends_with(&format!(" enable-plugins {D1_CLOUD_SURFACE_FLAGS}")));
-        let flags = compose_frontend_flags(Some("  enable-foo enable-bar "));
+        let flags = compose_frontend_flags(true, Some("  enable-foo enable-bar "));
         assert!(flags.contains("enable-plugins"));
         assert!(flags.ends_with(" enable-foo enable-bar"));
         // Empty extra is a no-op, not a trailing space.
-        assert_eq!(compose_frontend_flags(Some("  ")), compose_frontend_flags(None));
+        assert_eq!(
+            compose_frontend_flags(true, Some("  ")),
+            compose_frontend_flags(true, None)
+        );
     }
 
     #[test]
     fn frontend_flags_disable_every_cloud_surface() {
-        let flags = compose_frontend_flags(None);
+        let flags = compose_frontend_flags(true, None);
         for expected in [
             "disable-registration",
             "disable-dashboard-templates-section",
@@ -1180,10 +1314,44 @@ mod tests {
     }
 
     #[test]
+    fn plugins_preference_gates_the_frontend_flag() {
+        // D4: `plugins_enabled: false` must remove `enable-plugins` as a
+        // standalone token — a `contains` check would still pass on a fused
+        // token like `enable-pluginsdisable-registration`, so this matches
+        // the exact-token idiom used by `frontend_flags_disable_every_cloud_surface`
+        // above.
+        let off = compose_frontend_flags(false, None);
+        assert!(
+            !off.split(' ').any(|token| token == "enable-plugins"),
+            "enable-plugins must NOT be present when plugins_enabled is false: {off}"
+        );
+        // Everything else must still be there — only the plugins flag is gated.
+        assert!(off.starts_with(supervisor::DEFAULT_PENPOT_FLAGS));
+        assert!(off.split(' ').any(|token| token == "disable-registration"));
+
+        let on = compose_frontend_flags(true, None);
+        assert!(
+            on.split(' ').any(|token| token == "enable-plugins"),
+            "enable-plugins must be present when plugins_enabled is true: {on}"
+        );
+    }
+
+    #[test]
     fn backend_flags_are_left_alone_by_the_frontend_composition() {
         // The cloud-surface flags are UI-only; the JVM's flag string must not
         // silently acquire them.
         assert!(!supervisor::DEFAULT_PENPOT_FLAGS.contains("disable-registration"));
+    }
+
+    #[test]
+    fn persisted_sync_off_is_reapplied_at_boot() {
+        // The boot path must consult prefs; encode that as a small pure
+        // helper so it is testable without booting a stack.
+        assert!(should_pause_sync_at_boot(&prefs::Preferences {
+            sync_enabled: false,
+            ..Default::default()
+        }));
+        assert!(!should_pause_sync_at_boot(&prefs::Preferences::default()));
     }
 
     #[test]
@@ -1198,7 +1366,7 @@ mod tests {
     fn html_csp_defaults_on_overrides_and_off_sentinel() {
         // Default ON (CSP-GO): a default-src baseline (finding 2) PLUS the
         // connect-src fence to the local origin.
-        let def = resolve_html_csp(None, 9022).unwrap();
+        let def = resolve_html_csp(None, true, 9022).unwrap();
         assert!(
             def.contains("default-src 'self' data: blob:"),
             "default-src baseline fences non-connect exfil vectors"
@@ -1215,17 +1383,45 @@ mod tests {
         // SES + render-wasm still work: script-src allows eval + wasm.
         assert!(def.contains("'unsafe-eval'") && def.contains("'wasm-unsafe-eval'"));
         // Empty env value falls back to the default (never header-less by accident).
-        assert_eq!(resolve_html_csp(Some("  "), 8686), Some(default_html_csp(8686)));
+        assert_eq!(resolve_html_csp(Some("  "), true, 8686), Some(default_html_csp(8686)));
         // Explicit value wins verbatim.
         assert_eq!(
-            resolve_html_csp(Some("connect-src 'self'"), 9022).as_deref(),
+            resolve_html_csp(Some("connect-src 'self'"), true, 9022).as_deref(),
             Some("connect-src 'self'")
         );
         // The off sentinel disables the header (gate probe legs).
-        assert_eq!(resolve_html_csp(Some("off"), 9022), None);
-        assert_eq!(resolve_html_csp(Some("OFF"), 9022), None);
-        assert_eq!(resolve_html_csp(Some("none"), 9022), None);
-        assert_eq!(resolve_html_csp(Some("0"), 9022), None);
+        assert_eq!(resolve_html_csp(Some("off"), true, 9022), None);
+        assert_eq!(resolve_html_csp(Some("OFF"), true, 9022), None);
+        assert_eq!(resolve_html_csp(Some("none"), true, 9022), None);
+        assert_eq!(resolve_html_csp(Some("0"), true, 9022), None);
+    }
+
+    #[test]
+    fn csp_preference_disables_the_default_policy_when_env_is_unset() {
+        // D4: csp_enabled=false, with no env override, must produce the
+        // disabled ("no header") result — same shape as the `off` sentinel.
+        assert_eq!(resolve_html_csp(None, false, 9022), None);
+        assert_eq!(resolve_html_csp(Some(""), false, 9022), None);
+        assert_eq!(resolve_html_csp(Some("  "), false, 9022), None);
+        // csp_enabled=true, no env override, produces the full default policy.
+        assert_eq!(resolve_html_csp(None, true, 9022), Some(default_html_csp(9022)));
+    }
+
+    #[test]
+    fn env_var_wins_over_the_preference_when_both_are_set() {
+        // Precedence choice (documented on `resolve_html_csp`): `PENPOT_LOCAL_CSP`
+        // is a gate/debugging escape hatch and must not be silently defeated
+        // by whatever a machine's persisted preference happens to say.
+        //
+        // Preference says ON, env says off: env wins → disabled.
+        assert_eq!(resolve_html_csp(Some("off"), true, 9022), None);
+        // Preference says OFF, env says a verbatim policy: env wins → that policy.
+        assert_eq!(
+            resolve_html_csp(Some("connect-src 'self'"), false, 9022).as_deref(),
+            Some("connect-src 'self'")
+        );
+        // Preference says OFF, env unset (or blank): preference governs → disabled.
+        assert_eq!(resolve_html_csp(None, false, 9022), None);
     }
 
     #[test]

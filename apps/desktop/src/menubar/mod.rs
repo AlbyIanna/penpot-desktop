@@ -804,11 +804,25 @@ fn run_command<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, command: Command) 
         ),
         Command::KnownLimits => crate::dialog::native_info_dialog(
             "Penpot Local — Known Limits",
-            "\u{2022} Preferences is not available yet (arrives in a later milestone).\n\
+            "\u{2022} Preferences changes to plugins, the Content Security Policy, or\n  re-enabling renders need a restart of the local stack — the\n  Preferences window offers an explicit \"Apply & Restart\" for those.\n\
              \u{2022} Open…, Import… and Export… use native pickers on macOS only.\n\
              \u{2022} The menu bar is app-wide (a macOS constraint): it always reflects\n  whichever window is currently key, not a per-window menu.\n\
              \u{2022} New Project has no file to open yet, so it opens Home instead,\n  where the new (empty) project appears immediately.",
         ),
+        Command::Preferences => {
+            let proxy_url = live_snapshot(&ctx.live).proxy_url;
+            if proxy_url.is_empty() {
+                tracing::info!("Preferences requested before boot completed; ignoring");
+            } else {
+                // Same "wrap the already-known proxy url into a fresh
+                // ProxyUrlSlot" shortcut `Command::ShowPalette` uses above —
+                // cheaper than plumbing the app-wide slot through `MenuCtx`
+                // just for this one command, and behaves identically since
+                // the slot is only ever read here, never written.
+                let slot: crate::overlay::ProxyUrlSlot = Arc::new(Mutex::new(Some(proxy_url)));
+                crate::overlay::open_preferences(app, &slot);
+            }
+        }
     }
 }
 

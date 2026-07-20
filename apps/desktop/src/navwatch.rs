@@ -5,11 +5,11 @@
 //! not patch, inject into, or drive Penpot's SPA, so invariant 3 holds.
 //!
 //! Two different policies apply to two different route classes (D1 decision,
-//! `.superpowers/sdd/task-6-report.md`; updated by D2):
-//!   * `#/auth/*`, `#/dashboard` — cancelled UNCONDITIONALLY, no env var
-//!     required. `#/auth` is closed because there is no second account to
-//!     log into or register in a single-user offline app; this is safe for
-//!     the real login path: `/__bootstrap`
+//! `.superpowers/sdd/task-6-report.md`; updated by D2 and D4):
+//!   * `#/auth/*`, `#/dashboard`, `#/settings` — cancelled UNCONDITIONALLY, no
+//!     env var required. `#/auth` is closed because there is no second
+//!     account to log into or register in a single-user offline app; this is
+//!     safe for the real login path: `/__bootstrap`
 //!     (`apps/desktop/src/lib.rs::bootstrap_login`) logs in server-side via
 //!     RPC and 302s straight to `/__home`, never through an `#/auth/...`
 //!     fragment in the webview — so unconditionally cancelling `#/auth`
@@ -17,25 +17,32 @@
 //!     that D2 must verify this before enabling it; D1 verified it by
 //!     inspection of the bootstrap route above.) `#/dashboard` joined this
 //!     class in D2: its replacement, `/__home` with create/rename/duplicate/
-//!     move/delete, shipped earlier in this milestone, so the surface can
-//!     close by default.
-//!   * `#/settings` — still measurement-only by default, exactly as D0
-//!     shipped it; gated behind `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`. Its
-//!     native replacement (D4's Preferences) does not exist yet, so closing
-//!     it now would remove the only way to reach account/workspace settings
-//!     — the same mistake D1 already avoided once.
+//!     move/delete, shipped earlier in this milestone, so the surface could
+//!     close by default. `#/settings` joins it in D4, for the identical
+//!     reason: its native replacement, the Preferences window
+//!     (`apps/desktop/src/prefs_http.rs`, `/__preferences`), now exists.
+//!     D1/D2/D3 all left it open specifically because that replacement
+//!     didn't exist yet — see `settings_is_present_and_cancelled_in_d4`'s doc
+//!     for the history this test pins.
+//!
+//! The gated class below is currently EMPTY (D4 was the last web route in
+//! it) — kept as a mechanism, not deleted, in case a future web route needs
+//! the same staged-rollout treatment `#/settings` had through D1-D3.
 //!
 //! Env switches:
 //!   * `PENPOT_LOCAL_NAVWATCH_LOG=<path>`  — append observations as JSONL.
-//!   * `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`  — cancel `#/settings` too, on top
-//!     of the always-on `#/auth`/`#/dashboard` cancellation above.
+//!   * `PENPOT_LOCAL_NAVWATCH_REDIRECT=1`  — cancel any route in the (now
+//!     empty) gated class, on top of the always-on cancellation above.
 
 use std::io::Write;
 use std::path::PathBuf;
 
 /// Env var: path to the JSONL observation log. Absent ⇒ no recording.
 pub const ENV_LOG: &str = "PENPOT_LOCAL_NAVWATCH_LOG";
-/// Env var: `1` enables the cancel+redirect policy for `#/dashboard`/`#/settings`.
+/// Env var: `1` enables the cancel+redirect policy for the (currently empty)
+/// gated web-route class — see [`GATED_WEB_ROUTE_PREFIXES`]. `#/dashboard`
+/// and `#/settings` both graduated out of this class (D2, D4) into the
+/// always-unconditional one, so this flag no longer affects either.
 pub const ENV_REDIRECT: &str = "PENPOT_LOCAL_NAVWATCH_REDIRECT";
 
 /// Where a web route should send the user instead.
@@ -43,16 +50,20 @@ pub const HOME_PATH: &str = "/__home";
 
 /// Hash routes cancelled UNCONDITIONALLY, no env var required — see the
 /// module doc comment above for why this is safe for the real login path.
-/// `#/dashboard` joined this class in D2: its replacement (`/__home` with
-/// create/rename/duplicate/move/delete) shipped earlier in this milestone.
-const ALWAYS_CANCELLED_PREFIXES: [&str; 2] = ["#/auth", "#/dashboard"];
+/// `#/dashboard` joined this class in D2 (`/__home` with create/rename/
+/// duplicate/move/delete shipped as its replacement); `#/settings` joins in
+/// D4 (`/__preferences`, `prefs_http.rs`, shipped as ITS replacement).
+const ALWAYS_CANCELLED_PREFIXES: [&str; 3] = ["#/auth", "#/dashboard", "#/settings"];
 
 /// Hash routes cancelled ONLY when `PENPOT_LOCAL_NAVWATCH_REDIRECT=1` — their
 /// native replacement doesn't exist yet, so they stay open (measurement-only)
 /// by default. Do NOT add to this list without a native replacement shipping
-/// alongside — closing these is what removes the only way to browse files.
-/// `#/settings`'s replacement is D4's native Preferences.
-const GATED_WEB_ROUTE_PREFIXES: [&str; 1] = ["#/settings"];
+/// alongside — closing a route here is what removes the only way to reach
+/// whatever it does. Empty as of D4: `#/settings` (the last entry) moved to
+/// [`ALWAYS_CANCELLED_PREFIXES`] once its replacement shipped — the array (and
+/// the `redirect_enabled` gate below) stay in place as a mechanism for
+/// whatever future web route needs the same staged rollout.
+const GATED_WEB_ROUTE_PREFIXES: [&str; 0] = [];
 
 /// What the navigation handler should do with a URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,8 +92,8 @@ pub fn decide(url: &str, redirect_enabled: bool) -> Decision {
     };
     let frag = format!("#{frag}");
 
-    // `#/auth/*` and `#/dashboard` are closed unconditionally — this class
-    // doesn't wait on the redirect env var at all.
+    // `#/auth/*`, `#/dashboard` and `#/settings` are closed unconditionally
+    // — this class doesn't wait on the redirect env var at all.
     if ALWAYS_CANCELLED_PREFIXES.iter().any(|p| matches_prefix(&frag, p)) {
         return Decision::CancelAndRedirect(HOME_PATH.to_string());
     }
@@ -171,24 +182,29 @@ mod tests {
         }
     }
 
-    /// `#/settings` is UNCHANGED from D0: allowed by default (its native
-    /// replacement, D4's Preferences, does not exist yet), cancelled only
-    /// when the env var opts in. `#/dashboard` moved to the unconditional
-    /// class in D2 — see `dashboard_is_cancelled_even_with_redirect_disabled`.
+    /// Flips `settings_is_allowed_with_redirect_disabled`: `#/settings` moved
+    /// to the unconditional-cancel class in D4 (like `#/dashboard` did in
+    /// D2 — see `dashboard_is_cancelled_even_with_redirect_disabled`), now
+    /// that its native replacement (D4's Preferences window) exists.
     #[test]
-    fn settings_is_allowed_with_redirect_disabled() {
+    fn settings_is_cancelled_with_redirect_disabled_in_d4() {
         for u in [
             "http://localhost:9034/#/settings",
             "http://localhost:9034/#/settings/profile",
         ] {
-            assert_eq!(decide(u, false), Decision::Allow, "{u} must be allowed by default");
+            assert_eq!(
+                decide(u, false),
+                Decision::CancelAndRedirect("/__home".to_string()),
+                "{u} must be redirected unconditionally (redirect_enabled=false)"
+            );
         }
     }
 
     #[test]
     fn dashboard_and_settings_redirect_to_home_when_enabled() {
-        // `#/dashboard` redirects unconditionally as of D2, so this also
-        // holds with the env var on; `#/settings` still needs it enabled.
+        // `#/dashboard` redirects unconditionally as of D2 and `#/settings`
+        // as of D4, so this also holds with the env var on — both are in the
+        // unconditional class now, independent of `redirect_enabled`.
         for u in [
             "http://localhost:9034/#/dashboard",
             "http://localhost:9034/#/dashboard/team/abc",
@@ -236,15 +252,25 @@ mod tests {
         }
     }
 
+    /// Flips `settings_is_unchanged_by_d2` — THE central pin for this task.
+    /// D1/D2/D3 all left `#/settings` open by default specifically because
+    /// its native replacement didn't exist yet (closing a surface before its
+    /// replacement exists is exactly the mistake D1 avoided for `#/auth`).
+    /// That replacement — D4's Preferences window (`/__preferences`,
+    /// `apps/desktop/src/prefs_http.rs`) — now exists, so `#/settings`
+    /// closes unconditionally, exactly like `#/auth` and `#/dashboard`: the
+    /// `redirect_enabled` flag no longer makes any difference to it.
     #[test]
-    fn settings_is_unchanged_by_d2() {
-        // Its replacement is D4's native Preferences. Closing a surface before
-        // its replacement exists is exactly the mistake D1 avoided.
-        assert!(matches!(decide("http://localhost:9048/#/settings/profile", false), Decision::Allow));
-        assert!(matches!(
-            decide("http://localhost:9048/#/settings/profile", true),
-            Decision::CancelAndRedirect(_)
-        ));
+    fn settings_is_present_and_cancelled_in_d4() {
+        for redirect_enabled in [false, true] {
+            assert!(
+                matches!(
+                    decide("http://localhost:9048/#/settings/profile", redirect_enabled),
+                    Decision::CancelAndRedirect(_)
+                ),
+                "#/settings must be cancelled regardless of redirect_enabled={redirect_enabled}"
+            );
+        }
     }
 
     #[test]
@@ -253,12 +279,16 @@ mod tests {
         assert!(matches!(decide("http://localhost:9048/#/dashboardx", false), Decision::Allow));
     }
 
+    /// Flips `redirect_disabled_still_allows_settings`: `#/settings` is no
+    /// longer part of the gated class at all as of D4 — `#/auth`,
+    /// `#/dashboard` and `#/settings` are ALL unconditional now, and the
+    /// gated class ([`GATED_WEB_ROUTE_PREFIXES`]) is empty.
     #[test]
-    fn redirect_disabled_still_allows_settings() {
-        // Default production behaviour for the still-gated class: observe
-        // only, change nothing. (#/auth and #/dashboard are covered
-        // separately above — they are NOT part of the gated class any more.)
-        assert_eq!(decide("http://localhost:9034/#/settings", false), Decision::Allow);
+    fn redirect_disabled_still_cancels_settings() {
+        assert_eq!(
+            decide("http://localhost:9034/#/settings", false),
+            Decision::CancelAndRedirect("/__home".to_string())
+        );
     }
 
     #[test]
@@ -272,6 +302,10 @@ mod tests {
                 "http://localhost:9034/#/dashboardXYZ",
                 "http://localhost:9034/#/authenticate",
                 "http://localhost:9034/#/authoring",
+                // D4: the same boundary discipline must hold for the newly
+                // unconditional `#/settings` — a naive `starts_with` would
+                // wrongly cancel this.
+                "http://localhost:9034/#/settingsXYZ",
             ] {
                 assert_eq!(
                     decide(u, redirect_enabled),
@@ -290,6 +324,8 @@ mod tests {
             "http://localhost:9034/#/dashboard",
             "http://localhost:9034/#/dashboard/team/x",
             "http://localhost:9034/#/auth/login",
+            "http://localhost:9034/#/settings",
+            "http://localhost:9034/#/settings/profile",
         ] {
             assert_eq!(
                 decide(u, true),

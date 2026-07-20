@@ -171,7 +171,15 @@ async fn live_app_boot_tray_contract_and_pause_resume() {
     }
 
     let config = penpot_desktop::AppConfig::resolve().expect("config");
-    let app = penpot_desktop::boot(config).await.expect("boot");
+    // D4: `boot()` takes a late-bound `VaultRunner` slot (see
+    // `control::RunnerSlot`'s doc) so the Preferences routes it mounts can
+    // call back into the runner that wraps this very stack. This test calls
+    // `boot()` directly rather than through `control::boot_active_vault`
+    // (which owns filling that slot in), so an empty one — never filled — is
+    // fine here: nothing in this test drives `/__api/prefs/reboot` or
+    // `/__api/prefs/vault`.
+    let runner_slot: penpot_desktop::control::RunnerSlot = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let app = penpot_desktop::boot(config, runner_slot).await.expect("boot");
 
     // --- the tray contract: daemon status + control are exposed ----------
     let status = app.sync_status().expect("sync daemon must expose status");

@@ -1,0 +1,482 @@
+<!--
+  D4 native Preferences — replaces Penpot's `/#/settings`. Plain HTML +
+  vanilla JS, no framework, no build step, served same-origin at
+  /__preferences (auth cookie already set — same family as /__home,
+  /__palette, /__search, /__templates; same CSS-variable vocabulary).
+
+  Honesty about reboots is the whole point of this page: a toggle change is
+  saved and applied LIVE where possible the instant it changes (auto-save,
+  no separate "Save" button — same posture as a native macOS Preferences
+  pane), and the server tells this page — via `needsReboot` on the POST
+  response — whether anything it just saved is boot-time. This page never
+  re-derives which settings are boot-time itself; it only ever displays what
+  `POST /__api/prefs` reports, and it NEVER reboots the stack on its own —
+  only an explicit click on "Apply & Restart" does that, via
+  `POST /__api/prefs/reboot`. Silently rebooting a supervised stack under an
+  open workspace window is exactly what this page must never do.
+
+  Both `POST /__api/prefs/reboot` and `POST /__api/prefs/vault` ACK with a
+  `202` before doing any work — they tear down the very proxy serving this
+  page, so THIS PAGE'S OWN ORIGIN goes away and comes back. A fetch made
+  mid-teardown, or while the new stack is still booting, fails outright
+  (connection refused) — that is expected, not an error to surface as a
+  failure. So after either call, this page stops making one-shot requests
+  and instead polls `GET /__api/prefs` on a short interval, showing a
+  "reconnecting" state, until a request finally succeeds again — then it
+  reloads live state AND checks `lastOp` (the server's own record of how
+  that detached switch/reboot actually turned out, since the `202` response
+  itself never carries a pass/fail verdict) to report success or failure.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Preferences — Penpot Local</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e3e6ea; --text: #14181d;
+    --muted: #6b7580; --accent: #4b5fd6; --accent-text: #ffffff;
+    --shadow: 0 1px 3px rgba(20,24,29,.08);
+    --ok: #2f9e57; --paused: #b7791f; --warn: #d1453b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14181d; --panel: #1c2127; --border: #2b3138; --text: #e7ebef;
+      --muted: #9aa4af; --accent: #6b7ff0; --accent-text: #0d1013;
+      --shadow: 0 1px 3px rgba(0,0,0,.4);
+      --ok: #47c072; --paused: #e0a13c; --warn: #ef6a60;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif; color: var(--text);
+    background: var(--bg);
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; padding: 14px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  main { padding: 18px 20px 40px; max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+
+  section.card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: var(--shadow); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
+  }
+  section.card h2 { font-size: 12px; margin: 0; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+
+  .row {
+    display: flex; align-items: flex-start; gap: 12px; padding: 4px 0;
+  }
+  .row + .row { border-top: 1px solid var(--border); padding-top: 12px; }
+  .row .toggle { flex: none; margin-top: 2px; }
+  .row .copy { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+  .row .label { font-weight: 600; }
+  .row .hint { color: var(--muted); font-size: 12px; }
+  .row .badge {
+    flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: .4px;
+    color: var(--muted); border: 1px solid var(--border); border-radius: 5px;
+    padding: 1px 6px; align-self: flex-start; margin-top: 2px;
+  }
+
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+    padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border);
+  }
+  .status-pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .status-pill.st-ok::before { background: var(--ok); }
+  .status-pill.st-paused::before { background: var(--paused); }
+
+  .kv { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+
+  input[type=text] {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 7px; padding: 6px 9px; width: 100%;
+  }
+  button.bar {
+    font: inherit; color: var(--accent); border: 1px solid var(--border);
+    padding: 6px 12px; border-radius: 7px; background: var(--bg); white-space: nowrap; cursor: pointer;
+    align-self: flex-start;
+  }
+  button.bar:hover { border-color: var(--accent); }
+  button.bar:disabled { opacity: .5; cursor: not-allowed; }
+
+  .note { color: var(--muted); font-size: 12px; min-height: 16px; }
+
+  #reboot-banner {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: color-mix(in srgb, var(--paused) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--paused) 45%, transparent);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  #reboot-banner .msg { flex: 1; min-width: 200px; }
+  #reboot-banner .msg b { display: block; }
+  #reboot-banner .msg span { color: var(--muted); font-size: 12px; }
+  #reboot-banner button.primary {
+    font: inherit; cursor: pointer; border: 1px solid var(--warn); color: #fff;
+    background: var(--warn); border-radius: 7px; padding: 6px 12px;
+  }
+  #reboot-banner button.primary:disabled { opacity: .6; cursor: not-allowed; }
+  #reboot-banner button.ghost {
+    font: inherit; cursor: pointer; border: 1px solid var(--border); color: var(--text);
+    background: transparent; border-radius: 7px; padding: 6px 12px;
+  }
+
+  input.toggle[type=checkbox] { width: 34px; height: 20px; appearance: none; -webkit-appearance: none;
+    background: var(--border); border-radius: 999px; position: relative; cursor: pointer; outline: none; }
+  input.toggle[type=checkbox]::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+    background: var(--panel); border-radius: 50%; transition: left .12s;
+    box-shadow: 0 1px 2px rgba(0,0,0,.3);
+  }
+  input.toggle[type=checkbox]:checked { background: var(--accent); }
+  input.toggle[type=checkbox]:checked::after { left: 16px; }
+</style>
+</head>
+<body>
+  <header><h1>Preferences</h1></header>
+
+  <main>
+    <section class="card" id="vault-card">
+      <h2>Vault</h2>
+      <div class="kv"><span class="k">Current vault</span><span class="v" id="vault-name">—</span></div>
+      <div class="kv"><span class="k">Path</span><span class="v" id="vault-path">—</span></div>
+      <div class="copy" style="gap:6px;">
+        <label class="hint" for="switch-path">Switch to a different vault folder</label>
+        <input type="text" id="switch-path" placeholder="/absolute/path/to/a/vault/folder" autocomplete="off" spellcheck="false" />
+      </div>
+      <button class="bar" id="switch-btn" type="button">Switch Vault…</button>
+      <div class="note" id="switch-note"></div>
+    </section>
+
+    <section class="card">
+      <h2>Sync</h2>
+      <div class="row">
+        <input class="toggle" type="checkbox" id="pref-sync" />
+        <div class="copy">
+          <span class="label">Sync files to this vault</span>
+          <span class="hint">Applies immediately — pausing stops the folder ↔ database mirror without touching anything already on disk.</span>
+        </div>
+        <span class="status-pill" id="sync-status">—</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Renders</h2>
+      <div class="row">
+        <input class="toggle" type="checkbox" id="pref-exports" />
+        <div class="copy">
+          <span class="label">Generate board thumbnails / exports</span>
+          <span class="hint">Turning off applies immediately. Turning back on needs a restart of the local stack — it cannot be hot-added.</span>
+        </div>
+        <span class="status-pill" id="renders-status">—</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Plugins &amp; Security</h2>
+      <div class="row">
+        <input class="toggle" type="checkbox" id="pref-plugins" />
+        <div class="copy">
+          <span class="label">Enable the plugin runtime</span>
+          <span class="hint">Read once when the app's page loads — a change here always needs a restart.</span>
+        </div>
+        <span class="badge">restart</span>
+      </div>
+      <div class="row">
+        <input class="toggle" type="checkbox" id="pref-csp" />
+        <div class="copy">
+          <span class="label">Content Security Policy (recommended)</span>
+          <span class="hint">Fences network access to this app's own origin. Baked into the local proxy at startup — a change here always needs a restart.</span>
+        </div>
+        <span class="badge">restart</span>
+      </div>
+    </section>
+
+    <div class="note" id="save-note"></div>
+
+    <div id="reboot-banner" hidden>
+      <div class="msg">
+        <b>Some changes need a restart to take effect.</b>
+        <span>The local stack (not the whole app) restarts against the same vault — nothing on disk is touched.</span>
+      </div>
+      <button class="primary" id="reboot-btn" type="button">Apply &amp; Restart</button>
+      <button class="ghost" id="reboot-later" type="button">Later</button>
+    </div>
+  </main>
+
+<script>
+(function () {
+  "use strict";
+  var els = {
+    sync: document.getElementById("pref-sync"),
+    exports: document.getElementById("pref-exports"),
+    plugins: document.getElementById("pref-plugins"),
+    csp: document.getElementById("pref-csp"),
+    vaultPath: document.getElementById("vault-path"),
+    vaultName: document.getElementById("vault-name"),
+    syncStatus: document.getElementById("sync-status"),
+    rendersStatus: document.getElementById("renders-status"),
+    switchInput: document.getElementById("switch-path"),
+    switchBtn: document.getElementById("switch-btn"),
+    switchNote: document.getElementById("switch-note"),
+    saveNote: document.getElementById("save-note"),
+    reboot: document.getElementById("reboot-banner"),
+    rebootBtn: document.getElementById("reboot-btn"),
+    rebootLater: document.getElementById("reboot-later"),
+  };
+
+  var saveNoteTimer = null;
+  function setSaveNote(text, autoClearMs) {
+    clearTimeout(saveNoteTimer);
+    els.saveNote.textContent = text || "";
+    if (autoClearMs) {
+      saveNoteTimer = setTimeout(function () { els.saveNote.textContent = ""; }, autoClearMs);
+    }
+  }
+
+  function setSwitchNote(text) { els.switchNote.textContent = text || ""; }
+
+  // The server's own record of how the most recently FINISHED detached
+  // switch/reboot turned out (see prefs_http.rs's module doc) — kept in sync
+  // by every successful GET /__api/prefs (`load`, `pollLive`, and the
+  // reconnect poll below). `null` until one has finished since the server
+  // process started.
+  var currentLastOp = null;
+  // Keyed on `seq`, NOT `op + "@" + at` — `at` has one-second resolution
+  // (see last_op.rs's module doc "Identity" section), so two consecutive
+  // operations finishing within the same wall-clock second would produce an
+  // identical key and this page would accept the FIRST (stale) record as
+  // proof the SECOND one finished. `seq` is the monotonic counter that
+  // exists specifically to make that impossible; `scripts/d4_prefs_helper.py`
+  // already keys off it for exactly this reason.
+  function opKey(op) { return op ? String(op.seq) : null; }
+
+  // Live facts only — never touches the toggle checkboxes, so a poll landing
+  // mid-interaction can never yank back a change the user just made.
+  function applyStatus(data) {
+    els.vaultPath.textContent = data.vault.path || "—";
+    els.vaultName.textContent = data.vault.name || "—";
+    els.syncStatus.textContent = data.syncPaused ? "Paused" : "Running";
+    els.syncStatus.className = "status-pill " + (data.syncPaused ? "st-paused" : "st-ok");
+    els.rendersStatus.textContent = data.rendersRunning ? "Running" : "Stopped";
+    els.rendersStatus.className = "status-pill " + (data.rendersRunning ? "st-ok" : "st-paused");
+    if (!els.switchInput.value && data.vault.path) { els.switchInput.value = data.vault.path; }
+    currentLastOp = data.lastOp || null;
+  }
+
+  // Both `/reboot` and `/vault` ACK with a 202 and then tear down THIS VERY
+  // ORIGIN in the background (see the file-level comment above). Poll
+  // GET /__api/prefs, showing `noteText` meanwhile, until it reports a
+  // `lastOp` different from `baselineKey` (the op in effect when the action
+  // was kicked off) — NOT just until any request succeeds. A request can
+  // succeed against the OLD stack too: there is a brief window before the
+  // detached task has torn anything down yet, and some failures (e.g. an
+  // unusable target path) are caught before the stack is touched at all, so
+  // the origin never actually goes away. `lastOp` changing is the one signal
+  // that holds in every case, because only the detached task itself writes
+  // it, and only once it is completely done — success or failure.
+  var RECONNECT_INTERVAL_MS = 1000;
+  var RECONNECT_MAX_ATTEMPTS = 150; // ~2.5 minutes
+  function waitForOpOutcome(baselineKey, noteText, onDone, attempt) {
+    attempt = attempt || 0;
+    setSaveNote(noteText);
+    fetch("/__api/prefs")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        applyPrefs(data.preferences);
+        applyStatus(data);
+        if (opKey(data.lastOp) !== baselineKey) {
+          onDone(data.lastOp);
+          return;
+        }
+        retry();
+      })
+      .catch(retry); // connection refused mid-teardown/mid-boot: expected, keep polling
+    function retry() {
+      if (attempt >= RECONNECT_MAX_ATTEMPTS) {
+        onDone(null);
+        return;
+      }
+      setTimeout(function () {
+        waitForOpOutcome(baselineKey, noteText, onDone, attempt + 1);
+      }, RECONNECT_INTERVAL_MS);
+    }
+  }
+
+  function applyPrefs(p) {
+    els.sync.checked = !!p.syncEnabled;
+    els.exports.checked = !!p.exportsEnabled;
+    els.plugins.checked = !!p.pluginsEnabled;
+    els.csp.checked = !!p.cspEnabled;
+  }
+
+  function load() {
+    fetch("/__api/prefs")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) {
+        applyPrefs(data.preferences);
+        applyStatus(data);
+      })
+      .catch(function () {
+        setSaveNote("Could not load preferences — retrying…");
+        setTimeout(load, 1500);
+      });
+  }
+
+  // Live status only (vault/sync/renders) — polled on an interval so the
+  // page reflects reality even when nothing was just saved here.
+  function pollLive() {
+    fetch("/__api/prefs")
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (data) { applyStatus(data); })
+      .catch(function () { /* keep last known state */ });
+  }
+
+  function currentFromForm() {
+    return {
+      syncEnabled: els.sync.checked,
+      exportsEnabled: els.exports.checked,
+      pluginsEnabled: els.plugins.checked,
+      cspEnabled: els.csp.checked,
+    };
+  }
+
+  // Auto-save on every toggle — no separate "Save" button, same posture as
+  // a native macOS Preferences pane. The SERVER decides `needsReboot`
+  // (`prefs::needs_reboot`); this page only ever displays that answer.
+  function save() {
+    var body = currentFromForm();
+    setSaveNote("Saving…");
+    fetch("/__api/prefs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (res) {
+        if (!res.body.ok) {
+          setSaveNote("Could not save preferences: " + (res.body.error || "unknown error"));
+          return;
+        }
+        if (res.body.needsReboot) {
+          els.reboot.hidden = false;
+          setSaveNote("Saved.");
+        } else {
+          els.reboot.hidden = true;
+          setSaveNote("Saved.", 2500);
+        }
+        pollLive();
+      })
+      .catch(function () { setSaveNote("Could not save preferences."); });
+  }
+
+  [els.sync, els.exports, els.plugins, els.csp].forEach(function (el) {
+    el.addEventListener("change", save);
+  });
+
+  // "Apply & Restart" is the ONLY thing on this page that reboots the
+  // stack — never a toggle change by itself, never a background poll.
+  els.rebootBtn.addEventListener("click", function () {
+    els.rebootBtn.disabled = true;
+    var prevLabel = els.rebootBtn.textContent;
+    els.rebootBtn.textContent = "Restarting…";
+    var baselineKey = opKey(currentLastOp);
+    fetch("/__api/prefs/reboot", { method: "POST" })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (res) {
+        if (!res.body.ok) {
+          els.rebootBtn.disabled = false;
+          els.rebootBtn.textContent = prevLabel;
+          setSaveNote("Restart failed: " + (res.body.error || "unknown error"));
+          return;
+        }
+        // 202 Accepted — the actual restart is happening in the background;
+        // this origin is about to disappear and come back. Poll for it.
+        waitForOpOutcome(baselineKey, "Restarting the local stack…", function (lastOp) {
+          els.rebootBtn.disabled = false;
+          els.rebootBtn.textContent = prevLabel;
+          if (!lastOp) {
+            setSaveNote("Still waiting for the local stack to come back — try reloading the page.");
+          } else if (lastOp.op !== "reboot") {
+            // A different operation's record raced in during this wait (e.g.
+            // a vaultSwitch kicked off elsewhere) — this poll only has proof
+            // that op finished, not the reboot it was actually awaiting.
+            setSaveNote("The local stack is back, but a different operation (" + lastOp.op + ") finished in the meantime — reload the page to check status.");
+          } else if (!lastOp.ok) {
+            setSaveNote("Restart failed: " + (lastOp.error || "unknown error"));
+          } else {
+            els.reboot.hidden = true;
+            setSaveNote("Restarted — settings applied.", 4000);
+          }
+        });
+      })
+      .catch(function () {
+        els.rebootBtn.disabled = false;
+        els.rebootBtn.textContent = prevLabel;
+        setSaveNote("Restart failed.");
+      });
+  });
+
+  els.rebootLater.addEventListener("click", function () { els.reboot.hidden = true; });
+
+  els.switchBtn.addEventListener("click", function () {
+    var path = els.switchInput.value.trim();
+    if (!path) { setSwitchNote("Enter a folder path first."); return; }
+    if (!window.confirm(
+      "Switch the active vault to:\n" + path +
+      "\n\nThe local stack restarts against the new vault. Nothing in the current vault's folder tree is touched."
+    )) {
+      return;
+    }
+    els.switchBtn.disabled = true;
+    setSwitchNote("Switching vaults…");
+    var baselineKey = opKey(currentLastOp);
+    fetch("/__api/prefs/vault", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: path }),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (res) {
+        if (!res.body.ok) {
+          els.switchBtn.disabled = false;
+          setSwitchNote("Switch failed: " + (res.body.error || "unknown error"));
+          return;
+        }
+        // 202 Accepted — the switch runs in the background against the new
+        // vault; this origin is about to disappear and come back. Poll for it.
+        waitForOpOutcome(baselineKey, "Switching vaults — the local stack is restarting…", function (lastOp) {
+          els.switchBtn.disabled = false;
+          if (!lastOp) {
+            setSwitchNote("Still waiting for the local stack to come back — try reloading the page.");
+          } else if (lastOp.op !== "vaultSwitch") {
+            // A different operation's record raced in during this wait (e.g.
+            // a reboot kicked off elsewhere) — this poll only has proof that
+            // op finished, not the vault switch it was actually awaiting.
+            setSwitchNote("The local stack is back, but a different operation (" + lastOp.op + ") finished in the meantime — reload the page to check status.");
+          } else if (!lastOp.ok) {
+            setSwitchNote("Switch failed: " + (lastOp.error || "unknown error"));
+          } else {
+            setSwitchNote("Switched vault.");
+            load();
+          }
+        });
+      })
+      .catch(function () {
+        els.switchBtn.disabled = false;
+        setSwitchNote("Switch failed.");
+      });
+  });
+
+  load();
+  setInterval(pollLive, 4000);
+})();
+</script>
+</body>
+</html>
