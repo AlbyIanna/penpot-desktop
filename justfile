@@ -250,6 +250,26 @@ d1:
 d2:
     bash scripts/d2-home.sh
 
+# D3 menu-bar gate (PLAN4 milestone D3). A native menu cannot be clicked in
+# CI, so this proves the menu bar three other ways: (a) the pure model's
+# shape via pinned unit-test names (menubar::/windows::/recent::/reveal:: —
+# a renamed or weakened test fails this, not just "the suite passed"); (b)
+# every command's underlying route/function against a live stack (New
+# File/New Project via /__api/vault/manage/*, the five View pages by
+# fetching and asserting a real render, Reveal via its pure command
+# builder, Open Vault via the control server) with a printed
+# covered/not-covered table so a gap is never silent; (c) no orphaned items
+# in either direction (dead item <-> dead command, both directions pinned).
+# The GUI half of window-per-file (two real windows, two titles, ⌘Q) has no
+# automation surface available (no Tauri IPC command exists to drive it, no
+# window-enumeration tool here) — printed as an explicit SKIPPED leg, never
+# a silent or counted-as-pass omission, distinct from the GUI boot-only
+# smoke check which DOES run and assert PASS/FAIL. Dedicated ports proxy
+# 9050, backend 6512, postgres 5585, valkey 6528, control 9051. Chained
+# into `just e2e` — D3 lands product code.
+d3:
+    bash scripts/d3-menus.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -260,14 +280,16 @@ routes-gate:
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
 # so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7,
-# D1, D2). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2
+# D1–D3). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2/d3
 # boot their own live stacks (dedicated ports) like the m/n suites, safe to
 # chain at the tail. n2-thumbs + e4-gallery + e7-plugins need the runtime
 # bundle WITH browsers (`bash scripts/fetch-penpot.sh --with-browsers`);
 # d1-offline and d2-home need the same bundled browsers (their behavioural
 # checks drive a headless browser too). d2-home ALSO needs a GUI session for
 # its navwatch leg (same operational constraint as d0 — not CI-headless) —
-# unlike d0, d2 stays in the chain because it lands product code.
+# unlike d0, d2 stays in the chain because it lands product code. d3-menus
+# also boots a real GUI session for its boot-only smoke leg (same
+# constraint), chained for the same reason: D3 lands product code.
 # m4-artifact-test.sh stays separate: it needs a dmg build
 # (`bash scripts/build-dmg.sh` first) and carries the E4 offline
 # packaged-gallery leg (g4) + the E7 offline plugin-serving leg (g5).
@@ -295,6 +317,7 @@ e2e:
     bash scripts/e7-plugins-spike.sh
     bash scripts/d1-offline.sh
     bash scripts/d2-home.sh
+    bash scripts/d3-menus.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

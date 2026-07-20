@@ -7,14 +7,27 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use penpot_desktop::control::{self, VaultRunner};
-use penpot_desktop::navwatch::{self, Decision, NavWatch};
+use penpot_desktop::menubar::{self, LiveVault, LiveVaultSlot, MenuCtx};
+use penpot_desktop::navwatch::{NavWatch, HOME_PATH};
 use penpot_desktop::overlay::{self, ProxyUrlSlot};
+use penpot_desktop::windows::{OpenWindow, WindowRegistry, HOME_LABEL};
 use penpot_desktop::AppConfig;
-use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tokio::sync::Mutex;
+
+// D3: `navigation_policy` (the shared `on_navigation` closure builder) and
+// `open_file_window` (window-per-file's Tauri-side builder) now live in
+// `penpot_desktop::menubar` rather than here — see that module's doc comment
+// for why: menubar's dispatcher (File > Open…/Open Recent) is the first real
+// CALLER of `open_file_window`, and it is a module of the `penpot_desktop`
+// LIBRARY, while this file is the separate binary crate that only depends on
+// the library. A library module cannot call a function defined in the
+// binary, so the window-construction code had to move to the library side of
+// that boundary, beside its caller. The home window below still goes through
+// `menubar::navigation_policy` so the redirect rule is defined exactly once.
 
 /// The live vault runner (owns the stack; swaps it on `File > Open Vault`).
 /// `None` until boot completes.
@@ -38,6 +51,17 @@ fn main() {
     let proxy_slot_boot = proxy_slot.clone();
     let proxy_slot_shortcut = proxy_slot.clone();
 
+    // D3: the window registry (Task 1) — every open window, which file (if
+    // any) it shows, and which one is key. Constructed here, before the
+    // Builder chain, so both the home window (built in `.setup()` below) and
+    // every later file window (`menubar::open_file_window`) register into
+    // the SAME registry instance.
+    let window_registry = WindowRegistry::new();
+    // D3: late-bound proxy origin / team id / vault root the menu bar's
+    // dispatcher needs — see `menubar::LiveVault`'s doc comment. Empty until
+    // boot completes, refreshed again on every N5 vault switch.
+    let menu_live: LiveVaultSlot = Arc::new(StdMutex::new(LiveVault::default()));
+
     // N4: the global shortcut (default Cmd/Ctrl+K, configurable via
     // PENPOT_LOCAL_PALETTE_SHORTCUT) toggling the palette overlay window.
     let palette_shortcut = overlay::configured_shortcut();
@@ -59,7 +83,7 @@ fn main() {
         // its window while the second process exits immediately.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tracing::info!("second launch detected: focusing the existing window");
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window(HOME_LABEL) {
                 let _ = window.show();
                 let _ = window.unminimize();
                 let _ = window.set_focus();
@@ -70,54 +94,32 @@ fn main() {
             // D0: the main window is built HERE (not from tauri.conf.json) so a
             // navigation handler can be attached — `on_navigation` is a builder
             // method and a config-declared window gives us no builder.
+            //
+            // D3: the navigation-policy closure moved to `menubar::
+            // navigation_policy` (was inlined here through D0-D2) so
+            // `menubar::open_file_window` can attach the exact same rules to
+            // every file window instead of hand-copying this closure — see
+            // that function's doc comment for why a second copy would be a
+            // hazard.
             let watch = NavWatch::from_env();
-            let watch_for_handler = watch.clone();
-            let nav_handle = app.handle().clone();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            let home_window = WebviewWindowBuilder::new(app, HOME_LABEL, WebviewUrl::default())
                 .title("Penpot Local")
                 .inner_size(1280.0, 800.0)
                 .resizable(true)
-                .on_navigation(move |url| {
-                    let url_s = url.to_string();
-                    // Observe first: the log is the spike's primary evidence.
-                    watch_for_handler.record("on_navigation", &url_s);
-                    match navwatch::decide(&url_s, watch_for_handler.redirect_enabled()) {
-                        Decision::Allow => true,
-                        Decision::CancelAndRedirect(path) => {
-                            // Cannot navigate from inside the handler (we are on
-                            // the webview's navigation path); hop to the app
-                            // thread and navigate there.
-                            let h = nav_handle.clone();
-                            tauri::async_runtime::spawn(async move {
-                                if let Some(w) = h.get_webview_window("main") {
-                                    // HAZARD (unreachable today, but noted for
-                                    // D2): joining against `w.url()` trusts
-                                    // whatever the window is currently pointed
-                                    // at as the base. Every redirect-eligible
-                                    // navigation today only ever happens after
-                                    // boot has already pointed the window at
-                                    // the proxy origin, so this always resolves
-                                    // against `http://localhost:<proxy-port>`.
-                                    // But if a redirect-eligible navigation
-                                    // ever fired BEFORE boot repoints the
-                                    // window (still on `tauri://localhost`),
-                                    // this would join to
-                                    // `tauri://localhost/__home` instead of the
-                                    // proxy. D2 should pin the proxy origin
-                                    // explicitly rather than joining against
-                                    // whatever the current URL happens to be.
-                                    if let Ok(base) = w.url() {
-                                        if let Ok(dest) = base.join(&path) {
-                                            let _ = w.navigate(dest);
-                                        }
-                                    }
-                                }
-                            });
-                            false // cancel the web-route navigation
-                        }
-                    }
-                })
+                .on_navigation(menubar::navigation_policy(&app.handle().clone(), HOME_LABEL, watch, HOME_PATH))
                 .build()?;
+
+            // D3: register the home window itself — nothing did this before
+            // Task 6, since window-per-file had no live caller yet (see
+            // `menubar`'s module doc). Without this the Window menu would
+            // never list "Penpot Local", and `key_has_file` would have
+            // nothing to key off of until the first file window opened.
+            window_registry.insert(OpenWindow {
+                label: HOME_LABEL.into(),
+                file_id: None,
+                title: "Penpot Local".into(),
+            });
+            window_registry.set_key(HOME_LABEL);
 
             let handle = app.handle().clone();
             let running = running_setup.clone();
@@ -141,6 +143,10 @@ fn main() {
             let resource_dir = app.path().resource_dir().ok();
             let config = AppConfig::resolve_with_resources(resource_dir);
             let designs_dir = config.as_ref().ok().map(|c| c.designs_dir.clone());
+            // D3: the app-DATA dir (recent-files.json lives here, NOT the
+            // vault — see `recent.rs`'s module doc). Known synchronously,
+            // unlike proxy_url/team_id/vault_root, which need a booted stack.
+            let menu_data_dir = config.as_ref().ok().map(|c| c.data_dir.clone()).unwrap_or_default();
             // M5: the "Exports:" tray row exists only when the board-export
             // service will run (PENPOT_LOCAL_EXPORTS=1 resolved a layout);
             // the bridge late-binds it exactly like the sync-status one.
@@ -151,9 +157,27 @@ fn main() {
             let export_bridge = penpot_desktop::status::ExportStatusBridge::new();
             let exports_rx = exports_enabled.then(|| export_bridge.subscribe());
 
+            // D3: a `MenuCtx` carrying only the fixed pieces (registry, data
+            // dir, the live slot) — used by the vault-switch closure below to
+            // refresh `menu_live`'s team id / vault root after a switch and
+            // rebuild the menu. `on_open_vault` isn't known yet at this point
+            // (this closure IS what becomes it), so it's filled in below once
+            // the final `menu_ctx` is built — `registry`/`live` are
+            // `Arc`-shared, so that later value change is invisible here: a
+            // rebuild through this ctx reaches the exact same registry/live.
+            let menu_ctx_for_vault = MenuCtx {
+                registry: window_registry.clone(),
+                data_dir: menu_data_dir.clone(),
+                live: menu_live.clone(),
+                on_open_vault: None,
+            };
+
             // N5: the tray "Open Vault…" action drives the vault switch through
             // the runner. macOS-only native folder picker (manual-QA surface —
             // the mechanism itself is gated headlessly, PLAN2 design item 4).
+            // D3 reuses this SAME callback for File > Open Vault… — sharing it
+            // (rather than re-deriving the switch flow in menubar/mod.rs) is
+            // what "do not reimplement" means for that command.
             let on_open_vault: Option<penpot_desktop::tray::OpenVaultCb> = if demo {
                 None
             } else {
@@ -161,11 +185,15 @@ fn main() {
                 let handle_cb = app.handle().clone();
                 let bridge_cb = bridge.clone();
                 let export_bridge_cb = export_bridge.clone();
+                let menu_live_cb = menu_live.clone();
+                let menu_ctx_cb = menu_ctx_for_vault.clone();
                 Some(Arc::new(move || {
                     let holder = holder.clone();
                     let handle_cb = handle_cb.clone();
                     let bridge_cb = bridge_cb.clone();
                     let export_bridge_cb = export_bridge_cb.clone();
+                    let menu_live_cb = menu_live_cb.clone();
+                    let menu_ctx_cb = menu_ctx_cb.clone();
                     tauri::async_runtime::spawn(async move {
                         // Pick a folder off the UI thread (osascript blocks).
                         let picked = tauri::async_runtime::spawn_blocking(|| {
@@ -192,8 +220,25 @@ fn main() {
                                 if let Some(ex) = runner.export_status().await {
                                     export_bridge_cb.attach(ex);
                                 }
+                                // D3: team id (and possibly proxy port, though
+                                // that's stable across switches — see
+                                // `VaultRunner::proxy_url`'s doc) can change
+                                // with the new vault; refresh the menu's live
+                                // facts and rebuild so the Window menu / File
+                                // > Open… dispatch reflect the new vault
+                                // immediately instead of the one just left.
+                                let team_id = runner.team_id().await.unwrap_or_default();
+                                let access_token = runner.access_token().await.unwrap_or_default();
+                                {
+                                    let mut live = menu_live_cb.lock().unwrap_or_else(|p| p.into_inner());
+                                    live.proxy_url = runner.proxy_url();
+                                    live.team_id = team_id;
+                                    live.access_token = access_token;
+                                    live.vault_root = vref.root();
+                                }
+                                menubar::on_window_set_changed(&handle_cb, &menu_ctx_cb);
                                 // Reload the window onto the new vault's home.
-                                if let Some(window) = handle_cb.get_webview_window("main") {
+                                if let Some(window) = handle_cb.get_webview_window(HOME_LABEL) {
                                     if let Ok(url) = format!("{}/__bootstrap", runner.proxy_url())
                                         .parse::<tauri::Url>()
                                     {
@@ -212,6 +257,39 @@ fn main() {
                     });
                 }) as penpot_desktop::tray::OpenVaultCb)
             };
+
+            // D3: the full `MenuCtx` (now that `on_open_vault` exists) and
+            // the initial menu install. `install` registers the ONE global
+            // `on_menu_event` listener — see menubar's module doc for why
+            // that must happen exactly once — so this must run before the
+            // tray (or anything else) could plausibly race a second call in.
+            let menu_ctx = MenuCtx {
+                registry: window_registry.clone(),
+                data_dir: menu_data_dir,
+                live: menu_live.clone(),
+                on_open_vault: on_open_vault.clone(),
+            };
+            if let Err(e) = menubar::install(app.handle(), &menu_ctx) {
+                tracing::error!("failed to install the native menu bar: {e}");
+            }
+
+            // Keep the registry (and therefore the Window menu / key-window-
+            // dependent enabled state) honest for the home window too: forget
+            // it if it's ever destroyed, and track focus so `key_has_file`
+            // reflects reality the instant the user switches windows.
+            let menu_ctx_for_home = menu_ctx.clone();
+            let handle_for_home = app.handle().clone();
+            home_window.on_window_event(move |event| match event {
+                WindowEvent::Destroyed => {
+                    menu_ctx_for_home.registry.remove(HOME_LABEL);
+                    menubar::on_window_set_changed(&handle_for_home, &menu_ctx_for_home);
+                }
+                WindowEvent::Focused(true) => {
+                    menu_ctx_for_home.registry.set_key(HOME_LABEL);
+                    menubar::on_window_set_changed(&handle_for_home, &menu_ctx_for_home);
+                }
+                _ => {}
+            });
 
             let tray_result = if demo {
                 let mock = Arc::new(penpot_desktop::status::MockStatusSource::new(
@@ -246,6 +324,7 @@ fn main() {
             }
             // The window already shows placeholder-dist ("booting…"); bring
             // the stack up asynchronously and swap the URL when ready.
+            let menu_ctx_boot = menu_ctx.clone();
             tauri::async_runtime::spawn(async move {
                 // N5: resolve the active vault (registry + interrupted-switch
                 // recovery), then boot it; the runner owns the stack and swaps
@@ -261,6 +340,21 @@ fn main() {
                         if let Ok(mut slot) = proxy_slot_boot.lock() {
                             *slot = Some(runner.proxy_url());
                         }
+                        // D3: publish the menu bar's late-bound facts (see
+                        // `menubar::LiveVault`) now that a stack exists, then
+                        // rebuild so File > Open…/New File/the View pages
+                        // stop no-op'ing the instant boot finishes.
+                        let team_id = runner.team_id().await.unwrap_or_default();
+                        let access_token = runner.access_token().await.unwrap_or_default();
+                        {
+                            let mut live =
+                                menu_live.lock().unwrap_or_else(|p| p.into_inner());
+                            live.proxy_url = runner.proxy_url();
+                            live.team_id = team_id;
+                            live.access_token = access_token;
+                            live.vault_root = runner.active().root();
+                        }
+                        menubar::on_window_set_changed(&handle, &menu_ctx_boot);
                         // D0: the spike gate points the window at /__navprobe.
                         // Absent the override this is byte-identical to before.
                         let start = std::env::var("PENPOT_LOCAL_START_URL")
@@ -288,7 +382,7 @@ fn main() {
                             }
                         }
                         *running.lock().await = Some(runner);
-                        if let Some(window) = handle.get_webview_window("main") {
+                        if let Some(window) = handle.get_webview_window(HOME_LABEL) {
                             if let Err(e) = window.navigate(url) {
                                 tracing::error!("failed to navigate to penpot: {e}");
                             }
@@ -316,7 +410,7 @@ fn main() {
                             }
                             None => "Penpot Local — boot failed (see logs)".to_string(),
                         };
-                        if let Some(window) = handle.get_webview_window("main") {
+                        if let Some(window) = handle.get_webview_window(HOME_LABEL) {
                             let _ = window.set_title(&title);
                         }
                     }

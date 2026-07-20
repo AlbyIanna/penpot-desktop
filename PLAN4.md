@@ -126,7 +126,7 @@ absent, (c) **zero outbound network connection attempts** across a full session 
 loopback (permitted) from anything leaving the machine (forbidden). Baseline screenshots committed.
 Green twice.
 
-### D2 — The home becomes the front door
+### D2 — The home becomes the front door — ✅ DONE
 Goal: boot goes `/__bootstrap` → `/__home`, never `/`. The lighttable graduates from a read-only
 surface into what the dashboard used to be for a single user: create file, create project, rename,
 duplicate, move, delete — reusing the RPCs M5 already shipped (`rename-file`, `move-files`,
@@ -230,9 +230,13 @@ In addition to its gate, each milestone lands `docs/milestones/d<N>.md` containi
 
 ## Open questions (decide before the milestone that needs them)
 
-1. **Window-per-file, or one window?** D5 assumes document-style multi-window. Single-window with an
-   in-app switcher is simpler and may fit the lighttable model better. **Decide before D3**, since the
-   Window menu depends on it.
+1. ~~**Window-per-file, or one window?**~~ **RESOLVED (before D3): window-per-file.** Each file gets
+   its own window with the filename in the title, so the Window menu, `⌘\`` cycling and D5's
+   document behaviour all have something real to list. The known cost, accepted deliberately: every
+   window boots the full Penpot SPA including the WASM renderer, so several open files means real
+   memory use. Two consequences that bind later milestones — D3 must stop assuming a single
+   hardcoded `"main"` window, and D5's single-instance guard must **forward** a document to the
+   running app rather than boot a second stack.
 2. **Keep Penpot's viewer (`/view`)?** It exists for share links (meaningless offline) but is also
    "present mode", which is genuinely useful locally. Keep, hide, or reach it only from our own UI?
    **Decide before D6.**
