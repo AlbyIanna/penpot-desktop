@@ -27,29 +27,29 @@ use tokio::sync::Mutex;
 /// start with `-`): `docopen::resolve` is the real judge of whether it is
 /// actually a `.penpot` directory, in or out of the vault; this only decides
 /// whether there is an argument worth handing to it at all.
+///
+/// A4 (review note, forward-looking): this binary takes no value-taking
+/// flags today (every flag is a bare switch), so "the first token that
+/// doesn't start with `-`" is a safe test. If one is ever added (e.g.
+/// `--log-level info`), this function must skip that flag's VALUE too, or
+/// the value itself (`info`) would be mistaken for the document path — a
+/// footgun worth documenting now, before it is a latent bug nobody
+/// remembers to check for.
 fn document_arg<I: IntoIterator<Item = String>>(args: I) -> Option<PathBuf> {
     args.into_iter().skip(1).find(|a| !a.starts_with('-')).map(PathBuf::from)
 }
 
-#[cfg(test)]
-mod document_arg_tests {
-    use super::*;
-
-    #[test]
-    fn finds_the_first_non_flag_argument_after_the_program_name() {
-        let args = ["penpot-desktop", "--flag", "/a/b.penpot"].map(String::from);
-        assert_eq!(document_arg(args), Some(PathBuf::from("/a/b.penpot")));
-    }
-
-    #[test]
-    fn no_path_argument_yields_none() {
-        let args = ["penpot-desktop", "--flag"].map(String::from);
-        assert_eq!(document_arg(args), None);
-    }
-
-    #[test]
-    fn bare_invocation_with_no_args_yields_none() {
-        assert_eq!(document_arg(Vec::<String>::new()), None);
+/// Show, unminimize and focus the home window. The single-instance callback's
+/// baseline behaviour (a second launch with no document argument), and — as
+/// of the A2 review fix below — also its fallback when a document argument
+/// IS present but there is no `MenuCtx` to forward it through: a launch the
+/// user actually made must never vanish with zero visible effect just
+/// because the first instance is still mid-boot.
+fn focus_home_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window(HOME_LABEL) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
     }
 }
 
@@ -135,19 +135,30 @@ fn main() {
                     );
                     match app.try_state::<MenuCtx>() {
                         Some(ctx) => menubar::open_document(app, &ctx, &path),
-                        None => tracing::warn!(
-                            "second launch: MenuCtx not yet managed (first instance still \
-                             booting?); cannot forward the document"
-                        ),
+                        None => {
+                            // A2 (review fix): this used to only log and stop
+                            // here — a user double-clicked a file / ran the
+                            // binary again, and the launch vanished with no
+                            // visible effect at all. `MenuCtx` missing this
+                            // late (single-instance callbacks only fire once
+                            // the FIRST instance is up and this plugin is
+                            // registered) should not happen in practice — see
+                            // the doc comment above on why it is normally
+                            // guaranteed present — but if it somehow is,
+                            // fall back to the no-document branch's behaviour
+                            // (refocus) rather than a silent no-op.
+                            tracing::warn!(
+                                "second launch: MenuCtx not yet managed (first instance still \
+                                 booting?); cannot forward the document — focusing the existing \
+                                 window instead"
+                            );
+                            focus_home_window(app);
+                        }
                     }
                 }
                 None => {
                     tracing::info!("second launch detected: focusing the existing window");
-                    if let Some(window) = app.get_webview_window(HOME_LABEL) {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                    }
+                    focus_home_window(app);
                 }
             }
         }))
@@ -408,6 +419,12 @@ fn main() {
             // the stack up asynchronously and swap the URL when ready.
             let menu_ctx_boot = menu_ctx.clone();
             let cli_document_path_boot = cli_document_path.clone();
+            // D5 Task 4 (GUI wiring): the control server needs the SAME
+            // `WindowRegistry` the home window and every file window
+            // register into (see below) — a clone into the boot task, not a
+            // fresh `WindowRegistry::new()`, which would always answer
+            // `{"windows":[]}` regardless of what is actually open.
+            let window_registry_boot = window_registry.clone();
             tauri::async_runtime::spawn(async move {
                 // N5: resolve the active vault (registry + interrupted-switch
                 // recovery), then boot it; the runner owns the stack and swaps
@@ -471,6 +488,30 @@ fn main() {
                                 export_bridge.attach(status);
                                 tracing::info!("tray bound to the board-export service");
                             }
+                        }
+                        // D5 Task 4 (GUI wiring): before this, `serve_control`
+                        // was only ever called from `bin/headless.rs` — the
+                        // GUI binary never served the control port, so
+                        // `GET /windows` (the D5 gate's only way to observe
+                        // that a document actually opened, per
+                        // `control.rs`'s module doc) was unreachable in the
+                        // real windowed app. Same env-guarded, localhost-only
+                        // call `headless.rs` makes; `window_registry_boot` is
+                        // the LIVE registry (see its binding above), so
+                        // `/windows` reflects the home window and every real
+                        // file window here, not an empty stand-in. Test-only:
+                        // a normal launch (no `PENPOT_LOCAL_CONTROL_PORT`)
+                        // binds nothing new, byte-identical to before.
+                        if let Some(port) = control::control_port_from_env() {
+                            let runner_ctl = runner.clone();
+                            let windows_ctl = window_registry_boot.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) =
+                                    control::serve_control(runner_ctl, windows_ctl, port).await
+                                {
+                                    tracing::error!("vault control server exited: {e:#}");
+                                }
+                            });
                         }
                         *running.lock().await = Some(runner);
                         if let Some(window) = handle.get_webview_window(HOME_LABEL) {
@@ -569,4 +610,31 @@ fn main() {
         }
         _ => {}
     });
+}
+
+// A3 (review fix): moved to the end of the file — `clippy::
+// items_after_test_module` flags a `#[cfg(test)]` module followed by more
+// non-test items (this one used to sit right after `document_arg`, ahead of
+// `focus_home_window`, `SharedRunner`, and everything else below). The tests
+// themselves are unchanged; only their position moved.
+#[cfg(test)]
+mod document_arg_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_first_non_flag_argument_after_the_program_name() {
+        let args = ["penpot-desktop", "--flag", "/a/b.penpot"].map(String::from);
+        assert_eq!(document_arg(args), Some(PathBuf::from("/a/b.penpot")));
+    }
+
+    #[test]
+    fn no_path_argument_yields_none() {
+        let args = ["penpot-desktop", "--flag"].map(String::from);
+        assert_eq!(document_arg(args), None);
+    }
+
+    #[test]
+    fn bare_invocation_with_no_args_yields_none() {
+        assert_eq!(document_arg(Vec::<String>::new()), None);
+    }
 }
