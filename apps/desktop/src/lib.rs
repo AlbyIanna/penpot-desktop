@@ -576,15 +576,22 @@ const D1_CLOUD_SURFACE_FLAGS: &str = "disable-registration disable-dashboard-tem
      disable-google-fonts-provider disable-login-with-password";
 
 /// Compose the frontend flag string: the supervisor defaults + the plugins
-/// flag (E7 ships plugins enabled) + the D1 cloud-surface flags, plus any
+/// flag (E7 ships plugins enabled BY DEFAULT, but D4's `plugins_enabled`
+/// preference can turn it off — this is the one place `PLUGINS_FRONTEND_FLAG`
+/// is appended, so it is also the one place that has to honor the
+/// preference) + the D1 cloud-surface flags, plus any
 /// `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS` tokens appended verbatim.
-fn compose_frontend_flags(extra: Option<&str>) -> String {
-    let mut flags = format!(
-        "{} {} {}",
-        supervisor::DEFAULT_PENPOT_FLAGS,
-        PLUGINS_FRONTEND_FLAG,
-        D1_CLOUD_SURFACE_FLAGS
-    );
+fn compose_frontend_flags(plugins_enabled: bool, extra: Option<&str>) -> String {
+    let mut flags = if plugins_enabled {
+        format!(
+            "{} {} {}",
+            supervisor::DEFAULT_PENPOT_FLAGS,
+            PLUGINS_FRONTEND_FLAG,
+            D1_CLOUD_SURFACE_FLAGS
+        )
+    } else {
+        format!("{} {}", supervisor::DEFAULT_PENPOT_FLAGS, D1_CLOUD_SURFACE_FLAGS)
+    };
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         flags.push(' ');
         flags.push_str(extra);
@@ -654,14 +661,30 @@ fn default_html_csp(proxy_port: u16) -> String {
     .join("; ")
 }
 
-/// Resolve the proxy CSP header value: unset/empty `PENPOT_LOCAL_CSP` → the
-/// default (CSP ON — the shipped promise requires it); the sentinel `off` /
-/// `none` / `0` disables the header entirely (gates use it for the csp-off
-/// egress probe leg — the egress-containment promise does NOT hold there);
-/// any other value is used verbatim.
-fn resolve_html_csp(env_value: Option<&str>, proxy_port: u16) -> Option<String> {
+/// Resolve the proxy CSP header value.
+///
+/// Precedence (deliberate, DOCUMENTED HERE — env wins when set): `env_value`
+/// is `PENPOT_LOCAL_CSP`, which exists for gates and debugging (e.g. the
+/// e7-plugins-spike gate's csp-off egress probe leg passes
+/// `PENPOT_LOCAL_CSP=off` explicitly to witness containment failing with the
+/// header removed). A gate or developer reaching for that env var needs it to
+/// win outright, on whatever machine, regardless of whatever the LOCAL
+/// `preferences.json` on that machine happens to say — an env override that
+/// a stray persisted preference could silently defeat would make the escape
+/// hatch untrustworthy. So: `env_value` SET (non-empty after trim) always
+/// wins, whether it's the `off`/`none`/`0` sentinel or a verbatim policy
+/// string. Only when `env_value` is unset/empty does `csp_enabled` (D4's
+/// preference) get to decide: `true` → the default policy, `false` →
+/// disabled, same shape as the sentinel.
+fn resolve_html_csp(env_value: Option<&str>, csp_enabled: bool, proxy_port: u16) -> Option<String> {
     match env_value.map(str::trim) {
-        None | Some("") => Some(default_html_csp(proxy_port)),
+        None | Some("") => {
+            if csp_enabled {
+                Some(default_html_csp(proxy_port))
+            } else {
+                None
+            }
+        }
         Some(v)
             if v.eq_ignore_ascii_case("off")
                 || v.eq_ignore_ascii_case("none")
@@ -917,11 +940,16 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
     });
     // E7 — plugins ship ENABLED: `enable-plugins` on the FRONTEND flag string
     // only (config.js; backend PENPOT_FLAGS untouched) and the plugins
-    // whitelist pinned to the local proxy origins by default.
+    // whitelist pinned to the local proxy origins by default. D4: whether the
+    // flag is actually appended is now gated on `prefs.plugins_enabled` (see
+    // `compose_frontend_flags`) — this is BOOT-TIME only (see prefs.rs module
+    // docs: config.js is read once at SPA script load, so there is no live
+    // channel to push a changed flag into an already-loaded page).
     // `PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS` appends extra frontend flags;
     // `PENPOT_LOCAL_PLUGINS_WHITELIST` (comma-separated origins) overrides
     // the whitelist pin.
     let frontend_flags = compose_frontend_flags(
+        prefs.plugins_enabled,
         std::env::var("PENPOT_LOCAL_EXTRA_FRONTEND_FLAGS").ok().as_deref(),
     );
     let plugins_whitelist = std::env::var("PENPOT_LOCAL_PLUGINS_WHITELIST")
@@ -1059,10 +1087,17 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
     // text/html response, ON BY DEFAULT (the shipped egress-containment
     // promise requires it; plugin.js executes in a SES Compartment in the SPA
     // page context, so the SPA DOCUMENT's CSP is what governs its fetches).
+    // D4: `prefs.csp_enabled` (BOOT-TIME — see prefs.rs module docs: the
+    // header is chosen once here and wired into the router at bind time, so
+    // toggling it needs a fresh proxy bind) can also disable it. `env` wins
+    // over the preference when set — see `resolve_html_csp`'s doc for why.
     // `PENPOT_LOCAL_CSP` overrides the value; `PENPOT_LOCAL_CSP=off` disables
     // the header (gate probe legs only — the promise does not hold then).
-    proxy_config.html_csp =
-        resolve_html_csp(std::env::var("PENPOT_LOCAL_CSP").ok().as_deref(), config.proxy_port);
+    proxy_config.html_csp = resolve_html_csp(
+        std::env::var("PENPOT_LOCAL_CSP").ok().as_deref(),
+        prefs.csp_enabled,
+        config.proxy_port,
+    );
 
     let bound = proxy::Proxy::bind_with_router(proxy_config, extra)
         .await
@@ -1237,19 +1272,22 @@ mod tests {
 
     #[test]
     fn frontend_flags_include_plugins_by_default_and_append_extras() {
-        let flags = compose_frontend_flags(None);
+        let flags = compose_frontend_flags(true, None);
         assert!(flags.starts_with(supervisor::DEFAULT_PENPOT_FLAGS));
         assert!(flags.ends_with(&format!(" enable-plugins {D1_CLOUD_SURFACE_FLAGS}")));
-        let flags = compose_frontend_flags(Some("  enable-foo enable-bar "));
+        let flags = compose_frontend_flags(true, Some("  enable-foo enable-bar "));
         assert!(flags.contains("enable-plugins"));
         assert!(flags.ends_with(" enable-foo enable-bar"));
         // Empty extra is a no-op, not a trailing space.
-        assert_eq!(compose_frontend_flags(Some("  ")), compose_frontend_flags(None));
+        assert_eq!(
+            compose_frontend_flags(true, Some("  ")),
+            compose_frontend_flags(true, None)
+        );
     }
 
     #[test]
     fn frontend_flags_disable_every_cloud_surface() {
-        let flags = compose_frontend_flags(None);
+        let flags = compose_frontend_flags(true, None);
         for expected in [
             "disable-registration",
             "disable-dashboard-templates-section",
@@ -1271,6 +1309,29 @@ mod tests {
         assert!(
             flags.split(' ').any(|token| token == "enable-plugins"),
             "E7 plugins flag lost in {flags}"
+        );
+    }
+
+    #[test]
+    fn plugins_preference_gates_the_frontend_flag() {
+        // D4: `plugins_enabled: false` must remove `enable-plugins` as a
+        // standalone token — a `contains` check would still pass on a fused
+        // token like `enable-pluginsdisable-registration`, so this matches
+        // the exact-token idiom used by `frontend_flags_disable_every_cloud_surface`
+        // above.
+        let off = compose_frontend_flags(false, None);
+        assert!(
+            !off.split(' ').any(|token| token == "enable-plugins"),
+            "enable-plugins must NOT be present when plugins_enabled is false: {off}"
+        );
+        // Everything else must still be there — only the plugins flag is gated.
+        assert!(off.starts_with(supervisor::DEFAULT_PENPOT_FLAGS));
+        assert!(off.split(' ').any(|token| token == "disable-registration"));
+
+        let on = compose_frontend_flags(true, None);
+        assert!(
+            on.split(' ').any(|token| token == "enable-plugins"),
+            "enable-plugins must be present when plugins_enabled is true: {on}"
         );
     }
 
@@ -1304,7 +1365,7 @@ mod tests {
     fn html_csp_defaults_on_overrides_and_off_sentinel() {
         // Default ON (CSP-GO): a default-src baseline (finding 2) PLUS the
         // connect-src fence to the local origin.
-        let def = resolve_html_csp(None, 9022).unwrap();
+        let def = resolve_html_csp(None, true, 9022).unwrap();
         assert!(
             def.contains("default-src 'self' data: blob:"),
             "default-src baseline fences non-connect exfil vectors"
@@ -1321,17 +1382,45 @@ mod tests {
         // SES + render-wasm still work: script-src allows eval + wasm.
         assert!(def.contains("'unsafe-eval'") && def.contains("'wasm-unsafe-eval'"));
         // Empty env value falls back to the default (never header-less by accident).
-        assert_eq!(resolve_html_csp(Some("  "), 8686), Some(default_html_csp(8686)));
+        assert_eq!(resolve_html_csp(Some("  "), true, 8686), Some(default_html_csp(8686)));
         // Explicit value wins verbatim.
         assert_eq!(
-            resolve_html_csp(Some("connect-src 'self'"), 9022).as_deref(),
+            resolve_html_csp(Some("connect-src 'self'"), true, 9022).as_deref(),
             Some("connect-src 'self'")
         );
         // The off sentinel disables the header (gate probe legs).
-        assert_eq!(resolve_html_csp(Some("off"), 9022), None);
-        assert_eq!(resolve_html_csp(Some("OFF"), 9022), None);
-        assert_eq!(resolve_html_csp(Some("none"), 9022), None);
-        assert_eq!(resolve_html_csp(Some("0"), 9022), None);
+        assert_eq!(resolve_html_csp(Some("off"), true, 9022), None);
+        assert_eq!(resolve_html_csp(Some("OFF"), true, 9022), None);
+        assert_eq!(resolve_html_csp(Some("none"), true, 9022), None);
+        assert_eq!(resolve_html_csp(Some("0"), true, 9022), None);
+    }
+
+    #[test]
+    fn csp_preference_disables_the_default_policy_when_env_is_unset() {
+        // D4: csp_enabled=false, with no env override, must produce the
+        // disabled ("no header") result — same shape as the `off` sentinel.
+        assert_eq!(resolve_html_csp(None, false, 9022), None);
+        assert_eq!(resolve_html_csp(Some(""), false, 9022), None);
+        assert_eq!(resolve_html_csp(Some("  "), false, 9022), None);
+        // csp_enabled=true, no env override, produces the full default policy.
+        assert_eq!(resolve_html_csp(None, true, 9022), Some(default_html_csp(9022)));
+    }
+
+    #[test]
+    fn env_var_wins_over_the_preference_when_both_are_set() {
+        // Precedence choice (documented on `resolve_html_csp`): `PENPOT_LOCAL_CSP`
+        // is a gate/debugging escape hatch and must not be silently defeated
+        // by whatever a machine's persisted preference happens to say.
+        //
+        // Preference says ON, env says off: env wins → disabled.
+        assert_eq!(resolve_html_csp(Some("off"), true, 9022), None);
+        // Preference says OFF, env says a verbatim policy: env wins → that policy.
+        assert_eq!(
+            resolve_html_csp(Some("connect-src 'self'"), false, 9022).as_deref(),
+            Some("connect-src 'self'")
+        );
+        // Preference says OFF, env unset (or blank): preference governs → disabled.
+        assert_eq!(resolve_html_csp(None, false, 9022), None);
     }
 
     #[test]
