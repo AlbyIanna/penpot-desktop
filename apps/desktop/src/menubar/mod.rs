@@ -117,6 +117,7 @@ pub struct MenuCtx {
 /// failing to compile. The enum in `model.rs` closes that hole entirely —
 /// there is no runtime "unknown name" case left.
 fn predefined_item<R: Runtime>(app: &AppHandle<R>, kind: Predefined) -> tauri::Result<PredefinedMenuItem<R>> {
+    let app_name = model::APP_NAME;
     match kind {
         Predefined::Undo => PredefinedMenuItem::undo(app, None),
         Predefined::Redo => PredefinedMenuItem::redo(app, None),
@@ -129,15 +130,22 @@ fn predefined_item<R: Runtime>(app: &AppHandle<R>, kind: Predefined) -> tauri::R
         // is no separately named "zoom" constructor in tauri::menu.
         Predefined::Zoom => PredefinedMenuItem::maximize(app, None),
         Predefined::CloseWindow => PredefinedMenuItem::close_window(app, None),
-        // The application-submenu items (D3-review CRITICAL finding 1): the
-        // OS supplies the "About <app>"/"Quit <app>" wording itself when
-        // `text` is `None`, exactly like every other predefined item here.
-        Predefined::About => PredefinedMenuItem::about(app, None, None),
+        // The application-submenu items (D3-review CRITICAL finding 1).
+        //
+        // These pass an EXPLICIT product name rather than `None`. With `None`
+        // the OS derives the wording from the running executable, which is
+        // right in a packaged .app but reads "About penpot-desktop" / "Quit
+        // penpot-desktop" in a dev build — verified live via System Events.
+        // Naming it here is correct in both, and keeps these labels agreeing
+        // with the menu bar title, which already says "Penpot Local".
+        Predefined::About => {
+            PredefinedMenuItem::about(app, Some(&format!("About {app_name}")), None)
+        }
         Predefined::Services => PredefinedMenuItem::services(app, None),
-        Predefined::Hide => PredefinedMenuItem::hide(app, None),
+        Predefined::Hide => PredefinedMenuItem::hide(app, Some(&format!("Hide {app_name}"))),
         Predefined::HideOthers => PredefinedMenuItem::hide_others(app, None),
         Predefined::ShowAll => PredefinedMenuItem::show_all(app, None),
-        Predefined::Quit => PredefinedMenuItem::quit(app, None),
+        Predefined::Quit => PredefinedMenuItem::quit(app, Some(&format!("Quit {app_name}"))),
     }
 }
 
