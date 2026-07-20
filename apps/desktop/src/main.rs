@@ -12,6 +12,7 @@ use std::sync::Arc;
 use penpot_desktop::control::{self, VaultRunner};
 use penpot_desktop::navwatch::{self, Decision, NavWatch};
 use penpot_desktop::overlay::{self, ProxyUrlSlot};
+use penpot_desktop::windows::HOME_LABEL;
 use penpot_desktop::AppConfig;
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::Mutex;
@@ -59,7 +60,7 @@ fn main() {
         // its window while the second process exits immediately.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tracing::info!("second launch detected: focusing the existing window");
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window(HOME_LABEL) {
                 let _ = window.show();
                 let _ = window.unminimize();
                 let _ = window.set_focus();
@@ -73,7 +74,7 @@ fn main() {
             let watch = NavWatch::from_env();
             let watch_for_handler = watch.clone();
             let nav_handle = app.handle().clone();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            WebviewWindowBuilder::new(app, HOME_LABEL, WebviewUrl::default())
                 .title("Penpot Local")
                 .inner_size(1280.0, 800.0)
                 .resizable(true)
@@ -89,7 +90,7 @@ fn main() {
                             // thread and navigate there.
                             let h = nav_handle.clone();
                             tauri::async_runtime::spawn(async move {
-                                if let Some(w) = h.get_webview_window("main") {
+                                if let Some(w) = h.get_webview_window(HOME_LABEL) {
                                     // HAZARD (unreachable today, but noted for
                                     // D2): joining against `w.url()` trusts
                                     // whatever the window is currently pointed
@@ -193,7 +194,7 @@ fn main() {
                                     export_bridge_cb.attach(ex);
                                 }
                                 // Reload the window onto the new vault's home.
-                                if let Some(window) = handle_cb.get_webview_window("main") {
+                                if let Some(window) = handle_cb.get_webview_window(HOME_LABEL) {
                                     if let Ok(url) = format!("{}/__bootstrap", runner.proxy_url())
                                         .parse::<tauri::Url>()
                                     {
@@ -288,7 +289,7 @@ fn main() {
                             }
                         }
                         *running.lock().await = Some(runner);
-                        if let Some(window) = handle.get_webview_window("main") {
+                        if let Some(window) = handle.get_webview_window(HOME_LABEL) {
                             if let Err(e) = window.navigate(url) {
                                 tracing::error!("failed to navigate to penpot: {e}");
                             }
@@ -316,7 +317,7 @@ fn main() {
                             }
                             None => "Penpot Local — boot failed (see logs)".to_string(),
                         };
-                        if let Some(window) = handle.get_webview_window("main") {
+                        if let Some(window) = handle.get_webview_window(HOME_LABEL) {
                             let _ = window.set_title(&title);
                         }
                     }

@@ -24,6 +24,7 @@ pub mod status;
 pub mod templates;
 pub mod tray;
 pub mod vault;
+pub mod windows;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
