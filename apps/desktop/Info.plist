@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  D5a: register `.penpot` (an unzipped-binfile DIRECTORY) as a package
+  document type so Finder treats a double-click as "open in Penpot Local"
+  instead of "browse into this folder".
+
+  Tauri's `fileAssociations` config cannot express `LSTypeIsPackage`
+  (verified against tauri-utils 2.9.3's schema — no such field), so this
+  fragment is merged into the generated Info.plist via the
+  `bundle.macOS.infoPlist` escape hatch (see apps/desktop/tauri.bundle.conf.json).
+  Exact keys proven by the spike: docs/spikes/finder-document-association.md
+  and scripts/d5a-finder-spike.sh.
+
+  Only the keys Tauri does not already generate are declared here — do not
+  duplicate CFBundleName / CFBundleIdentifier / CFBundleExecutable / etc.,
+  Tauri fills those in from tauri.conf.json.
+-->
+<plist version="1.0">
+<dict>
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>dev.albyianna.penpot-file</string>
+      <key>UTTypeDescription</key>
+      <string>Penpot File</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>com.apple.package</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>penpot</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Penpot File</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSTypeIsPackage</key>
+      <true/>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>dev.albyianna.penpot-file</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>
