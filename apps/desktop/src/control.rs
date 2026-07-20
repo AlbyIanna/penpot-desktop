@@ -124,6 +124,19 @@ impl VaultRunner {
         self.app.lock().await.as_ref().and_then(|a| a.export_status())
     }
 
+    /// D4 — live "stop renders" control, delegating to
+    /// [`RunningApp::set_renders_enabled`]. `false` both when the running
+    /// stack refused the request (turning renders back on with no exporter
+    /// child spawned — see that method's docs) AND in the brief mid-switch
+    /// window where there is no stack at all to ask; either way `false` means
+    /// the caller must reboot to get renders running.
+    pub async fn set_renders_enabled(&self, on: bool) -> bool {
+        match self.app.lock().await.as_ref() {
+            Some(app) => app.set_renders_enabled(on).await,
+            None => false,
+        }
+    }
+
     /// The active vault's default team id, if the stack is up. D3's menu bar
     /// needs this to build workspace deep links (`vault_index::
     /// workspace_deep_link`) when dispatching File > Open… / Open Recent —

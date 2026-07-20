@@ -708,7 +708,13 @@ pub struct RunningApp {
     proxy_shutdown: Option<oneshot::Sender<()>>,
     proxy_task: Option<JoinHandle<anyhow::Result<()>>>,
     sync_daemon: Option<sync_daemon::SyncDaemonHandle>,
-    board_export: Option<board_export::BoardExportHandle>,
+    /// `std::sync::Mutex`, not a plain `Option`: [`RunningApp::set_renders_enabled`]
+    /// needs to stop (consume) the handle from behind `&self` — Preferences
+    /// calls it on a live, shared `RunningApp` without tearing down the rest
+    /// of the stack. A std (not tokio) mutex is enough because every access
+    /// here is a quick `lock()` + `take()`/`as_ref()`, never held across an
+    /// `.await` point.
+    board_export: std::sync::Mutex<Option<board_export::BoardExportHandle>>,
     vault_index: Option<vault_index::VaultIndexHandle>,
 }
 
@@ -735,7 +741,38 @@ impl RunningApp {
     pub fn export_status(
         &self,
     ) -> Option<tokio::sync::watch::Receiver<board_export::ExportStatusSnapshot>> {
-        self.board_export.as_ref().map(|b| b.status())
+        self.board_export
+            .lock()
+            .expect("board_export mutex")
+            .as_ref()
+            .map(|b| b.status())
+    }
+
+    /// D4 — live "stop renders" control: Preferences turning `exports_enabled`
+    /// off/on WITHOUT tearing down the rest of the stack.
+    ///
+    /// `on = false` stops the board-export poll loop in place
+    /// (`board_export::BoardExportHandle::stop`, the same call `shutdown`
+    /// makes) and always succeeds (stopping an already-stopped/never-started
+    /// exporter is a no-op success, not an error).
+    ///
+    /// `on = true` does NOT spawn a new exporter: the supervisor has no
+    /// hot-add (`AppConfig.exporter` / `sup_config.exporter` are wired only
+    /// at `boot()`), so if the child isn't already running there is nothing
+    /// this call can turn on. The return value tells the caller which
+    /// happened: `true` if renders were already running (turning "on" was a
+    /// no-op), `false` if they were not — which is exactly the signal
+    /// Preferences uses to offer "Apply & Restart" instead of silently
+    /// pretending the toggle worked.
+    pub async fn set_renders_enabled(&self, on: bool) -> bool {
+        if on {
+            return self.board_export.lock().expect("board_export mutex").is_some();
+        }
+        let handle = self.board_export.lock().expect("board_export mutex").take();
+        if let Some(handle) = handle {
+            handle.stop().await;
+        }
+        true
     }
 
     /// Orderly shutdown: stop the board-export service first (renders talk
@@ -748,7 +785,7 @@ impl RunningApp {
         if let Some(index) = self.vault_index.take() {
             index.stop().await;
         }
-        if let Some(exports) = self.board_export.take() {
+        if let Some(exports) = self.board_export.get_mut().expect("board_export mutex").take() {
             exports.stop().await;
         }
         if let Some(daemon) = self.sync_daemon.take() {
@@ -805,6 +842,18 @@ pub fn supervisor_config(
     sup_config
 }
 
+/// D4 — whether the sync daemon should start PAUSED, per persisted
+/// preferences. Pure (no I/O, no daemon handle) so boot's reapply-prefs step
+/// is unit-testable without booting a stack: `SyncControl` always starts
+/// unpaused (`sync_daemon::spawn` wires a fresh `watch::channel(false)`),
+/// so without consulting this, "sync off" would silently turn itself back on
+/// at every boot AND at every vault switch (`VaultRunner::switch_to` calls
+/// `boot()` again) — a preference that forgets itself is worse than no
+/// preference.
+fn should_pause_sync_at_boot(prefs: &prefs::Preferences) -> bool {
+    !prefs.sync_enabled
+}
+
 /// Run the full boot sequence. On first run in dev mode this downloads the
 /// embedded Postgres binaries (network needed once); a packaged install with
 /// a bundled `postgres/` is fully offline from the very first boot. Also
@@ -818,6 +867,14 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
 
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("cannot create data dir {}", config.data_dir.display()))?;
+
+    // D4: read persisted Preferences before spawning anything that a LIVE
+    // preference governs. `prefs::load` never fails (see its docs), so a
+    // corrupt preferences.json degrades to defaults (everything on) rather
+    // than blocking boot. `sync_enabled`/`exports_enabled` are applied below,
+    // right where the sync daemon / board-export service would otherwise
+    // unconditionally start — see `should_pause_sync_at_boot`.
+    let prefs = prefs::load(&config.data_dir);
 
     // One clear line per component: where it came from (env|bundle|dev).
     for line in config.layout.describe() {
@@ -1016,6 +1073,16 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
                 "starting sync daemon"
             );
             let handle = sync_daemon::spawn(rpc, sync_config);
+            // D4: `SyncControl` always starts unpaused (`sync_daemon::spawn`
+            // wires `watch::channel(false)` directly) — without this, "sync
+            // off" would silently turn itself back on at every boot AND at
+            // every vault switch (`VaultRunner::switch_to` calls `boot()`
+            // again). Re-apply the persisted preference immediately, before
+            // anything can observe an unpaused daemon.
+            if should_pause_sync_at_boot(&prefs) {
+                tracing::info!("sync daemon starting PAUSED (preferences: sync disabled)");
+                handle.control().pause();
+            }
             // Late-bind the D2 delete route's pause/resume handle now that a
             // real one exists — see the long comment at `manage_sync`'s
             // definition above. `.set()` can only fail if it's already been
@@ -1087,32 +1154,44 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
     // talks to the sync daemon. Status is surfaced via tracing AND the
     // watch channel behind [`RunningApp::export_status`] — the tray's
     // "Exports:" row subscribes to it through status::ExportStatusBridge.
-    let board_export = match (&config.exporter, &credentials.access_token) {
-        (Some(exporter), Some(token)) => {
-            let rpc = PenpotClient::new(&readiness.backend_base_url)
-                .with_auth(Auth::Token(token.clone()));
-            let export_config = board_export::ExportConfig::new(
-                &config.designs_dir,
-                format!("http://127.0.0.1:{}", exporter.port),
-                &readiness.backend_base_url,
-                &credentials.email,
-                &credentials.password,
-                &profile.id,
-            );
-            tracing::info!(
-                root = %config.designs_dir.display(),
-                exporter_port = exporter.port,
-                "starting board-export service"
-            );
-            Some(board_export::spawn(rpc, export_config))
+    let board_export = if !prefs.exports_enabled {
+        // D4: the supervisor still starts the exporter CHILD per
+        // `config.exporter` (that's `PENPOT_LOCAL_EXPORTS`, a deploy-time
+        // capability toggle, not a user preference) — what this skips is
+        // spawning the board-export SERVICE that drives it. Turning
+        // `exports_enabled` back on needs a reboot (`prefs::needs_reboot`)
+        // precisely because this `boot()`-time decision is the only place
+        // the service ever gets spawned.
+        tracing::info!("board-export NOT started: disabled by preferences");
+        None
+    } else {
+        match (&config.exporter, &credentials.access_token) {
+            (Some(exporter), Some(token)) => {
+                let rpc = PenpotClient::new(&readiness.backend_base_url)
+                    .with_auth(Auth::Token(token.clone()));
+                let export_config = board_export::ExportConfig::new(
+                    &config.designs_dir,
+                    format!("http://127.0.0.1:{}", exporter.port),
+                    &readiness.backend_base_url,
+                    &credentials.email,
+                    &credentials.password,
+                    &profile.id,
+                );
+                tracing::info!(
+                    root = %config.designs_dir.display(),
+                    exporter_port = exporter.port,
+                    "starting board-export service"
+                );
+                Some(board_export::spawn(rpc, export_config))
+            }
+            (Some(_), None) => {
+                tracing::warn!(
+                    "board-export NOT started: exporter is enabled but no access token was provisioned"
+                );
+                None
+            }
+            (None, _) => None,
         }
-        (Some(_), None) => {
-            tracing::warn!(
-                "board-export NOT started: exporter is enabled but no access token was provisioned"
-            );
-            None
-        }
-        (None, _) => None,
     };
 
     Ok(RunningApp {
@@ -1123,7 +1202,7 @@ pub async fn boot(config: AppConfig) -> anyhow::Result<RunningApp> {
         proxy_shutdown: Some(shutdown_tx),
         proxy_task: Some(proxy_task),
         sync_daemon,
-        board_export,
+        board_export: std::sync::Mutex::new(board_export),
         vault_index: Some(vault_index),
     })
 }
@@ -1185,6 +1264,17 @@ mod tests {
         // The cloud-surface flags are UI-only; the JVM's flag string must not
         // silently acquire them.
         assert!(!supervisor::DEFAULT_PENPOT_FLAGS.contains("disable-registration"));
+    }
+
+    #[test]
+    fn persisted_sync_off_is_reapplied_at_boot() {
+        // The boot path must consult prefs; encode that as a small pure
+        // helper so it is testable without booting a stack.
+        assert!(should_pause_sync_at_boot(&prefs::Preferences {
+            sync_enabled: false,
+            ..Default::default()
+        }));
+        assert!(!should_pause_sync_at_boot(&prefs::Preferences::default()));
     }
 
     #[test]
