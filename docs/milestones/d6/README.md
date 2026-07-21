@@ -35,7 +35,7 @@ pinned by tests, so a future route added to the bundle can't silently reopen thi
 | `#/workspace/*` | Allowed — the product | always | This **is** the product |
 | `#/view/*` | Allowed — kept | decided in D0/D1 | Present mode; our own Present buttons navigate here, and a share-link pointing at it is inert offline anyway |
 | `#/frame-preview`, `#/render-sprite/:id` | Allowed — internal | always | The SPA navigates to these **itself** to render thumbnails and frames; cancelling either risks breaking rendering — the `#/view` lesson repeated |
-| `#/subscribe-nitrate` | Absent | n/a | Gated behind a flag this build does not set; never compiles into the route tree |
+| `#/subscribe-nitrate` | Unreachable | n/a | Route literal ships, but a runtime flag guard (the `nitrate` flag is unset) leaves it unregistered in the route tree |
 
 ## Classifying a navigation
 

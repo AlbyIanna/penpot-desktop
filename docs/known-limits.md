@@ -109,8 +109,9 @@ Two route families are reachable and were deliberately **left allowed**, not ove
   routes (plus `#/workspace`) stay allowed, specifically so a future tidy-up pass can't silently
   cancel them.
 
-`#/subscribe-nitrate` is absent from this build entirely — it sits behind a flag this app does
-not set, so it never compiles into the route tree. Recorded for completeness; no policy needed.
+`#/subscribe-nitrate` is unreachable in this build — its route literal ships in the bundle, but
+a runtime flag guard (the app does not set the `nitrate` flag) leaves it unregistered in the
+route tree, so no navigation can reach it. Recorded for completeness; no policy needed.
 
 ## Deferred threads
 

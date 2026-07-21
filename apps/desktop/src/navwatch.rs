@@ -46,9 +46,11 @@
 //!     `internal_render_routes_and_the_viewer_stay_allowed` below.
 //!
 //! Absent from our build, no action needed:
-//!   * `#/subscribe-nitrate` — gated behind a flag this build does not set,
-//!     so it does not compile into the route tree at all. Recorded here so
-//!     the accounting names all eight families, not because it needs a
+//!   * `#/subscribe-nitrate` — gated behind a flag this build does not set.
+//!     The route literal ships in the bundle but a runtime `contains?(flags,
+//!     :nitrate)` guard leaves it UNREGISTERED in the route tree, so it is
+//!     unreachable and needs no policy. Recorded here so the accounting names
+//!     all eight families, not because it needs a
 //!     policy.
 //!
 //! The gated class below is currently EMPTY (D4 was the last web route in
@@ -397,7 +399,9 @@ mod tests {
 
     #[test]
     fn debug_prefix_boundary_holds() {
-        // "#/debugger" (hypothetical) must NOT match "#/debug".
+        // A longer route that merely starts with the text "#/debug" must NOT
+        // match "#/debug" — the boundary is a "/" subpath or an exact match.
         assert!(matches!(decide("http://localhost:9058/#/debugxyz", false), Decision::Allow));
+        assert!(matches!(decide("http://localhost:9058/#/debugger", false), Decision::Allow));
     }
 }
