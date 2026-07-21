@@ -383,9 +383,10 @@ pub fn open_file_window<R: Runtime>(
 /// the SAME [`open_document`] funnel every other arrival path uses (CLI
 /// argv, second launch, `RunEvent::Opened`). Caught NATIVELY by Tauri's
 /// window-event loop, never by a script injected into the SPA (invariant 3).
-/// A `.penpot` is a DIRECTORY on disk, so `docopen::resolve`'s own
-/// `is_dir`/`.penpot`-suffix checks already route anything else to
-/// `NotAPenpotDir` — no pre-filtering needed here.
+/// A `.penpot` is EITHER a directory (in-vault storage format) OR a zip file
+/// (the binfile export format, dropped in from Downloads or anywhere else),
+/// so `docopen::resolve`'s own dir/zip-magic checks already route anything
+/// else to `NotAPenpot` — no pre-filtering needed here.
 ///
 /// Both the home window (`main.rs` — the primary and usually ONLY window at
 /// launch) and every file window ([`open_file_window`] below) wire this to
@@ -417,6 +418,15 @@ pub enum DocumentAction {
     /// wires the poll-until-id; for now the caller only logs what was
     /// skipped.
     WaitForImport { rel_path: String },
+    /// A `.penpot` FILE (the zip binfile export format, reachable from
+    /// anywhere — Downloads, a shared link, a drag-drop) rather than a
+    /// vault-storage directory. There is nothing to copy: the bytes go
+    /// straight to `import-binfile` over RPC, the same door File > Import…
+    /// already uses — see [`import_binfile_from_path`]. `title` is dropped
+    /// here rather than carried: the handler recomputes it from `path` the
+    /// same way `import_into_vault` derives a name from its own picked
+    /// file, so there is exactly one place that rule lives.
+    ImportBinfileFile { path: PathBuf },
     /// Not a Penpot document at all.
     Reject { reason: String },
 }
@@ -431,7 +441,8 @@ pub fn document_action(resolved: docopen::Resolved) -> DocumentAction {
         docopen::Resolved::InVault { file_id, title } => DocumentAction::OpenInVault { file_id, title },
         docopen::Resolved::External { path } => DocumentAction::OfferImport { path },
         docopen::Resolved::PendingImport { rel_path } => DocumentAction::WaitForImport { rel_path },
-        docopen::Resolved::NotAPenpotDir { reason } => DocumentAction::Reject { reason },
+        docopen::Resolved::ImportableBinfile { path, .. } => DocumentAction::ImportBinfileFile { path },
+        docopen::Resolved::NotAPenpot { reason } => DocumentAction::Reject { reason },
     }
 }
 
@@ -452,10 +463,13 @@ pub fn document_action(resolved: docopen::Resolved) -> DocumentAction {
 /// nothing forked. `OfferImport` confirms with the user then copies the
 /// `.penpot` INTO the vault ([`offer_import`]); `WaitForImport` skips
 /// straight to polling ([`poll_until_imported_and_open`]) since the dir is
-/// already on disk. `Reject` raises a native error dialog — every call site
-/// that reaches `open_document` today is itself a direct user gesture (a CLI
-/// argument, a second launch, a Finder open), so there is no "quiet
-/// background rescan" case here that a dialog would spam.
+/// already on disk. `ImportBinfileFile` confirms with the user then imports
+/// the zip's bytes straight over RPC ([`import_binfile_from_path`]) — no
+/// copy-into-vault step, since the destination is the DB via `import-binfile`,
+/// not a path under the vault root. `Reject` raises a native error dialog —
+/// every call site that reaches `open_document` today is itself a direct
+/// user gesture (a CLI argument, a second launch, a Finder open), so there
+/// is no "quiet background rescan" case here that a dialog would spam.
 pub fn open_document<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, raw_path: &Path) {
     let live = live_snapshot(&ctx.live);
     if live.vault_root.as_os_str().is_empty() {
@@ -494,6 +508,13 @@ pub fn open_document<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, raw_path: &P
             let vault_root = live.vault_root.clone();
             tauri::async_runtime::spawn(async move {
                 poll_until_imported_and_open(&app, &ctx, &vault_root, &rel_path).await;
+            });
+        }
+        DocumentAction::ImportBinfileFile { path } => {
+            let app = app.clone();
+            let ctx = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                import_binfile_from_path(&app, &ctx, path, /* confirm */ true).await;
             });
         }
         DocumentAction::Reject { reason } => {
@@ -1122,26 +1143,66 @@ async fn export_key_file(ctx: &MenuCtx) {
     }
 }
 
-/// File > Import…: the SAME import-as-new-and-settle mechanism
-/// `templates.rs`/`packages.rs` use (`installer::import_binfile_and_settle`)
-/// — the picked `.zip`'s bytes go straight to the backend over RPC, landing
-/// in the team's default project via `installer::default_project_id`. This
-/// goes through the backend rather than unzipping into the vault directly
-/// for the SAME reason as New File: nothing in this module may write to the
-/// vault — only the sync daemon does, once the import lands in the DB. The
-/// newly imported file opens immediately, exactly like opening any other.
-async fn import_into_vault<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) {
+/// The reusable body of "get a `.penpot` zip's bytes into the vault via
+/// `import-binfile`, then open it" — the SAME import-as-new-and-settle
+/// mechanism `templates.rs`/`packages.rs` use
+/// (`installer::import_binfile_and_settle`), landing in the team's default
+/// project via `installer::default_project_id`. This goes through the
+/// backend rather than unzipping into the vault directly for the SAME
+/// reason as New File: nothing in this module may write to the vault — only
+/// the sync daemon does, once the import lands in the DB.
+///
+/// Two callers, two `confirm` values: [`import_into_vault`] (File >
+/// Import…) already has explicit user intent — the user just picked this
+/// exact file from a native picker — so it passes `confirm: false` and this
+/// function skips straight to the RPC. [`open_document`]'s
+/// `DocumentAction::ImportBinfileFile` arm (a `.penpot` FILE opened by
+/// double-click, drag, or a CLI/second-launch path) has NOT been told
+/// "import" yet — the user only said "open" — so it passes `confirm: true`
+/// and this function asks first, exactly like [`offer_import`] does for an
+/// external `.penpot` DIRECTORY.
+///
+/// **Same post-confirm-snapshot discipline as [`offer_import`]:** when
+/// `confirm` is true, the RPC client/team/project are resolved from
+/// `ctx.live` fresh, AFTER the dialog returns — `native_confirm_dialog` runs
+/// in a separate `osascript` process and does not block the Tauri event
+/// loop, so an N5 vault switch (`File > Open Vault…`) is reachable while it
+/// is up. Resolving before showing the dialog (or reusing a pre-dialog
+/// snapshot) would risk sending the import to the vault active when the
+/// user clicked rather than the one active when they actually confirmed —
+/// the same cross-vault-spill vector `resolve_post_confirm_vault` closes for
+/// `offer_import`. The `confirm: false` path resolves fresh too (there is no
+/// dialog to wait on, so this is just "read `ctx.live` when called"),
+/// keeping ONE resolution rule for both callers rather than a second one
+/// for the no-confirm case.
+async fn import_binfile_from_path<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, path: PathBuf, confirm: bool) {
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Imported file").to_string();
+
+    if confirm {
+        // Fast, NON-authoritative pre-dialog gate — mirrors `offer_import`'s
+        // own: skip popping a dialog the app can't act on yet (boot not
+        // complete). This snapshot is discarded right after the check, same
+        // as there — never reused for the actual import below.
+        if live_snapshot(&ctx.live).vault_root.as_os_str().is_empty() {
+            tracing::info!(path = %path.display(), "binfile import requested before boot completed; ignoring");
+            return;
+        }
+        let message = format!("\"{name}\" isn't in your vault yet. Import it?");
+        let confirmed = tauri::async_runtime::spawn_blocking(move || {
+            crate::dialog::native_confirm_dialog("Penpot Local — Import", &message)
+        })
+        .await
+        .unwrap_or(false); // a panicked confirm task is exactly a "no", not a crash
+        if !confirmed {
+            return;
+        }
+    }
+
+    // THE authoritative snapshot for the RPC client/team: taken fresh right
+    // here — after the confirm dialog (if any) has closed. See doc comment.
     let live = live_snapshot(&ctx.live);
     let Some(client) = rpc_client(&live) else {
-        tracing::info!("Import requested before boot completed; ignoring");
-        return;
-    };
-    let Some(src) = tauri::async_runtime::spawn_blocking(|| {
-        crate::dialog::choose_file("Import a Penpot export (.zip)", &["zip"])
-    })
-    .await
-    .ok()
-    .flatten() else {
+        tracing::info!(path = %path.display(), "binfile import: vault facts not ready; ignoring");
         return;
     };
     let project_id = match crate::installer::default_project_id(&client, &live.team_id).await {
@@ -1151,8 +1212,12 @@ async fn import_into_vault<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) {
             return;
         }
     };
-    let name = src.file_stem().and_then(|s| s.to_str()).unwrap_or("Imported file").to_string();
-    let bytes = match tauri::async_runtime::spawn_blocking(move || std::fs::read(&src)).await {
+    let bytes = match tauri::async_runtime::spawn_blocking({
+        let path = path.clone();
+        move || std::fs::read(&path)
+    })
+    .await
+    {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
             crate::dialog::native_error_dialog("Penpot Local — Import failed", &format!("could not read the file: {e}"));
@@ -1176,6 +1241,29 @@ async fn import_into_vault<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) {
         }
         Err(e) => crate::dialog::native_error_dialog("Penpot Local — Import failed", &format!("{e:#}")),
     }
+}
+
+/// File > Import…: pick a `.zip` via a native file picker, then hand its
+/// path to [`import_binfile_from_path`] with `confirm: false` — the user
+/// picking this exact file from the dialog IS the confirmation, so there is
+/// nothing left to ask.
+async fn import_into_vault<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) {
+    // Same early gate as before this was factored out: skip even showing
+    // the (blocking) native file picker if boot hasn't produced RPC
+    // credentials yet — there would be nothing to import into.
+    if rpc_client(&live_snapshot(&ctx.live)).is_none() {
+        tracing::info!("Import requested before boot completed; ignoring");
+        return;
+    }
+    let Some(src) = tauri::async_runtime::spawn_blocking(|| {
+        crate::dialog::choose_file("Import a Penpot export (.zip)", &["zip"])
+    })
+    .await
+    .ok()
+    .flatten() else {
+        return;
+    };
+    import_binfile_from_path(app, ctx, src, /* confirm */ false).await;
 }
 
 /// File > Reveal in Finder: resolve the key window's file to its on-disk
@@ -1394,13 +1482,28 @@ mod tests {
 
     #[test]
     fn a_non_penpot_resolution_is_rejected() {
-        let action = document_action(docopen::Resolved::NotAPenpotDir {
+        let action = document_action(docopen::Resolved::NotAPenpot {
             reason: "notes is not a directory".into(),
         });
         assert_eq!(
             action,
             DocumentAction::Reject { reason: "notes is not a directory".into() }
         );
+    }
+
+    #[test]
+    fn an_importable_binfile_resolution_imports_not_opens() {
+        // The downloaded-`.penpot`-file bug: `Resolved::ImportableBinfile`
+        // must route to `ImportBinfileFile`, not `Reject` — that was the
+        // exact gap this fix closes. `title` is deliberately dropped here
+        // (see `DocumentAction::ImportBinfileFile`'s doc comment); only
+        // `path` carries through.
+        let path = PathBuf::from("/Users/x/Downloads/Avataaars.penpot");
+        let action = document_action(docopen::Resolved::ImportableBinfile {
+            path: path.clone(),
+            title: "Avataaars".into(),
+        });
+        assert_eq!(action, DocumentAction::ImportBinfileFile { path });
     }
 
     // -----------------------------------------------------------------
