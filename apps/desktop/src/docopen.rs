@@ -6,9 +6,18 @@
 //! translation on top. Mirrors the `tray/model.rs` / `windows.rs` split:
 //! this module is deliberately free of Tauri types, touching the
 //! filesystem only for the read-only checks it needs (`is_dir`,
-//! `canonicalize`) and never writing to the vault or the DB — the core
-//! invariant (DB is a disposable cache, the folder tree is truth) does not
-//! apply to a module that never mutates either side of it.
+//! `canonicalize`, and — for a `.penpot` FILE — reading its first four
+//! bytes) and never writing to the vault or the DB — the core invariant (DB
+//! is a disposable cache, the folder tree is truth) does not apply to a
+//! module that never mutates either side of it.
+//!
+//! There are TWO shapes of `.penpot` in the world, and both are handled
+//! here. Inside the vault, a `.penpot` is an UNZIPPED DIRECTORY — our
+//! storage format, the one the sync daemon reads and writes. Everywhere
+//! else (Downloads, a shared link, an export from penpot.app), a `.penpot`
+//! is a ZIP FILE — the binfile-v3 export format, `PK\x03\x04` magic and
+//! all. The single most natural gesture — download a `.penpot` and open it
+//! — produces the second shape, so `resolve` below recognizes both.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -29,8 +38,15 @@ pub enum Resolved {
     PendingImport { rel_path: String },
     /// A `.penpot` dir outside the vault. The caller offers to import it.
     External { path: PathBuf },
-    /// Not a directory whose name ends in `.penpot`.
-    NotAPenpotDir { reason: String },
+    /// A `.penpot` FILE (not a directory) anywhere — the zip binfile export
+    /// shape, confirmed by its `PK\x03\x04` magic. No vault-membership
+    /// question applies to this one: it is imported by copying its BYTES
+    /// over RPC (exactly like `menubar::import_into_vault`'s File > Import…
+    /// path), never by its filesystem path, so there is no in/out-of-vault
+    /// distinction to make.
+    ImportableBinfile { path: PathBuf, title: String },
+    /// Neither a `.penpot` directory nor a `.penpot` zip file.
+    NotAPenpot { reason: String },
 }
 
 /// Resolve `raw_path` against `vault_root` and the already-loaded
@@ -48,18 +64,45 @@ pub enum Resolved {
 /// un-canonicalized `vault_root` against a canonicalized `raw_path` would
 /// spuriously fail `strip_prefix` even for genuinely in-vault paths.
 pub fn resolve(raw_path: &Path, vault_root: &Path, manifest: &Manifest) -> Resolved {
-    if !raw_path.is_dir() {
-        return Resolved::NotAPenpotDir {
-            reason: format!("{} is not a directory", raw_path.display()),
-        };
+    if raw_path.is_dir() {
+        return resolve_dir(raw_path, vault_root, manifest);
     }
+
+    // Not a directory: the only other shape this function recognizes is a
+    // `.penpot` FILE — the zip binfile export format found everywhere
+    // outside the vault. Confirming the zip magic (rather than trusting the
+    // extension alone) keeps a same-named non-export file — or a `.penpot`
+    // that failed to download completely — from being handed to the import
+    // machinery as if it were real.
+    if let Some(name) = raw_path.file_name().and_then(|n| n.to_str()) {
+        if name.ends_with(".penpot") && starts_with_zip_magic(raw_path) {
+            return Resolved::ImportableBinfile {
+                path: raw_path.to_path_buf(),
+                title: display_title(name),
+            };
+        }
+    }
+
+    Resolved::NotAPenpot {
+        reason: format!(
+            "{} is not a Penpot document (expected a .penpot folder or a .penpot export file)",
+            raw_path.display()
+        ),
+    }
+}
+
+/// The directory branch of [`resolve`] — a `.penpot` dir is either already
+/// known to the manifest, freshly on disk and pending import, or outside
+/// the vault entirely. Unchanged from before the `ImportableBinfile` split
+/// other than the renamed reject variant.
+fn resolve_dir(raw_path: &Path, vault_root: &Path, manifest: &Manifest) -> Resolved {
     let Some(name) = raw_path.file_name().and_then(|n| n.to_str()) else {
-        return Resolved::NotAPenpotDir {
+        return Resolved::NotAPenpot {
             reason: format!("{} has no usable file name", raw_path.display()),
         };
     };
     if !name.ends_with(".penpot") {
-        return Resolved::NotAPenpotDir {
+        return Resolved::NotAPenpot {
             reason: format!("{name} does not end in .penpot"),
         };
     }
@@ -75,7 +118,7 @@ pub fn resolve(raw_path: &Path, vault_root: &Path, manifest: &Manifest) -> Resol
     let (Ok(canonical_path), Ok(canonical_vault)) =
         (std::fs::canonicalize(raw_path), std::fs::canonicalize(vault_root))
     else {
-        return Resolved::NotAPenpotDir {
+        return Resolved::NotAPenpot {
             reason: format!(
                 "{} could not be resolved against the vault",
                 raw_path.display()
@@ -103,6 +146,21 @@ pub fn resolve(raw_path: &Path, vault_root: &Path, manifest: &Manifest) -> Resol
         },
         None => Resolved::PendingImport { rel_path },
     }
+}
+
+/// True iff `path` is a readable file whose first four bytes are the zip
+/// local-file-header signature (`PK\x03\x04`) — every binfile-v3 export
+/// (`.penpot` file downloaded from penpot.app, shared, or produced by this
+/// app's own File > Export…) starts with it. A failed open/read (permission
+/// denied, the file vanished mid-check, fewer than four bytes) is NOT a
+/// match — fail closed, same discipline as the vault-boundary canonicalize
+/// check above: an unreadable path is never silently treated as importable.
+fn starts_with_zip_magic(path: &Path) -> bool {
+    use std::io::Read;
+    const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut buf = [0u8; 4];
+    file.read_exact(&mut buf).is_ok() && buf == ZIP_MAGIC
 }
 
 /// `<project>/<name>.penpot` -> `<name>`, for a vault-relative path.
@@ -224,7 +282,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("notes")).unwrap();
         assert!(matches!(resolve(&tmp.path().join("notes"), tmp.path(), &Manifest::default()),
-                         Resolved::NotAPenpotDir { .. }));
+                         Resolved::NotAPenpot { .. }));
     }
 
     #[test]
@@ -256,7 +314,7 @@ mod tests {
         let missing_vault = tmp.path().join("does-not-exist");
         assert!(matches!(
             resolve(&tmp.path().join("X.penpot"), &missing_vault, &Manifest::default()),
-            Resolved::NotAPenpotDir { .. }
+            Resolved::NotAPenpot { .. }
         ));
     }
 
@@ -267,6 +325,56 @@ mod tests {
         let m = vault_with(root, "Proj/Home.penpot", "fid1");
         let sneaky = root.join("Proj").join("..").join("Proj").join("Home.penpot");
         assert!(matches!(resolve(&sneaky, root, &m), Resolved::InVault { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // The other `.penpot` shape: a ZIP FILE (the binfile-v3 export format
+    // found everywhere outside the vault — Downloads, a shared link, an
+    // export from penpot.app or this app's own File > Export…). None of
+    // these cases touch a vault/manifest at all — `ImportableBinfile` skips
+    // the in/out-of-vault question entirely (see its doc comment).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_penpot_zip_file_anywhere_resolves_to_importable_binfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap(); // deliberately unrelated to the file's location
+        let path = tmp.path().join("Avataaars.penpot");
+        std::fs::write(&path, b"PK\x03\x04rest-of-the-zip-does-not-matter-here").unwrap();
+
+        match resolve(&path, vault.path(), &Manifest::default()) {
+            Resolved::ImportableBinfile { path: got_path, title } => {
+                assert_eq!(got_path, path);
+                assert_eq!(title, "Avataaars");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dot_penpot_file_without_zip_magic_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Fake.penpot");
+        std::fs::write(&path, b"hello").unwrap();
+
+        assert!(matches!(
+            resolve(&path, vault.path(), &Manifest::default()),
+            Resolved::NotAPenpot { .. }
+        ));
+    }
+
+    #[test]
+    fn a_non_dot_penpot_file_is_rejected_even_with_zip_magic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("archive.zip");
+        std::fs::write(&path, b"PK\x03\x04rest-of-the-zip-does-not-matter-here").unwrap();
+
+        assert!(matches!(
+            resolve(&path, vault.path(), &Manifest::default()),
+            Resolved::NotAPenpot { .. }
+        ));
     }
 
     // -----------------------------------------------------------------
