@@ -4,26 +4,54 @@
 //! callback. Reading that callback is OUR code observing OUR window — it does
 //! not patch, inject into, or drive Penpot's SPA, so invariant 3 holds.
 //!
-//! Two different policies apply to two different route classes (D1 decision,
-//! `.superpowers/sdd/task-6-report.md`; updated by D2 and D4):
-//!   * `#/auth/*`, `#/dashboard`, `#/settings` — cancelled UNCONDITIONALLY, no
-//!     env var required. `#/auth` is closed because there is no second
-//!     account to log into or register in a single-user offline app; this is
-//!     safe for the real login path: `/__bootstrap`
-//!     (`apps/desktop/src/lib.rs::bootstrap_login`) logs in server-side via
-//!     RPC and 302s straight to `/__home`, never through an `#/auth/...`
-//!     fragment in the webview — so unconditionally cancelling `#/auth`
-//!     cannot cancel login itself. (This supersedes the original D0 WARNING
-//!     that D2 must verify this before enabling it; D1 verified it by
-//!     inspection of the bootstrap route above.) `#/dashboard` joined this
-//!     class in D2: its replacement, `/__home` with create/rename/duplicate/
-//!     move/delete, shipped earlier in this milestone, so the surface could
-//!     close by default. `#/settings` joins it in D4, for the identical
-//!     reason: its native replacement, the Preferences window
+//! ## Route accounting (D6 residue audit — this is the authoritative table)
+//!
+//! The shipped bundle does not elide `*assert*`, so every top-level hash
+//! route in it is reachable by URL, not just the ones the app's own UI links
+//! to. D6 (`docs/superpowers/plans/2026-07-21-d6-residue-audit.md`) walked
+//! the bundle and classified all eight route families below; this module is
+//! where that classification is enforced, so it is written out here in full
+//! rather than trusted to stay in sync with an external doc.
+//!
+//! Cancelled unconditionally — [`ALWAYS_CANCELLED_PREFIXES`], no env var
+//! required:
+//!   * `#/auth/*` (D1) — there is no second account to log into or register
+//!     in a single-user offline app; safe for the real login path, since
+//!     `/__bootstrap` (`apps/desktop/src/lib.rs::bootstrap_login`) logs in
+//!     server-side via RPC and 302s straight to `/__home`, never through an
+//!     `#/auth/...` fragment in the webview.
+//!   * `#/dashboard` (D2) — its replacement, `/__home` with create/rename/
+//!     duplicate/move/delete, shipped in D2, so the surface could close by
+//!     default.
+//!   * `#/settings` (D4) — its native replacement, the Preferences window
 //!     (`apps/desktop/src/prefs_http.rs`, `/__preferences`), now exists.
 //!     D1/D2/D3 all left it open specifically because that replacement
-//!     didn't exist yet — see `settings_is_present_and_cancelled_in_d4`'s doc
-//!     for the history this test pins.
+//!     didn't exist yet — see `settings_is_present_and_cancelled_in_d4`'s
+//!     doc for the history this test pins.
+//!   * `#/debug` (D6) — `#/debug/icons-preview` and `#/debug/playground` are
+//!     inert dev tooling with no account or network implication, and the app
+//!     never navigates to either. Closing them is risk-free and is what
+//!     closes the accounting gap the audit found: five milestones of "no web
+//!     route reaches the canvas" never accounted for these two.
+//!
+//! Allowed — the app either navigates here itself or this IS the product:
+//!   * `#/workspace/*` — the product itself.
+//!   * `#/view/*` — present mode, KEPT DELIBERATELY. Our own Present buttons
+//!     navigate here, and share-links pointing at it are inert offline (no
+//!     server to resolve them against). Do NOT redirect it.
+//!   * `#/frame-preview`, `#/render-sprite/:id` — internal render utilities
+//!     the SPA navigates to ITSELF as part of rendering. Cancelling either
+//!     could break rendering — the same lesson `#/view` already taught — so
+//!     both stay allowed and pinned by
+//!     `internal_render_routes_and_the_viewer_stay_allowed` below.
+//!
+//! Absent from our build, no action needed:
+//!   * `#/subscribe-nitrate` — gated behind a flag this build does not set.
+//!     The route literal ships in the bundle but a runtime `contains?(flags,
+//!     :nitrate)` guard leaves it UNREGISTERED in the route tree, so it is
+//!     unreachable and needs no policy. Recorded here so the accounting names
+//!     all eight families, not because it needs a
+//!     policy.
 //!
 //! The gated class below is currently EMPTY (D4 was the last web route in
 //! it) — kept as a mechanism, not deleted, in case a future web route needs
@@ -52,8 +80,10 @@ pub const HOME_PATH: &str = "/__home";
 /// module doc comment above for why this is safe for the real login path.
 /// `#/dashboard` joined this class in D2 (`/__home` with create/rename/
 /// duplicate/move/delete shipped as its replacement); `#/settings` joins in
-/// D4 (`/__preferences`, `prefs_http.rs`, shipped as ITS replacement).
-const ALWAYS_CANCELLED_PREFIXES: [&str; 3] = ["#/auth", "#/dashboard", "#/settings"];
+/// D4 (`/__preferences`, `prefs_http.rs`, shipped as ITS replacement);
+/// `#/debug` joins in D6 (no replacement needed — it's inert dev tooling the
+/// app never navigates to, so closing it has no product-side cost).
+const ALWAYS_CANCELLED_PREFIXES: [&str; 4] = ["#/auth", "#/dashboard", "#/settings", "#/debug"];
 
 /// Hash routes cancelled ONLY when `PENPOT_LOCAL_NAVWATCH_REDIRECT=1` — their
 /// native replacement doesn't exist yet, so they stay open (measurement-only)
@@ -333,5 +363,45 @@ mod tests {
                 "{u} must still be redirected"
             );
         }
+    }
+
+    #[test]
+    fn debug_routes_are_cancelled() {
+        // The shipped bundle does not elide *assert*, so #/debug/* is reachable
+        // by URL. It is inert dev tooling with no account/network implication,
+        // and the app never navigates there — so we close it.
+        for url in [
+            "http://localhost:9058/#/debug/icons-preview",
+            "http://localhost:9058/#/debug/playground",
+        ] {
+            match decide(url, false) {
+                Decision::CancelAndRedirect(to) => assert!(to.ends_with(HOME_PATH), "{url} -> {to}"),
+                other => panic!("{url} not cancelled: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn internal_render_routes_and_the_viewer_stay_allowed() {
+        // These the SPA navigates to ITSELF (present mode; frame/sprite render
+        // utilities). Cancelling would break rendering — the #/view lesson. The
+        // audit KEEPS them, deliberately, and pins that so a future tidy-up
+        // can't silently cancel them.
+        for url in [
+            "http://localhost:9058/#/view?file-id=x&page-id=y",
+            "http://localhost:9058/#/frame-preview",
+            "http://localhost:9058/#/render-sprite/abc",
+            "http://localhost:9058/#/workspace?team-id=t&file-id=f",
+        ] {
+            assert!(matches!(decide(url, false), Decision::Allow), "{url} should be allowed");
+        }
+    }
+
+    #[test]
+    fn debug_prefix_boundary_holds() {
+        // A longer route that merely starts with the text "#/debug" must NOT
+        // match "#/debug" — the boundary is a "/" subpath or an exact match.
+        assert!(matches!(decide("http://localhost:9058/#/debugxyz", false), Decision::Allow));
+        assert!(matches!(decide("http://localhost:9058/#/debugger", false), Decision::Allow));
     }
 }

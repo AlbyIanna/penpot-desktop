@@ -156,7 +156,7 @@ and **actually take effect** (e.g. toggling the exporter stops renders being pro
 vault switch initiated from Preferences goes through the N5 zero-spill machinery (re-asserting no
 cross-vault spill). Green twice.
 
-### D5 — OS integration: documents, windows, drag-and-drop — ✅ DONE
+### D5 — OS integration: documents, windows, drag-and-drop — ✅ DONE (merged)
 Goal: behave like a document-based app. Open a `.penpot` folder from Finder (file association / CLI
 argument / URL scheme); one window per file with the **filename in the window title**; multi-window;
 drag a `.penpot` folder onto the app to open it. Must cooperate with the M5 single-instance guard: a

@@ -327,6 +327,32 @@ d4:
 d5:
     bash scripts/d5-documents.sh
 
+# D6 residue gate (PLAN4 milestone D6, chapter 4's closer). Ties together the
+# route-accounting audit, the honest known-limits doc, and the packaged
+# artifact proof: (a) requires BY NAME the specific navwatch:: unit tests
+# that pin every route-family verdict (debug_routes_are_cancelled,
+# internal_render_routes_and_the_viewer_stay_allowed,
+# dashboard_is_cancelled_even_with_redirect_disabled,
+# settings_is_present_and_cancelled_in_d4,
+# auth_family_is_cancelled_even_with_redirect_disabled,
+# workspace_and_our_surfaces_are_never_redirected) — not just "the suite
+# passed"; (b) a live GUI redirect probe for #/dashboard and
+# #/debug/playground is SKIPPED (kept out of the pass count, reason printed
+# — the policy itself is already required by name in (a), and the live
+# on_navigation->redirect mechanism has been exercised continuously by
+# D0/D1/D2's own GUI legs); (c) a structural check that docs/known-limits.md
+# exists and carries all five required sections; (d) greps
+# scripts/m4-artifact-test.sh for the D6 navwatch-log leg Task 3 added, so
+# `just d6` and `just m4` cannot drift apart — the actual packaged run (needs
+# a dmg, many minutes) stays in `just m4`, never re-executed here. Dedicated
+# ports (reserved, not bound today since leg (b) is skipped): proxy 9058,
+# backend 6520, postgres 5593, valkey 6536. Chained into `just e2e` — it is
+# pure and headless (a cargo test run + two grep checks + one documented
+# skip), unlike m4-artifact-test.sh which needs a packaged dmg build and
+# stays out of the chain.
+d6:
+    bash scripts/d6-residue.sh
+
 # SPA hash-route version-bump gate (PLAN2 risk 2): grep the route strings out
 # of the compiled bundle + a live headless-browser navigation assert. Boots its
 # own throwaway stack unless ROUTES_GATE_BASE points at a running one. Run this
@@ -364,7 +390,10 @@ routes-gate:
 # pure-verdict spikes, no product behaviour changes by default (D1's navwatch
 # policy IS the product behaviour D0 spiked — D1 exercises it via cargo
 # test, not by re-running D0; D5's document-open wiring IS the product
-# behaviour d5a spiked — d5-documents exercises it directly).
+# behaviour d5a spiked — d5-documents exercises it directly). d6-residue.sh
+# chains too (D6 lands product code — the #/debug closure — and its own leg
+# (b) is SKIPPED rather than GUI-only, so unlike m4-artifact-test.sh it is
+# fully headless and safe to run in this chain).
 e2e:
     bash scripts/m1-smoke.sh
     bash scripts/m2-invariant.sh
@@ -386,6 +415,7 @@ e2e:
     bash scripts/d3-menus.sh
     bash scripts/d4-preferences.sh
     bash scripts/d5-documents.sh
+    bash scripts/d6-residue.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

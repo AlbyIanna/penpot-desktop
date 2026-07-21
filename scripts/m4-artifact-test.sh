@@ -38,6 +38,23 @@
 #       hardened route (dotfile -> 400), /__api/packages/plugins lists it
 #       un-installed (surface-don't-apply), and the DEFAULT CSP header rides
 #       the SPA document (the CSP-GO egress promise ships in the artifact);
+#   (h) D6 NAVWATCH: the packaged app boots into the native home, offline, not
+#       the dashboard — PENPOT_LOCAL_NAVWATCH_LOG (passed through the env -i
+#       invocation below) makes the app append every {source,url} navigation
+#       observation as JSONL (apps/desktop/src/navwatch.rs). The hash
+#       fragment never reaches the server, so this log is the ONLY valid
+#       evidence of what the webview actually loaded — a curl check proves
+#       nothing about it. Asserts the boot resolves /__bootstrap -> /__home
+#       and that NO observation anywhere in the session is a #/dashboard,
+#       #/auth, or #/settings fragment. A missing/empty log FAILS LOUDLY as
+#       an infrastructure failure, never a silent pass (D0/D6 precedent);
+#   (i) D6 OFFLINE EGRESS STRENGTHENING: on top of the env -i + poisoned-proxy
+#       harness (which already means a non-loopback connection cannot succeed
+#       in principle), samples `lsof -nP -i` over the full packaged stack
+#       (stack_pids()) and asserts zero non-loopback peers, reusing
+#       scripts/d1_egress.py's loopback predicate/parser rather than a new
+#       implementation — this is the promised D6 strengthening of D1's
+#       single-lsof-sample caveat (docs/known-limits.md);
 #   (e) SIGTERM -> clean exit, no orphans; then a SIGKILL run -> the watchdog
 #       reaps every child (incl. the exporter node child — the M5 orphan gap).
 #
@@ -68,6 +85,7 @@ INSTALL="$WORK/install"
 FRESH_HOME="$WORK/home"
 DATA_DIR="$WORK/data"
 LOG="$WORK/app.log"
+NAVWATCH_LOG="$WORK/navwatch.jsonl"
 APP_NAME="Penpot Local.app"
 APP="$INSTALL/$APP_NAME"
 APP_BIN="$APP/Contents/MacOS/penpot-desktop"
@@ -121,6 +139,7 @@ start_app() { # sanitized environment: the fresh-machine approximation
             PENPOT_LOCAL_VALKEY_PORT="$VALKEY_PORT" \
             PENPOT_LOCAL_EXPORTS=1 \
             PENPOT_LOCAL_EXPORTER_PORT="$EXPORTER_PORT" \
+            PENPOT_LOCAL_NAVWATCH_LOG="$NAVWATCH_LOG" \
             "$APP_BIN"
     ) >>"$LOG" 2>&1 &
     APP_PID=$!
@@ -333,6 +352,95 @@ if grep -q "sync-status tray icon created" "$LOG"; then
     pass "(d) sync-status tray icon created (GUI run)"
 else
     fail "(d) sync-status tray icon created (GUI run)"
+fi
+
+# (h) D6 NAVWATCH: the packaged app boots into /__home, offline, never the ---------------
+# dashboard. The hash fragment never reaches the server (only the webview
+# sees it), so PENPOT_LOCAL_NAVWATCH_LOG (wired into start_app() above) is the
+# ONLY valid evidence of what the webview actually loaded — a curl check on
+# the proxy proves nothing about the on-screen URL. A missing/empty log means
+# the probe never looked and must FAIL LOUDLY as an infrastructure failure,
+# never read as a silent pass (D0/D6 precedent).
+NAV_RESULT="$(python3 - "$NAVWATCH_LOG" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+urls = []
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                urls.append(json.loads(line)["url"])
+            except (ValueError, KeyError):
+                continue
+except FileNotFoundError:
+    pass
+
+if not urls:
+    print(json.dumps({"ok": False, "reason": "navwatch log empty or absent", "urls": urls}))
+    sys.exit(0)
+
+bootstrap_idx = next((i for i, u in enumerate(urls) if "/__bootstrap" in u), None)
+home_idx = next((i for i, u in enumerate(urls) if "/__home" in u), None)
+bad = [u for u in urls if any(f in u for f in ("#/dashboard", "#/auth", "#/settings"))]
+
+ok = bootstrap_idx is not None and home_idx is not None and home_idx > bootstrap_idx and not bad
+reason = None
+if bootstrap_idx is None:
+    reason = "no /__bootstrap observation"
+elif home_idx is None:
+    reason = "no /__home observation"
+elif home_idx <= bootstrap_idx:
+    reason = "/__home was not observed AFTER /__bootstrap"
+elif bad:
+    reason = "a dashboard/auth/settings fragment was observed"
+
+print(json.dumps({
+    "ok": ok,
+    "reason": reason,
+    "bootstrapIdx": bootstrap_idx,
+    "homeIdx": home_idx,
+    "badFragments": bad,
+    "urls": urls,
+}))
+PY
+)"
+echo "     navwatch: $NAV_RESULT"
+NAV_OK="$(echo "$NAV_RESULT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ok"))' 2>/dev/null || echo False)"
+if [ "$NAV_OK" = "True" ]; then
+    pass "(h1) packaged app booted into the native home via /__bootstrap -> /__home (navwatch log); no #/dashboard, #/auth, or #/settings observation anywhere in the session"
+else
+    fail "(h1) navwatch does not prove a clean /__bootstrap -> /__home boot with no dashboard/auth/settings fragment (empty/absent log is an INFRASTRUCTURE FAILURE, never a pass): $NAV_RESULT"
+fi
+
+# (i) D6 OFFLINE EGRESS STRENGTHENING: zero non-loopback peers over the FULL ------------
+# packaged stack. The env -i + poisoned-proxy harness already means a
+# non-loopback connection cannot succeed in principle; this leg adds the
+# process-level socket evidence, discharging D1's own documented single-lsof-
+# sample caveat (docs/known-limits.md). Reuses d1_egress.py's loopback
+# predicate/parser verbatim rather than a second implementation.
+EGRESS_PY="$ROOT/scripts/d1_egress.py"
+if [ ! -f "$EGRESS_PY" ]; then
+    fail "(i1) d1_egress.py present (missing: $EGRESS_PY)"
+else
+    EGRESS_PIDS="$(stack_pids | tr '\n' ',' | sed 's/,$//')"
+    EGRESS_LSOF="$WORK/egress-lsof.txt"
+    lsof -nP -i -a -p "$EGRESS_PIDS" >"$EGRESS_LSOF" 2>/dev/null || true
+    EG="$(python3 "$EGRESS_PY" parse "$EGRESS_LSOF")"
+    CONN_TOTAL="$(echo "$EG" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['connections']))")"
+    if [ "$CONN_TOTAL" = "0" ]; then
+        fail "(i1) INFRASTRUCTURE FAILURE — the lsof sample over the packaged stack (pids: $EGRESS_PIDS) captured ZERO connections of any kind; nonLoopback=[] is vacuous here, not evidence of zero egress — see $EGRESS_LSOF"
+    else
+        EGRESS_BAD="$(echo "$EG" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['nonLoopback']))")"
+        if [ "$EGRESS_BAD" = "0" ]; then
+            pass "(i1) zero non-loopback peers over the packaged stack ($CONN_TOTAL loopback connection(s) observed, pids: $EGRESS_PIDS) — strengthens D1's single lsof sample with the env -i + poisoned-proxy packaged harness"
+        else
+            fail "(i1) packaged stack holds $EGRESS_BAD non-loopback connection(s): $(echo "$EG" | python3 -c "import json,sys;print(json.load(sys.stdin)['nonLoopback'])")"
+        fi
+    fi
 fi
 
 # (f) RENDERS ON: seeded board -> svg+png via the bundled node + headless shell -----

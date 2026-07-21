@@ -37,6 +37,45 @@ See [PLAN.md](PLAN.md) for the architecture, milestones, and risk register;
 | M4 — packaging (AppImage/dmg/Nix) | ✅ done — macOS dmg verified; AppImage CI-only; NixOS VM deferred (`docs/milestones/m4.md`) |
 | M5 — per-board exports, OS rename/move, git helpers, hardening | ✅ done — exporter dev-mode only; notarization + NixOS VM still open (`docs/milestones/m5.md`) |
 
+That table covers chapter 1 — the sync engine and packaging. Two further chapters shipped on top
+of it before chapter 4, below: chapter 2 (vault ergonomics — search, quick-open, multi-vault,
+templates: [`docs/milestones/n1.md`](docs/milestones/n1.md) through
+[`n6.md`](docs/milestones/n6.md)) and chapter 3 (the plugin/library ecosystem — contracts,
+package installs, component-library linking, plugin packages:
+[`docs/milestones/e1.md`](docs/milestones/e1.md) through [`e4.md`](docs/milestones/e4.md), plus
+spikes in [`docs/ecosystem-spikes/`](docs/ecosystem-spikes/)).
+
+## Chapter 4 — the desktop app
+
+Chapters 1–3 made Penpot Local a correct, offline, syncing app. Chapter 4 (milestones D0–D6)
+made it feel like a native macOS app rather than a web page in a window — by configuration,
+navigation policy, and native chrome, never by patching Penpot's own frontend (invariant 3, see
+[CLAUDE.md](CLAUDE.md)). It shipped:
+
+- **A native home as the front door** — `/__home` replaces Penpot's dashboard entirely for
+  project/file management ([D2](docs/milestones/d2/README.md)).
+- **A native menu bar and keyboard shortcuts** — File/Edit/View/Window/Help, window-per-file,
+  Open Recent ([D3](docs/milestones/d3/README.md)).
+- **Native Preferences** (`⌘,`) — vault, sync, renders, plugins, CSP, with a reboot-in-place
+  that never wipes the database ([D4](docs/milestones/d4/README.md)).
+- **Document integration** — a `.penpot` opens in its own window from a CLI argument, a second
+  launch, drag-drop, or a Finder double-click ([D5](docs/milestones/d5/README.md)).
+- **Proven-offline** — zero non-loopback connection attempts, checked at both the browser and
+  process level, across the dev stack and, as of D6, the packaged artifact
+  ([D1](docs/milestones/d1/README.md), [D6](docs/milestones/d6/README.md)).
+
+D0 ([spike](docs/milestones/d0.md)) and D1 ([D1](docs/milestones/d1/README.md)) removed the
+cloud-account surfaces first; D6 ([D6](docs/milestones/d6/README.md)) closed the chapter by
+auditing every reachable web route — not just the ones the app's own UI links to — and cancelling
+the one gap that audit found (`#/debug`). What the app still can't remove from inside the canvas,
+and why invariant 3 keeps it that way, is catalogued in full in
+[`docs/known-limits.md`](docs/known-limits.md) rather than repeated here.
+
+Native chrome — the menu bar, Preferences window, native dialogs — is OS-level UI outside any
+browser and is verified manually on a real GUI session and by spike, per
+[PLAN4.md](PLAN4.md); it is not exercised by headless CI, and each milestone doc says so
+explicitly rather than implying otherwise.
+
 ## Running it (macOS, dev)
 
 Prerequisites (one-time):
