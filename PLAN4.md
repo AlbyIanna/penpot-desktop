@@ -147,7 +147,7 @@ expected items and accelerators, and that **every menu action's underlying comma
 — menus cannot be clicked in CI, so the command layer is tested directly and the menu wiring is
 asserted to map onto those commands (no orphaned or dead menu items). Green twice.
 
-### D4 — Native Preferences + native dialogs
+### D4 — Native Preferences + native dialogs — ✅ DONE
 Goal: a native Preferences window standing in for `/settings`: vault location and switching (through
 the proven N5 path), sync on/off + status, thumbnails/exporter toggle, plugin + CSP toggles,
 about/updates. Native open/save dialogs for import/export.
@@ -156,7 +156,7 @@ and **actually take effect** (e.g. toggling the exporter stops renders being pro
 vault switch initiated from Preferences goes through the N5 zero-spill machinery (re-asserting no
 cross-vault spill). Green twice.
 
-### D5 — OS integration: documents, windows, drag-and-drop
+### D5 — OS integration: documents, windows, drag-and-drop — ✅ DONE
 Goal: behave like a document-based app. Open a `.penpot` folder from Finder (file association / CLI
 argument / URL scheme); one window per file with the **filename in the window title**; multi-window;
 drag a `.penpot` folder onto the app to open it. Must cooperate with the M5 single-instance guard: a

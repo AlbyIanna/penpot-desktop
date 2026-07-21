@@ -3,6 +3,9 @@
   "bundle": {
     "resources": {
       "../../dist/penpot-runtime": "penpot-runtime"
+    },
+    "macOS": {
+      "infoPlist": "Info.plist"
     }
   }
 }
