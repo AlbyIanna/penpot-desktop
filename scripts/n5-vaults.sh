@@ -15,6 +15,12 @@
 #       by an image fill) so media hygiene is provable.
 #   (b) switch A→B→A driven headlessly via the localhost control endpoint
 #       (POST /open {path}) — NO GUI dialog.
+#   (b/auth) that same control endpoint REFUSES a tokenless request (401) and
+#       a browser-shaped one carrying a VALID token (403). Chapter C made the
+#       port unconditional, so these two are what keep POST /open — a wipe of
+#       the disposable DB — out of reach of any web page the user has open.
+#       They are also the only automated coverage of the auth layer actually
+#       being applied to the served router (see the block itself).
 #   (c) after EVERY switch: ZERO spill — no file of the other vault appears in
 #       the DB (get-projects/get-project-files), the /__home lighttable
 #       (/__api/vault/boards) or the index (/__api/vault/search); and MEDIA
@@ -276,6 +282,33 @@ read_token || { fail "(a) no access token"; exit 1; }
 [ "$(control_active_path)" = "$VAULT_A" ] &&
     pass "(a) control /active reports vault A" ||
     fail "(a) control /active not A: $(control_active_path)"
+
+# --- (b/auth) the two defences standing between POST /open and the web ------
+# Chapter C made this port unconditional, and POST /open wipes the disposable
+# DB and reconciles the whole vault from disk. ANY web page the user has open
+# can send a cross-origin POST to 127.0.0.1 — the same-origin policy blocks
+# READING the response, not SENDING the request. So the server demands the
+# per-boot token AND refuses anything browser-shaped (Origin / Sec-Fetch-Site)
+# even when the token is valid.
+#
+# These two assertions are the ONLY automated proof that the auth layer is
+# wired onto the router `serve_control` actually serves: the unit tests in
+# crates/app-core/src/runtime_record.rs exercise a synthetic router they build
+# themselves, and every other control request in this gate merely ADDS a
+# header — which an UNGUARDED server would ignore, staying green. Delete the
+# `.layer(...)` in `serve_control` and these are what must go red. The
+# positive control is the assertion immediately above: a request WITH the
+# token just answered /active correctly, so a 401/403 here means "refused",
+# never "server down".
+AUTH_NO_TOKEN="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$CONTROL/health")"
+[ "$AUTH_NO_TOKEN" = "401" ] &&
+    pass "(b/auth) tokenless GET /health -> 401: an unauthenticated caller cannot reach POST /open (the DB wipe)" ||
+    fail "(b/auth) tokenless GET /health -> '$AUTH_NO_TOKEN', expected 401 — THE CONTROL PORT IS UNAUTHENTICATED: anything on this machine can drive POST /open"
+AUTH_BROWSER="$(ctl_curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H 'Origin: https://evil.example' "$CONTROL/health")"
+[ "$AUTH_BROWSER" = "403" ] &&
+    pass "(b/auth) browser-shaped GET /health with a VALID token -> 403: a web page cannot drive the DB wipe even if it learns the token" ||
+    fail "(b/auth) browser-shaped GET /health with a valid token -> '$AUTH_BROWSER', expected 403 — ANY WEB PAGE THE USER HAS OPEN CAN REACH POST /open"
 
 # Seed A (2 overlapping-named projects + a needle each).
 if IDS_A="$(n5helper seed "$WORK_DIR" A "$NEEDLE_A" 2>"$WORK_DIR/seedA.err")"; then

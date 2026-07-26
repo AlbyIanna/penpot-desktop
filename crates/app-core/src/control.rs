@@ -604,9 +604,16 @@ pub fn control_router(runner: Arc<VaultRunner>, windows: WindowRegistry) -> Rout
 /// that module's doc for the full threat model).
 ///
 /// The bound port — not the requested one, so port `0` works — is published
-/// with the pid, the proxy port and the token into `<data_dir>/runtime.json`
-/// (mode 0600) for the CLI to discover. The record is removed on the
-/// shutdown path of whichever binary owns this task.
+/// with the pid, the proxy port and the token into `runtime.json` (mode 0600)
+/// for the CLI to discover. The record is removed on the shutdown path of
+/// whichever binary owns this task.
+///
+/// The data dir and the proxy port are read off `runner`, never passed in:
+/// shutdown retracts the record through [`VaultRunner::data_dir`], so if
+/// publish could take a different path the two could silently disagree — the
+/// record landing where the CLI does not look, and shutdown deleting a path
+/// that was never written, leaving a stale record pointing at a dead port.
+/// One source for the path makes that divergence impossible by construction.
 ///
 /// `windows` is the live [`WindowRegistry`] backing `GET /windows` (D5 Task
 /// 2). The headless runner (no Tauri, no windows ever open) passes an empty
@@ -619,8 +626,6 @@ pub async fn serve_control(
     windows: WindowRegistry,
     port: u16,
     token: String,
-    data_dir: &Path,
-    proxy_port: u16,
 ) -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -628,10 +633,10 @@ pub async fn serve_control(
         .with_context(|| format!("control server cannot bind {addr}"))?;
     let bound = listener.local_addr()?.port();
     crate::runtime_record::write_record(
-        data_dir,
+        runner.data_dir(),
         &crate::runtime_record::RuntimeRecord {
             pid: std::process::id(),
-            proxy_port,
+            proxy_port: runner.proxy_port(),
             control_port: bound,
             token: token.clone(),
         },

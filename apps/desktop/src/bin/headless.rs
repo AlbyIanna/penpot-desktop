@@ -57,24 +57,16 @@ async fn main() -> anyhow::Result<()> {
     // Chapter C: unconditional, because the CLI attaches through it. The env
     // var only pins the port for the gates; unset ⇒ 0 ⇒ the OS picks one and
     // `serve_control` publishes the BOUND port (with the pid, the proxy port
-    // and this token) into `<data_dir>/runtime.json`, mode 0600.
+    // and this token) into `runtime.json` under the runner's OWN data dir —
+    // the same dir the shutdown path below retracts it from.
     let control_port = control::control_port_from_env().unwrap_or(0);
     let control_token = app_core::runtime_record::new_token();
     {
         let runner_ctl = runner.clone();
         let windows = app_core::windows::WindowRegistry::new();
-        let data_dir = runner.data_dir().to_path_buf();
-        let proxy_port = runner.proxy_port();
         tokio::spawn(async move {
-            if let Err(e) = control::serve_control(
-                runner_ctl,
-                windows,
-                control_port,
-                control_token,
-                &data_dir,
-                proxy_port,
-            )
-            .await
+            if let Err(e) =
+                control::serve_control(runner_ctl, windows, control_port, control_token).await
             {
                 tracing::error!("vault control server exited: {e:#}");
             }

@@ -530,27 +530,20 @@ fn main() {
                         // `PENPOT_LOCAL_CONTROL_PORT` only pins the port for
                         // the gates; unset ⇒ 0 ⇒ the OS picks one, and
                         // `serve_control` publishes the BOUND port plus this
-                        // per-boot token into `<data_dir>/runtime.json` (0600).
-                        // Nothing reachable without that token, and anything
-                        // browser-shaped is refused outright — see
-                        // `app_core::runtime_record`.
+                        // per-boot token into `runtime.json` under the
+                        // runner's OWN data dir — the same dir `RunEvent::Exit`
+                        // retracts it from. Nothing reachable without that
+                        // token, and anything browser-shaped is refused
+                        // outright — see `app_core::runtime_record`.
                         {
                             let port = control::control_port_from_env().unwrap_or(0);
                             let runner_ctl = runner.clone();
                             let windows_ctl = window_registry_boot.clone();
                             let token = penpot_desktop::runtime_record::new_token();
-                            let data_dir = runner.data_dir().to_path_buf();
-                            let proxy_port = runner.proxy_port();
                             tauri::async_runtime::spawn(async move {
-                                if let Err(e) = control::serve_control(
-                                    runner_ctl,
-                                    windows_ctl,
-                                    port,
-                                    token,
-                                    &data_dir,
-                                    proxy_port,
-                                )
-                                .await
+                                if let Err(e) =
+                                    control::serve_control(runner_ctl, windows_ctl, port, token)
+                                        .await
                                 {
                                     tracing::error!("vault control server exited: {e:#}");
                                 }
