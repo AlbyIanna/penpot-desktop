@@ -15,6 +15,7 @@ members = [
     "crates/vault-ops",
     "crates/web-ui",
     "crates/app-core",
+    "apps/cli",
 ]
 
 [workspace.package]

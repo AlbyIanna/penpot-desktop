@@ -1,0 +1,40 @@
+[package]
+name = "penpot-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local's command line: the app's third front-end, beside the native chrome and the served HTML pages. INTERNAL — no stability contract, no public surface; it may change in any chapter."
+
+[lib]
+name = "penpot_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "penpot"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+app-core = { path = "../../crates/app-core" }
+app-state = { path = "../../crates/app-state" }
+vault-ops = { path = "../../crates/vault-ops" }
+packages = { path = "../../crates/packages" }
+# NOT in the task brief's starting Cargo.toml: `docopen::resolve` and the
+# `pkg list`/`sync status` readers need `sync_core::Manifest`/`Lockfile`
+# directly (a transitive dependency's types cannot be named without also
+# being a direct one), so this crate needs its own edge to sync-core, not
+# just the one vault-ops/packages already carry internally.
+sync-core = { path = "../../crates/sync-core" }
+# `attach::pid_is_alive`'s kill(pid, 0) probe. Already resolved in this
+# workspace's Cargo.lock (crates/supervisor depends on the same "0.2"), so
+# this adds no new external dependency to the tree — see attach.rs's doc.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
