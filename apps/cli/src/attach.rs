@@ -146,4 +146,38 @@ mod tests {
         child.wait().expect("wait for `true` to exit");
         assert!(!pid_is_alive(pid));
     }
+
+    /// The behaviour the brief singles out for TDD: a `runtime.json` whose
+    /// `pid` is no longer alive (a `SIGKILL` mid-vault-switch — the
+    /// project's own N5 gate does this on purpose — leaves exactly this
+    /// residue) must be rejected, not attached to. Deleting the liveness
+    /// check in `attach()` and leaving every other test in this module
+    /// untouched still leaves all of THEM green — this is the one test that
+    /// would catch it going missing.
+    #[test]
+    fn attach_rejects_a_stale_record_whose_pid_is_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let dead_pid = child.id();
+        child.wait().expect("wait for `true` to exit");
+
+        app_core::runtime_record::write_record(
+            dir.path(),
+            &app_core::runtime_record::RuntimeRecord {
+                pid: dead_pid,
+                proxy_port: 9062,
+                control_port: 9063,
+                token: "s3cret".to_string(),
+            },
+        )
+        .unwrap();
+
+        let err = attach(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("stale") && err.contains("penpot daemon"),
+            "a dead-pid record must be rejected with a message naming the fix, got: {err}"
+        );
+    }
 }
