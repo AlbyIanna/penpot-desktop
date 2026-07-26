@@ -1,0 +1,17 @@
+[package]
+name = "web-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local's served HTML pages: the N3 lighttable home (/__home, thumbnails, quick-open palette, activity/conflict strip) and the D0 navigation probe page. Framework-free pages compiled in with include_str! and served through the proxy's extra routes — the app's second front-end, beside the native chrome and the CLI."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+vault-ops = { path = "../vault-ops" }
+sync-daemon = { path = "../sync-daemon" }
+vault-index = { path = "../vault-index" }
+axum = "0.8"
+http = "1"

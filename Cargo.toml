@@ -13,6 +13,7 @@ members = [
     "crates/app-state",
     "crates/packages",
     "crates/vault-ops",
+    "crates/web-ui",
 ]
 
 [workspace.package]

@@ -8,10 +8,8 @@
 
 pub mod control;
 pub mod dialog;
-pub mod home;
 pub mod layout;
 pub mod menubar;
-pub mod navprobe;
 pub mod navwatch;
 pub mod overlay;
 pub mod preflight;
@@ -968,7 +966,7 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
     // task is spawned after the daemon so the router can be built here.
     let (strip_tx, strip_rx) =
         tokio::sync::watch::channel(sync_daemon::SyncStatusSnapshot::default());
-    let home_routes = home::router(config.designs_dir.clone(), strip_rx);
+    let home_routes = web_ui::home::router(config.designs_dir.clone(), strip_rx);
 
     // --- N4b "Checkpoint now" (manual, git-native vault checkpoint) --------
     let checkpoint_routes = vault_ops::checkpoint::router(config.designs_dir.clone());
@@ -1060,7 +1058,7 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
         .merge(packages_routes)
         .merge(manage_routes)
         .merge(prefs_routes)
-        .merge(navprobe::router());
+        .merge(web_ui::navprobe::router());
 
     let mut proxy_config = proxy::ProxyConfig::new(
         config.runtime_dir.join("frontend"),

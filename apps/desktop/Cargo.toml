@@ -40,6 +40,7 @@ installer = { path = "../../crates/installer" }
 app-state = { path = "../../crates/app-state" }
 packages = { path = "../../crates/packages" }
 vault-ops = { path = "../../crates/vault-ops" }
+web-ui = { path = "../../crates/web-ui" }
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 http = "1"

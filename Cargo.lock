@@ -3138,6 +3138,7 @@ dependencies = [
  "tracing-subscriber",
  "vault-index",
  "vault-ops",
+ "web-ui",
 ]
 
 [[package]]
@@ -5855,6 +5856,21 @@ checksum = "8622dcb61c0bcc9fffa6938bed81210af2da9a7e4a1a834b2e37a59b6dfb6141"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "web-ui"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "http",
+ "serde",
+ "serde_json",
+ "sync-daemon",
+ "tokio",
+ "tracing",
+ "vault-index",
+ "vault-ops",
 ]
 
 [[package]]
