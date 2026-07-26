@@ -3034,6 +3034,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "packages"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http",
+ "installer",
+ "penpot-rpc",
+ "serde",
+ "serde_json",
+ "sync-core",
+ "sync-daemon",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "vault-index",
+]
+
+[[package]]
 name = "pango"
 version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3099,6 +3118,7 @@ dependencies = [
  "directories",
  "http",
  "installer",
+ "packages",
  "penpot-rpc",
  "proxy",
  "rand 0.8.7",

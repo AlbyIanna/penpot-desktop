@@ -18,12 +18,10 @@ pub mod menubar;
 pub mod navprobe;
 pub mod navwatch;
 pub mod overlay;
-pub mod packages;
 pub mod preflight;
 pub mod prefs_http;
 pub mod reveal;
 pub mod status;
-pub mod templates;
 pub mod tray;
 pub mod vault;
 pub mod windows;
@@ -986,8 +984,8 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
     // (`<runtime>/backend/builtin-templates`) and imports-as-new into the
     // active vault's default project on demand — the sync daemon then
     // materializes the `.penpot` tree on disk (folder = source of truth).
-    let templates_routes = templates::router(Arc::new(templates::TemplatesState {
-        builtin_dir: config.runtime_dir.join(templates::BUILTIN_TEMPLATES_REL),
+    let templates_routes = packages::templates::router(Arc::new(packages::templates::TemplatesState {
+        builtin_dir: config.runtime_dir.join(packages::templates::BUILTIN_TEMPLATES_REL),
         backend_base: readiness.backend_base_url.clone(),
         token: credentials.access_token.clone(),
         team_id: team_id.clone(),
@@ -1005,12 +1003,12 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
     // consumer's materialized `.penpot` file is NEVER rewritten (surface, not
     // applied); drift is preserved via `/__api/packages/preserve-drift`.
     let packages_dir = config.designs_dir.join(sync_core::PACKAGES_DIR_NAME);
-    let updates_rx = packages::spawn_updates_poller(
+    let updates_rx = packages::packages::spawn_updates_poller(
         config.designs_dir.clone(),
         packages_dir.clone(),
         team_id.clone(),
     );
-    let packages_state = Arc::new(packages::PackagesState {
+    let packages_state = Arc::new(packages::packages::PackagesState {
         packages_dir,
         vault_root: config.designs_dir.clone(),
         // The E7 consent ledger lives at the DATA dir root (NOT the vault): it
@@ -1018,13 +1016,13 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
         data_dir: config.data_dir.clone(),
         // Local-ness of a plugin pointer is decided by host == our proxy origin
         // (E7 finding 5), independent of any whitelist override.
-        local_origins: packages::local_proxy_origins(config.proxy_port),
+        local_origins: packages::packages::local_proxy_origins(config.proxy_port),
         backend_base: readiness.backend_base_url.clone(),
         token: credentials.access_token.clone(),
         team_id: team_id.clone(),
         updates_rx,
     });
-    let packages_routes = packages::router(packages_state.clone());
+    let packages_routes = packages::packages::router(packages_state.clone());
 
     // --- D2 manage routes (create/rename/move/delete) -----------------------
     // Create/rename/move are pure RPC passthroughs behind
@@ -1143,13 +1141,13 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
             // (M2), but each lock link's DB-side file_library_rel does NOT ride
             // the binfile — re-derive it once its endpoints are live. Idempotent;
             // a vault with no links exits after one cheap pass.
-            packages::spawn_relink_reconcile(packages_state.clone());
+            packages::packages::spawn_relink_reconcile(packages_state.clone());
             // E7 plugin reconcile: re-apply lock-pinned plugin registry
             // pointers after a DB wipe (insert-only, via the public
             // update-profile-props), then keep lock.json capturing what the
             // USER installs/uninstalls through Penpot's native Plugin Manager
             // (recording consent, never granting it).
-            packages::spawn_plugin_reconcile(packages_state.clone());
+            packages::packages::spawn_plugin_reconcile(packages_state.clone());
             Some(handle)
         }
         _ => {

@@ -11,6 +11,7 @@ members = [
     "crates/vault-index",
     "crates/installer",
     "crates/app-state",
+    "crates/packages",
 ]
 
 [workspace.package]
