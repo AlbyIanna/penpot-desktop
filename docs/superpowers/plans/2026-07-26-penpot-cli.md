@@ -868,35 +868,64 @@ c1:
 
 Add `bash scripts/c1-crates.sh` to the `e2e` chain, immediately before `bash scripts/d1-offline.sh`.
 
-- [ ] **Step 5: Repair the references the extraction invalidated**
+- [ ] **Step 5: Repair the references the extraction invalidated — the live ones only**
 
-Six tasks of moves left prose across the repo pointing at files that no longer exist. A controller sweep found every one and confirmed **none is an executed path** — the only real path assignment, `scripts/d6-residue.sh:63`'s `NAVWATCH_RS`, targets `navwatch.rs`, which stays in `apps/desktop`. So no gate is broken; what is broken is the documentation someone greps when deciding whether a gate still covers what they need. In this repo that documentation is load-bearing, so fix all of it:
+Six tasks of moves left 61 references across the repo naming files that no longer exist. **Do not fix all 61.** They split into two classes with opposite correct treatments, and the split is the point of this step:
 
-| File:line | Says | Should say |
+**Live references describe the system as it is now.** They are what someone greps to find the code behind a gate, a flag, or a route, and a wrong one sends them nowhere. Fix every one:
+
+| File:line | Names | Should name |
 |---|---|---|
+| `justfile:274` | `apps/desktop/src/prefs_http.rs` | `crates/app-core/src/prefs_http.rs` |
 | `justfile:322` | `cargo test -p penpot-desktop -- docopen::` | `-p vault-ops` |
 | `crates/sync-core/src/trash.rs:93` | `apps/desktop/src/home.rs::is_safe_vault_rel` | `crates/web-ui/src/home.rs::is_safe_vault_rel` |
 | `crates/sync-daemon/src/paths.rs:32` | `apps/desktop/src/manage.rs` | `crates/vault-ops/src/manage.rs` |
-| `scripts/e2_packages_helper.py:57` | `apps/desktop/src/installer.rs` | `crates/installer/src/lib.rs` |
+| `scripts/build-dmg.sh:14,66` | `apps/desktop/src/layout.rs` | `crates/app-core/src/layout.rs` |
+| `scripts/d0-navigation-spike.sh:6` | `apps/desktop/src/navprobe.{rs,html}` | `crates/web-ui/src/navprobe.{rs,html}` |
+| `scripts/d1-offline.sh:8` | `compose_frontend_flags` in `apps/desktop/src/lib.rs` | `crates/app-core/src/boot.rs` |
+| `scripts/d2_home_nav.cjs:167` | `apps/desktop/src/home.html` | `crates/web-ui/src/home.html` |
 | `scripts/d4-preferences.sh:108` | `apps/desktop/src/last_op.rs` | `crates/app-state/src/last_op.rs` |
 | `scripts/d4_prefs_helper.py:4,35` | `apps/desktop/src/prefs_http.rs` | `crates/app-core/src/prefs_http.rs` |
 | `scripts/d4_prefs_helper.py:45,241` | `apps/desktop/src/last_op.rs` | `crates/app-state/src/last_op.rs` |
-| `scripts/designs-git-init.sh:23` | `apps/desktop/src/gitinit.rs` | `crates/vault-ops/src/gitinit.rs` |
 | `scripts/d5_docs_helper.py:19` | `apps/desktop/src/control.rs` | `crates/app-core/src/control.rs` |
-| `scripts/d0-navigation-spike.sh:6` | `apps/desktop/src/navprobe.{rs,html}` | `crates/web-ui/src/navprobe.{rs,html}` |
 | `scripts/d6-residue.sh:148` | `apps/desktop/src/navprobe.html` | `crates/web-ui/src/navprobe.html` |
+| `scripts/designs-git-init.sh:23` | `apps/desktop/src/gitinit.rs` | `crates/vault-ops/src/gitinit.rs` |
+| `scripts/e2_packages_helper.py:57` | `apps/desktop/src/installer.rs` | `crates/installer/src/lib.rs` |
+| `docs/known-limits.md:20` | `apps/desktop/src/lib.rs` **and a markdown link to it** | `crates/app-core/src/boot.rs`; fix the link target too — it currently 404s |
 
-Leave every reference to `navwatch.rs`, `main.rs`, `menubar/`, `tray/`, `overlay.rs` and `dialog.rs` alone — those modules never moved.
+**Historical records must NOT be touched.** The 21 files under `docs/milestones/`, `docs/spikes/` and `docs/ecosystem-spikes/` are dated accounts of what was true when that milestone shipped. `docs/milestones/n5.md` saying the switch mechanism lived at `apps/desktop/src/control.rs` was *correct in N5*; rewriting it to today's path would falsify the record and make the next reader believe N5 shipped a crate that did not exist. Leave them exactly as they are — Task 12's doc pass records the moves once, in this chapter's own document, which is where a reader looks to reconcile the two.
 
-Then verify nothing was missed, and note the trap: a compound `grep` with `--include` filters returned a false empty during the controller's first sweep. Use a positive control — confirm the command finds a reference you know exists before trusting it to report none.
+Also leave alone every reference to `navwatch.rs`, `main.rs`, `menubar/`, `tray/`, `overlay.rs`, `dialog.rs` and `bin/headless.rs` — those never moved — and `crates/app-core/src/boot.rs:31`, whose mention of `apps/desktop/src/lib.rs` is a deliberate note explaining why those paths gained a `crate::` prefix in the split.
+
+Verify, with a positive control first:
 
 ```bash
-grep -rn "apps/desktop/src" crates/ scripts/ justfile README.md | grep -vE "navwatch|main\.rs|menubar|tray|overlay|dialog"
+# Must print nothing.
+grep -rn "apps/desktop/src" crates/ scripts/ justfile README.md docs/known-limits.md \
+  | grep -vE "navwatch|main\.rs|menubar|tray|overlay|dialog|bin/headless|boot\.rs:31"
 ```
 
-Expected: no output. Sanity-check the command first by dropping the second `grep` and confirming it prints the surviving `navwatch` lines.
+**Sanity-check the command before trusting its silence.** Run it without the second `grep` and confirm it prints the surviving allowed lines. Four separate sweeps in this chapter returned a false empty or a truncated list — once from `--include` filters, once from a `head -20` the author forgot was there. A search that reports nothing is not evidence until you have watched it report something.
 
-- [ ] **Step 6: Run the headless part of the ladder**
+- [ ] **Step 6: Clear the residue Phase 2's content freeze deferred**
+
+Phase 2 forbade content edits, so several small defects were correctly left in place. The freeze ends with Task 7, and this task is not a move — so clear them here rather than carrying them out of the chapter:
+
+- `apps/desktop/Cargo.toml` declares `tempfile` in **both** `[dependencies]` and `[dev-dependencies]`; the `[dependencies]` copy is dead (its only uses are inside `menubar/mod.rs`'s `#[cfg(test)] mod tests`). Delete that line. It is pre-existing, but Task 7 removed nine other dead declarations and moved `supervisor` to dev-dependencies for exactly this reason, so leaving it makes the manifest internally inconsistent.
+- `crates/app-core/src/prefs_http.rs:12,23,29` carry three unresolved `` [`control::…`] `` intra-doc links that rode in from `apps/desktop`. They now resolve as `crate::control::…` inside `app-core`. Fix all three.
+- `apps/desktop/src/lib.rs:14-15`'s re-export doc says the paths are kept for "`main.rs`, `bin/headless.rs` and the two integration tests", but `bin/headless.rs` now imports from `app_core` directly and has zero `penpot_desktop::` references. Drop it from that sentence.
+- `crates/vault-ops/src/vault.rs:355-360`: the doc-link downgrade put five lines of Cargo dependency-cycle mechanics inside the parenthetical of a user-facing sentence about `<data>/assets`, splitting subject from predicate in the rendered docs. Keep the parenthetical to `` wired in `app-core`'s `AppConfig::storage_dir` `` and move the rationale to a trailing non-doc `//` comment, matching the clean shape `vault.rs:4` already has.
+
+Verify:
+
+```bash
+cargo doc --workspace --no-deps 2>&1 | grep -c "unresolved link"
+cargo test --workspace 2>&1 | tail -5
+```
+
+Expected: `0` unresolved links, and the suite still passing at its current count.
+
+- [ ] **Step 7: Run the headless part of the ladder**
 
 ```bash
 bash scripts/c1-crates.sh && bash scripts/m1-smoke.sh && bash scripts/m2-invariant.sh && bash scripts/m3-sync.sh && bash scripts/n1-index.sh && bash scripts/n3-home.sh && bash scripts/n4-palette.sh && bash scripts/n5-vaults.sh && bash scripts/n6-templates.sh && bash scripts/e1-contract.sh && bash scripts/e2-packages.sh && bash scripts/e3-library.sh && bash scripts/e4-gallery.sh && bash scripts/d4-preferences.sh && bash scripts/d6-residue.sh
@@ -904,7 +933,7 @@ bash scripts/c1-crates.sh && bash scripts/m1-smoke.sh && bash scripts/m2-invaria
 
 Expected: all green. Report the result; the controller runs the GUI-session gates (`d2-home.sh`, `d3-menus.sh`, `d5-documents.sh`) separately — do not attempt them.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
