@@ -44,6 +44,7 @@
 //! [`writes_switch_marker`], so both decisions are unit-testable without
 //! booting a stack. See their doc comments for the reasoning.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -147,6 +148,25 @@ pub fn wipes_disposable_state(op: StackOp) -> bool {
 /// failure mode that structurally cannot occur here.
 pub fn writes_switch_marker(op: StackOp) -> bool {
     matches!(op, StackOp::Switch)
+}
+
+/// Take the live value out of a slot and tear it down with the slot's guard
+/// ALREADY RELEASED — the one place that ordering is written, extracted so it
+/// can be tested without a real (boot-only) [`RunningApp`], exactly like
+/// [`wipes_disposable_state`] and [`writes_switch_marker`] above.
+///
+/// The two statements are the whole point; see [`VaultRunner::shutdown`] for
+/// the deadlock that the obvious one-statement `if let` shape causes.
+async fn take_and_teardown<T, F, Fut>(slot: &AsyncMutex<Option<T>>, teardown: F)
+where
+    F: FnOnce(T) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    // The guard MUST die at this `;` — never hold it across the await below.
+    let taken = slot.lock().await.take();
+    if let Some(value) = taken {
+        teardown(value).await;
+    }
 }
 
 /// Owns the live stack and performs vault switches. Cheap to `clone` the
@@ -275,10 +295,28 @@ impl VaultRunner {
     }
 
     /// Stop the current stack (process-exit path). Idempotent.
+    ///
+    /// The `app` guard is released BEFORE the teardown is awaited, and that is
+    /// load-bearing, not style. [`RunningApp::shutdown`] ends in
+    /// `proxy_task.await`, and the proxy stops via
+    /// `axum::serve(..).with_graceful_shutdown(..)` — which drains the
+    /// requests already in flight. One of those can be `GET /__api/prefs`
+    /// (see [`crate::prefs_http`]), whose handler calls `sync_control()` /
+    /// `export_status()` — and those lock this very field. Written the obvious
+    /// way, `if let Some(app) = self.app.lock().await.take() { .. }`, the
+    /// guard is a temporary of the scrutinee and so lives to the end of the
+    /// whole statement, body included: proxy waits for the handler, handler
+    /// waits for the lock, lock is held by the code waiting for the proxy.
+    /// That deadlocks a reboot or a vault switch permanently — only SIGKILL
+    /// recovers. Taking the value out in its own statement drops the guard at
+    /// the `;`, so the draining handler can answer and the proxy can finish.
+    ///
+    /// This widens the documented `None` window on [`Self::app`] to cover the
+    /// teardown as well as the boot, which every reader already handles
+    /// (`export_status` / `sync_control` / `team_id` / `access_token` answer
+    /// `None`, `set_renders_enabled` answers `false`).
     pub async fn shutdown(&self) {
-        if let Some(app) = self.app.lock().await.take() {
-            app.shutdown().await;
-        }
+        take_and_teardown(&self.app, |app| app.shutdown()).await;
     }
 
     /// The shared stop→(optional wipe)→(hook)→boot dance behind both
@@ -767,5 +805,68 @@ mod tests {
         // of the same, unchanged vault — there is no half-changed pointer
         // for a marker to protect.
         assert!(!writes_switch_marker(StackOp::RebootInPlace));
+    }
+
+    // -----------------------------------------------------------------
+    // The teardown lock discipline — the four-ring deadlock in miniature.
+    //
+    // A reboot or a vault switch used to wedge permanently whenever a
+    // `GET /__api/prefs` request was in flight when the teardown began:
+    //
+    //   VaultRunner::shutdown            holds the `app` guard
+    //     -> RunningApp::shutdown        awaits `proxy_task`
+    //       -> with_graceful_shutdown    drains the in-flight requests
+    //         -> get_prefs               calls sync_control() / export_status()
+    //           -> self.app.lock()       blocked on the guard at the top
+    //
+    // Only SIGKILL recovered. The cycle spans three crates, so no single
+    // crate's unit test could see it and `VaultRunner` itself is boot-only —
+    // hence the extracted `take_and_teardown` seam, tested here at the real
+    // production function. `scripts/c2-cli.sh` leg (c) is the end-to-end pin;
+    // this is the fast one that fails in `cargo test` in milliseconds.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_teardown_releases_the_slot_before_awaiting() {
+        let slot: Arc<AsyncMutex<Option<u8>>> = Arc::new(AsyncMutex::new(Some(7)));
+        let probe = Arc::clone(&slot);
+
+        // Stands in for the proxy draining a `get_prefs` handler that reads
+        // the live stack: the teardown future MUST be able to take the very
+        // lock its value came out of. Held guard => this blocks forever.
+        let ran = tokio::time::timeout(
+            Duration::from_secs(5),
+            take_and_teardown(&slot, move |value| async move {
+                assert_eq!(value, 7, "the teardown must receive the taken value");
+                assert!(
+                    probe.lock().await.is_none(),
+                    "the slot must read empty during teardown (the documented \
+                     mid-switch `None` window), not merely be lockable"
+                );
+            }),
+        )
+        .await;
+
+        assert!(
+            ran.is_ok(),
+            "the `app` guard was held across the teardown await — a reboot or \
+             a vault switch will deadlock forever on any in-flight \
+             `GET /__api/prefs`, recoverable only by SIGKILL"
+        );
+        assert!(
+            slot.lock().await.is_none(),
+            "the slot stays empty after the teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn tearing_down_an_empty_slot_is_a_no_op() {
+        // Idempotence, as `shutdown`'s contract promises: the process-exit
+        // path can run after a switch already emptied the slot.
+        let slot: AsyncMutex<Option<u8>> = AsyncMutex::new(None);
+        take_and_teardown(&slot, |_| async {
+            unreachable!("nothing to tear down — the teardown must not run");
+        })
+        .await;
     }
 }
