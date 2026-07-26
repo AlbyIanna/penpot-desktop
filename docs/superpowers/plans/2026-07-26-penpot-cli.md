@@ -39,6 +39,7 @@ Two further findings from the spike are folded into this plan rather than given 
 - **Axum routers stay with their domain.** `packages`, `templates`, `manage`, and `checkpoint` each build their own `Router`. `crates/web-ui` is the two *page* modules only.
 - **The CLI never self-boots.** A Tier-2/3 verb with no app running exits with an error naming `penpot daemon`. The data dir is exclusive — the spike measured a second stack dying on the postgres lock in ~2s.
 - **Crate manifests follow the existing pattern:** `version.workspace = true`, `edition.workspace = true`, `license.workspace = true`, and a `description` that states what the crate owns (see `crates/vault-index/Cargo.toml`).
+- **Each task's dependency list is a starting point, not a contract.** It was derived by scanning the moved modules for `<crate>::` paths, which cannot tell a normal dependency from a dev-only one, and cannot see a crate reached only through a re-export. Add whatever the compiler demands, remove whatever it says is unused, and say in the report which lines you changed and why. Task 3 hit this first: its snippet omitted `chrono`, which `last_op.rs` needs for `Utc::now()`.
 - **Chapter C port set (verified free against every existing gate):** proxy `9062`, backend `6522`, postgres `5597`, valkey `6540`, control `9063`.
 
 ---
@@ -285,10 +286,10 @@ serde_json = { workspace = true }
 installer = { path = "../installer" }
 penpot-rpc = { path = "../penpot-rpc" }
 sync-core = { path = "../sync-core" }
+sync-daemon = { path = "../sync-daemon" }
+vault-index = { path = "../vault-index" }
 axum = "0.8"
 http = "1"
-
-[dev-dependencies]
 tempfile = "3"
 ```
 
@@ -391,11 +392,11 @@ serde_json = { workspace = true }
 installer = { path = "../installer" }
 penpot-rpc = { path = "../penpot-rpc" }
 sync-core = { path = "../sync-core" }
+sync-daemon = { path = "../sync-daemon" }
 axum = "0.8"
 http = "1"
 rand = "0.8"
-
-[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tempfile = "3"
 ```
 
@@ -519,6 +520,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 vault-ops = { path = "../vault-ops" }
 sync-daemon = { path = "../sync-daemon" }
+vault-index = { path = "../vault-index" }
 axum = "0.8"
 http = "1"
 
