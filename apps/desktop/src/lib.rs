@@ -16,6 +16,6 @@ pub mod tray;
 /// `supervisor_config` is here for `tests/packaged_layout_sim.rs`, which
 /// asserts the packaged-mode command lines through it.
 pub use app_core::{
-    boot, control, layout, preflight, prefs_http, status, supervisor_config, windows, AppConfig,
-    RunningApp,
+    boot, control, layout, preflight, prefs_http, runtime_record, status, supervisor_config,
+    windows, AppConfig, RunningApp,
 };

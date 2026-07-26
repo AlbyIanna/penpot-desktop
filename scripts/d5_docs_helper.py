@@ -26,6 +26,11 @@ Env (set by the shell script):
                    importing n5_vaults_helper reads it at MODULE load time.
   PENPOT_TOKEN     access token from <data_dir>/credentials.json (re-read
                    after every vault switch — provisioning mints a fresh one)
+  PENPOT_CONTROL_RECORD
+                   path to <data_dir>/runtime.json. Chapter C made the control
+                   port always-on and therefore token-authenticated: every
+                   /health and /windows request here carries the per-boot token
+                   from that file and no Origin header (see `control_token`).
 
 Subcommands:
   seed_docs <workdir> <vault_root> <timeout>
@@ -252,8 +257,35 @@ def cmd_wait_manifest_id(vault_root, rel_path, timeout):
 # --------------------------------------------------------------- control server
 
 
+CONTROL_TOKEN_HEADER = "x-penpot-control-token"
+
+
+def control_token():
+    """The per-boot control token from <data_dir>/runtime.json (chapter C).
+
+    Read fresh on EVERY request, never cached: this gate boots the GUI twice
+    and switches vaults, and each boot mints a new token. An absent or
+    unreadable record yields "" — the request then 401s and the caller's poll
+    loop retries, the same way it already handles "still booting".
+    """
+    path = os.environ.get("PENPOT_CONTROL_RECORD", "")
+    try:
+        with open(path) as fh:
+            return json.load(fh)["token"]
+    except Exception:  # noqa: BLE001 — not published yet; let the caller retry
+        return ""
+
+
+def control_request(url):
+    """A request the always-on control port will accept: the token, and
+    deliberately NO Origin/Sec-Fetch-Site (either header is a 403 even with a
+    valid token — POST /open wipes the disposable DB, and a web page CAN send
+    a cross-origin POST to 127.0.0.1)."""
+    return urllib.request.Request(url, headers={CONTROL_TOKEN_HEADER: control_token()})
+
+
 def http_get_json(url, timeout=10):
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    with urllib.request.urlopen(control_request(url), timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
@@ -262,7 +294,11 @@ def cmd_wait_reachable(control_base, timeout):
     last = "?"
     while time.time() < deadline:
         try:
-            health = urllib.request.urlopen(f"{control_base}/health", timeout=5).read().decode()
+            health = (
+                urllib.request.urlopen(control_request(f"{control_base}/health"), timeout=5)
+                .read()
+                .decode()
+            )
             if health.strip() != "ok":
                 last = f"/health returned {health!r}"
             else:

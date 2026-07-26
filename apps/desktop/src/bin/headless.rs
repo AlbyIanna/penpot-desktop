@@ -7,11 +7,13 @@
 //!
 //! **N5 vaults**: boot goes through [`control::boot_active_vault`], which
 //! resolves the active vault (registry + interrupted-switch recovery) before
-//! booting. When `PENPOT_LOCAL_CONTROL_PORT` is set, a localhost control
-//! server is started so `scripts/n5-vaults.sh` can drive `File > Open Vault`
-//! switches headlessly (`POST /open {path}`, `GET /active`, `GET /list`) —
-//! this is the test/automation surface for the switch mechanism; the GUI uses
-//! the same [`control::VaultRunner`] behind a native dialog.
+//! booting. A localhost control server always comes up so `scripts/n5-vaults.sh`
+//! can drive `File > Open Vault` switches headlessly (`POST /open {path}`,
+//! `GET /active`, `GET /list`) and, from chapter C, so the CLI can attach;
+//! the GUI uses the same [`control::VaultRunner`] behind a native dialog.
+//! `PENPOT_LOCAL_CONTROL_PORT` only pins the port. Every request must carry
+//! the per-boot token from `<data_dir>/runtime.json` — see
+//! [`app_core::runtime_record`].
 //!
 //! **Test-only control hook**: SIGUSR1 toggles the sync daemon's
 //! pause/resume (the same `SyncControl` surface the tray uses). This exists
@@ -45,17 +47,35 @@ async fn main() -> anyhow::Result<()> {
     // then boot it. The runner owns the live stack across vault switches.
     let runner = control::boot_active_vault(config).await?;
 
-    // N5: optional localhost control server (test/automation), driving
-    // `File > Open Vault` switches without the GUI dialog. D5 Task 2 adds
-    // `GET /windows`; the headless runner has no Tauri, so no window ever
-    // opens here — an empty, never-populated `WindowRegistry` is honest:
-    // `/windows` answers `{"windows":[]}`, which is the truth for this
-    // binary (the GUI shell wires its REAL registry through the same call).
-    if let Some(port) = control::control_port_from_env() {
+    // N5: the localhost control server, driving `File > Open Vault` switches
+    // without the GUI dialog. D5 Task 2 adds `GET /windows`; the headless
+    // runner has no Tauri, so no window ever opens here — an empty,
+    // never-populated `WindowRegistry` is honest: `/windows` answers
+    // `{"windows":[]}`, which is the truth for this binary (the GUI shell
+    // wires its REAL registry through the same call).
+    //
+    // Chapter C: unconditional, because the CLI attaches through it. The env
+    // var only pins the port for the gates; unset ⇒ 0 ⇒ the OS picks one and
+    // `serve_control` publishes the BOUND port (with the pid, the proxy port
+    // and this token) into `<data_dir>/runtime.json`, mode 0600.
+    let control_port = control::control_port_from_env().unwrap_or(0);
+    let control_token = app_core::runtime_record::new_token();
+    {
         let runner_ctl = runner.clone();
         let windows = app_core::windows::WindowRegistry::new();
+        let data_dir = runner.data_dir().to_path_buf();
+        let proxy_port = runner.proxy_port();
         tokio::spawn(async move {
-            if let Err(e) = control::serve_control(runner_ctl, windows, port).await {
+            if let Err(e) = control::serve_control(
+                runner_ctl,
+                windows,
+                control_port,
+                control_token,
+                &data_dir,
+                proxy_port,
+            )
+            .await
+            {
                 tracing::error!("vault control server exited: {e:#}");
             }
         });
@@ -90,6 +110,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Chapter C: retract the discovery record BEFORE the stack goes down, so a
+    // CLI never attaches to a control port that is already on its way out.
+    // Idempotent and never fatal (see `remove_record`).
+    app_core::runtime_record::remove_record(runner.data_dir());
     runner.shutdown().await;
     println!("STOPPED");
     std::io::stdout().flush().ok();

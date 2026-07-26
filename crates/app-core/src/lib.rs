@@ -16,6 +16,7 @@ pub mod control;
 pub mod layout;
 pub mod preflight;
 pub mod prefs_http;
+pub mod runtime_record;
 pub mod status;
 pub mod windows;
 

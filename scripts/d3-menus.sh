@@ -162,6 +162,18 @@ fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 skip() { echo "SKIPPED: $1"; SKIPPED=$((SKIPPED + 1)); }
 strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*m//g'; }
 
+# Chapter C: the control port is always-on and token-authenticated — every
+# request must carry the per-boot token the running app publishes in
+# <data>/runtime.json (mode 0600), and must send NO Origin/Sec-Fetch-Site
+# (browser-shaped requests are 403'd even with a valid token, because POST
+# /open wipes the disposable DB). Read fresh per call, never cached: each boot
+# mints a new token.
+control_token() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' \
+        "$DATA_DIR/runtime.json" 2>/dev/null || true
+}
+ctl_curl() { curl -H "x-penpot-control-token: $(control_token)" "$@"; }
+
 PG_CACHE="${D3_PG_CACHE:-$HOME/.cache/penpot-local/pg-install}"
 save_pg_cache() {
     if [ ! -d "$PG_CACHE" ] && [ -d "$DATA_DIR/postgres/install" ]; then
@@ -431,9 +443,9 @@ check_page "/__packages" "Package gallery"
 check_page "/__templates" "New from template"
 
 echo "-- (b) Open Vault via the localhost control server"
-if curl -fsS --max-time 10 "$CONTROL/health" >/dev/null 2>&1; then
+if ctl_curl -fsS --max-time 10 "$CONTROL/health" >/dev/null 2>&1; then
     pass "(b/open-vault) proof of looking: control server is up on :$CONTROL_PORT before we assert anything about /open"
-    SWITCH_OUT="$(curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
+    SWITCH_OUT="$(ctl_curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
         -H 'Content-Type: application/json' -d "{\"path\": \"$VAULT\"}" 2>"$WORK_DIR/open-vault.err")"
     if echo "$SWITCH_OUT" | grep -qE '"ok":[[:space:]]*true'; then
         pass "(b/open-vault) POST $CONTROL/open -> ok:true — the exact VaultRunner::switch_to the GUI's Open Vault callback invokes: $SWITCH_OUT"

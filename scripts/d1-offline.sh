@@ -79,8 +79,11 @@
 #           produced nothing must not read as "verified clean".
 #
 # Dedicated ports: proxy 9046, backend 6508, postgres 5581, valkey 6524
-# (control 9047 reserved, not bound — headless.rs only opens a control
-# server when PENPOT_LOCAL_CONTROL_PORT is set, which this gate never sets).
+# (control 9047 reserved but never used by this gate: chapter C made the
+# control server unconditional, and this gate leaves PENPOT_LOCAL_CONTROL_PORT
+# unset, so it binds an OS-chosen ephemeral port instead — a LISTEN socket,
+# which the egress parser deliberately ignores; only peers of established
+# connections count, and that one is loopback-only by construction).
 #
 # CRITICAL: teardown is strictly PID-scoped — another live gate may run on a
 # different port block. We kill ONLY the PID this script recorded; never

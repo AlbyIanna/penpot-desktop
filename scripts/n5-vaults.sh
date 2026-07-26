@@ -163,13 +163,26 @@ read_token() {
     [ -n "$PENPOT_TOKEN" ]
 }
 
-control_active_path() { curl -fsS "$CONTROL/active" 2>/dev/null | json_field path 2>/dev/null; }
+# Chapter C: the control port is always-on and token-authenticated — every
+# request must carry the per-boot token the running app publishes in
+# <data>/runtime.json (mode 0600), and must send NO Origin/Sec-Fetch-Site (a
+# browser-shaped request is refused outright with 403, even with a valid
+# token: POST /open wipes the disposable DB, and any web page can send a
+# cross-origin POST to 127.0.0.1). Read fresh on EVERY call, never cached:
+# this gate restarts the app repeatedly and each boot mints a new token, so a
+# cached one would 401 after the first reboot. Before the record exists the
+# token is empty — the request 401s and the caller's own poll loop retries,
+# which is exactly the "still booting" behaviour those loops already handle.
+control_token() { json_field token <"$DATA_DIR/runtime.json" 2>/dev/null || true; }
+ctl_curl() { curl -H "x-penpot-control-token: $(control_token)" "$@"; }
+
+control_active_path() { ctl_curl -fsS "$CONTROL/active" 2>/dev/null | json_field path 2>/dev/null; }
 
 # switch_vault <abs-path>: drive `File > Open Vault` headlessly (blocks until
 # the target stack is up). Returns 0 on a 200 with ok=true.
 switch_vault() {
     local target="$1" out
-    out="$(curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
+    out="$(ctl_curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
         -H 'Content-Type: application/json' -d "{\"path\": \"$target\"}" 2>/dev/null)" || return 1
     echo "$out" | grep -q '"ok":true' || echo "$out" | grep -q '"ok": true'
 }
@@ -398,7 +411,7 @@ fi
     pass "(g) active vault before crash is B" || fail "(g) pre-crash active not B: $(control_active_path)"
 
 # Fire the switch to A in the background; it will pause mid-wipe.
-( curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
+( ctl_curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
     -H 'Content-Type: application/json' -d "{\"path\": \"$VAULT_A\"}" >/dev/null 2>&1 ) &
 SWITCH_BG=$!
 if wait_log 60 "vault switch: wiping DB"; then

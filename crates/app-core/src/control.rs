@@ -21,10 +21,17 @@
 //! precedes the reconcile (step 5), forward-completion is safe from any
 //! interruption point: the previous vault's DB state is gone first.
 //!
-//! [`serve_control`] exposes this over a localhost-only HTTP port
-//! (`PENPOT_LOCAL_CONTROL_PORT`) so the N5 gate can drive switches WITHOUT the
-//! GUI dialog. It is a test/automation affordance: the GUI's File > Open Vault
-//! calls [`VaultRunner::switch_to`] directly, no HTTP involved.
+//! [`serve_control`] exposes this over a localhost-only HTTP port so the N5
+//! gate can drive switches WITHOUT the GUI dialog. The GUI's File > Open Vault
+//! still calls [`VaultRunner::switch_to`] directly, no HTTP involved.
+//!
+//! Chapter C promotes that port from a test/automation affordance to the
+//! CLI's attach point, so it is now served on EVERY boot —
+//! `PENPOT_LOCAL_CONTROL_PORT` only pins the port (the gates need a known
+//! one); unset means "let the OS choose". Always-on means every route is
+//! token-authenticated and refuses browser-shaped requests: see
+//! [`crate::runtime_record`] for the threat model and
+//! `<data_dir>/runtime.json` for how a CLI finds the port and the token.
 //!
 //! D4 adds [`VaultRunner::reboot_in_place`] — the same stop→boot dance
 //! ([`VaultRunner::stop_then_boot`], factored out so the two operations never
@@ -75,8 +82,10 @@ use crate::{boot, AppConfig, RunningApp};
 /// late-bound slots do — a "still starting" response, never a panic.
 pub type RunnerSlot = Arc<AsyncMutex<Option<Arc<VaultRunner>>>>;
 
-/// Env var: the localhost control port. Unset ⇒ no control server (every
-/// pre-N5 flow is byte-identical; nothing new binds).
+/// Env var: pin the localhost control port. Unset ⇒ the OS picks a free port
+/// (chapter C: the control server itself is unconditional; the port published
+/// in `runtime.json` is the one actually bound). The gates set this because
+/// they need to know the port before the app is up.
 pub const CONTROL_PORT_ENV: &str = "PENPOT_LOCAL_CONTROL_PORT";
 /// Env var (test-only): sleep this many ms mid-switch, right after the DB is
 /// wiped and before the target boots, to widen the SIGKILL window
@@ -182,6 +191,20 @@ impl VaultRunner {
     /// The proxy origin (stable across switches — same proxy port).
     pub fn proxy_url(&self) -> String {
         self.base_config.public_uri()
+    }
+
+    /// The proxy port (chapter C: published in `runtime.json` so a CLI can
+    /// reach the proxy, not just the control port).
+    pub fn proxy_port(&self) -> u16 {
+        self.base_config.proxy_port
+    }
+
+    /// The app data dir this runner owns — where `runtime.json`, the registry
+    /// and the markers live. Exposed because both binaries hand `config` to
+    /// [`boot_active_vault`] and then still need the dir for the runtime
+    /// record (publish at [`serve_control`], remove at shutdown).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// The currently-open vault.
@@ -569,8 +592,21 @@ pub fn control_router(runner: Arc<VaultRunner>, windows: WindowRegistry) -> Rout
 }
 
 /// Serve the control routes on `127.0.0.1:<port>` until the process exits.
-/// Localhost-only by construction. Spawn this only when
-/// [`CONTROL_PORT_ENV`] is set (the N5 gate sets it).
+/// Localhost-only by construction, and — since chapter C — **always** served:
+/// the CLI is a first-class front-end, so `/open`, `/active`, `/list` and
+/// `/windows` must exist in a normal install, not only under
+/// [`CONTROL_PORT_ENV`]. Pass `0` to let the OS choose a free port.
+///
+/// Always-on is what makes the auth mandatory rather than decorative: every
+/// route is behind [`crate::runtime_record::require_token`], which demands the
+/// per-boot `token` and refuses anything browser-shaped outright (a web page
+/// CAN send a cross-origin `POST /open`, which wipes the disposable DB — see
+/// that module's doc for the full threat model).
+///
+/// The bound port — not the requested one, so port `0` works — is published
+/// with the pid, the proxy port and the token into `<data_dir>/runtime.json`
+/// (mode 0600) for the CLI to discover. The record is removed on the
+/// shutdown path of whichever binary owns this task.
 ///
 /// `windows` is the live [`WindowRegistry`] backing `GET /windows` (D5 Task
 /// 2). The headless runner (no Tauri, no windows ever open) passes an empty
@@ -578,20 +614,41 @@ pub fn control_router(runner: Arc<VaultRunner>, windows: WindowRegistry) -> Rout
 /// `{"windows":[]}`, which is honest: nothing IS open. The GUI shell passes
 /// the SAME registry the menu bar / window-per-file machinery populates, so
 /// `/windows` reflects reality there.
-pub async fn serve_control(runner: Arc<VaultRunner>, windows: WindowRegistry, port: u16) -> Result<()> {
+pub async fn serve_control(
+    runner: Arc<VaultRunner>,
+    windows: WindowRegistry,
+    port: u16,
+    token: String,
+    data_dir: &Path,
+    proxy_port: u16,
+) -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("control server cannot bind {addr}"))?;
-    tracing::info!(%addr, "vault control server listening (test/automation)");
-    axum::serve(listener, control_router(runner, windows))
-        .await
-        .context("control server error")?;
+    let bound = listener.local_addr()?.port();
+    crate::runtime_record::write_record(
+        data_dir,
+        &crate::runtime_record::RuntimeRecord {
+            pid: std::process::id(),
+            proxy_port,
+            control_port: bound,
+            token: token.clone(),
+        },
+    )?;
+    tracing::info!(port = bound, "vault control server listening (token-authenticated)");
+    let router = control_router(runner, windows).layer(axum::middleware::from_fn_with_state(
+        token,
+        crate::runtime_record::require_token,
+    ));
+    axum::serve(listener, router).await.context("control server error")?;
     Ok(())
 }
 
-/// Read + parse [`CONTROL_PORT_ENV`]; `None` (or an invalid value) disables the
-/// control server.
+/// Read + parse [`CONTROL_PORT_ENV`]; `None` (or an invalid value) means "no
+/// pinned port" — the caller passes `0` and the OS picks one. Since chapter C
+/// this is an override for the gates that pin a port, no longer the on/off
+/// switch for the control server itself.
 pub fn control_port_from_env() -> Option<u16> {
     std::env::var(CONTROL_PORT_ENV).ok().and_then(|v| v.trim().parse().ok())
 }

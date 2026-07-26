@@ -190,6 +190,20 @@ read_token() {
     [ -n "$PENPOT_TOKEN" ]
 }
 
+# Chapter C: the control port is always-on and token-authenticated — every
+# request must carry the per-boot token the running app publishes in
+# <data>/runtime.json (mode 0600), and must send NO Origin/Sec-Fetch-Site (a
+# browser-shaped request is 403'd even with a VALID token, because POST /open
+# wipes the disposable DB and any web page can send a cross-origin POST to
+# 127.0.0.1). Read fresh on every call, never cached: this gate boots the GUI
+# twice and switches vaults, and each boot mints a new token. Before the
+# record exists the token is empty and the request 401s — which is what the
+# helper's own "still booting" poll loops already retry through.
+# PENPOT_CONTROL_RECORD is how d5_docs_helper.py finds the same file.
+export PENPOT_CONTROL_RECORD="$DATA_DIR/runtime.json"
+control_token() { json_field token <"$PENPOT_CONTROL_RECORD" 2>/dev/null || true; }
+ctl_curl() { curl -H "x-penpot-control-token: $(control_token)" "$@"; }
+
 ports_free_list() { # ports_free_list <port>...
     local p
     for p in "$@"; do
@@ -246,7 +260,7 @@ n5helper() { python3 "$N5_HELPER" "$@"; }
 switch_vault() {
     local target="$1"
     local resp
-    resp="$(curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
+    resp="$(ctl_curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
         -H 'Content-Type: application/json' -d "{\"path\": \"$target\"}" 2>"$WORK_DIR/switch.err")"
     if ! echo "$resp" | grep -qE '"ok":[[:space:]]*true'; then
         echo "switch to $target failed: $resp $(cat "$WORK_DIR/switch.err" 2>/dev/null)" >&2
@@ -489,7 +503,7 @@ else
     fail "(c) something bound one of the SECOND port block's ports — a second stack DID boot"
 fi
 
-if curl -fsS --max-time 10 "$CONTROL/health" >/dev/null 2>&1; then
+if ctl_curl -fsS --max-time 10 "$CONTROL/health" >/dev/null 2>&1; then
     pass "(c) instance 1 still answers GET /health after the second launch"
 else
     fail "(c) instance 1 stopped answering /health after the second launch"
