@@ -1,7 +1,7 @@
 //! N5 — Vaults, plural. The persistent bookkeeping around a switchable design
 //! vault, plus the pure decision logic the switch state machine and its
 //! crash-recovery path key off. The runtime orchestration (teardown → wipe →
-//! reconcile) lives in [`crate::control`]; everything here is data + pure
+//! reconcile) lives in `app-core`'s `control`; everything here is data + pure
 //! functions so the recovery decision table is unit-testable without a stack.
 //!
 //! Three files carry the state:

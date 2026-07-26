@@ -238,7 +238,7 @@ async fn reveal_action(
     let abs = state.vault_root.join(&p.path);
     // Fire-and-forget reveal (GUI-only; a no-op error is logged, never fatal).
     // The target may be a `.penpot` dir or a `.conflict-…penpot` copy.
-    crate::reveal::reveal(&abs);
+    vault_ops::reveal::reveal(&abs);
     tracing::info!(path = %abs.display(), "N3 reveal requested");
     Json(json!({"ok": true, "revealed": p.path})).into_response()
 }

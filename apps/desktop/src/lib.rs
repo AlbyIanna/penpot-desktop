@@ -6,24 +6,18 @@
 //! backend JVM) → first-boot single-user provisioning over RPC → start the
 //! local proxy with the `/__bootstrap` auto-login route → expose readiness.
 
-pub mod checkpoint;
 pub mod control;
 pub mod dialog;
-pub mod docopen;
-pub mod gitinit;
 pub mod home;
 pub mod layout;
-pub mod manage;
 pub mod menubar;
 pub mod navprobe;
 pub mod navwatch;
 pub mod overlay;
 pub mod preflight;
 pub mod prefs_http;
-pub mod reveal;
 pub mod status;
 pub mod tray;
-pub mod vault;
 pub mod windows;
 
 use std::path::{Path, PathBuf};
@@ -977,7 +971,7 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
     let home_routes = home::router(config.designs_dir.clone(), strip_rx);
 
     // --- N4b "Checkpoint now" (manual, git-native vault checkpoint) --------
-    let checkpoint_routes = checkpoint::router(config.designs_dir.clone());
+    let checkpoint_routes = vault_ops::checkpoint::router(config.designs_dir.clone());
 
     // --- N6 offline template gallery + New-from-template (pillar 7) --------
     // Enumerates the builtin-template binfiles shipped in the runtime bundle
@@ -1037,10 +1031,10 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
     // same cell (mirrors `home.rs`'s late-bound `strip_rx` watch channel —
     // just a one-shot cell instead of a stream, since there's only one value
     // to hand over). A delete that lands before that `.set()` is rejected by
-    // `manage::delete_file`, not silently un-paused — see the `sync` field
-    // doc on `ManageState`.
+    // `vault_ops::manage::delete_file`, not silently un-paused — see the `sync`
+    // field doc on `ManageState`.
     let manage_sync = Arc::new(std::sync::OnceLock::<sync_daemon::SyncControl>::new());
-    let manage_state = Arc::new(manage::ManageState {
+    let manage_state = Arc::new(vault_ops::manage::ManageState {
         backend_base: readiness.backend_base_url.clone(),
         token: credentials.access_token.clone(),
         team_id: team_id.clone(),
@@ -1048,7 +1042,7 @@ pub async fn boot(config: AppConfig, runner_slot: control::RunnerSlot) -> anyhow
         sync: manage_sync.clone(),
         delete_lock: tokio::sync::Mutex::new(()),
     });
-    let manage_routes = manage::router(manage_state);
+    let manage_routes = vault_ops::manage::router(manage_state);
 
     // --- D4 Preferences page + routes ---------------------------------------
     // `/__preferences` + `/__api/prefs*`, mounted exactly like `/__home` above.

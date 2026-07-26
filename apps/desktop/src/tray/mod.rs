@@ -166,7 +166,7 @@ pub fn spawn_tray<R: Runtime>(
             OPEN_DESIGNS_ID => {
                 if let Some(designs) = &designs_dir {
                     tracing::info!(dir = %designs.display(), "tray: open designs folder");
-                    crate::reveal::open_folder(designs);
+                    vault_ops::reveal::open_folder(designs);
                 }
             }
             QUICK_OPEN_ID => {
@@ -183,8 +183,8 @@ pub fn spawn_tray<R: Runtime>(
                 if let Some(designs) = designs_for_checkpoint.clone() {
                     tracing::info!(dir = %designs.display(), "tray: checkpoint now");
                     tauri::async_runtime::spawn_blocking(move || {
-                        let label = crate::checkpoint::default_label();
-                        match crate::checkpoint::checkpoint(&designs, &label) {
+                        let label = vault_ops::checkpoint::default_label();
+                        match vault_ops::checkpoint::checkpoint(&designs, &label) {
                             Ok(out) => {
                                 tracing::info!("checkpoint: {}", out.message);
                                 crate::dialog::native_info_dialog(
@@ -208,7 +208,7 @@ pub fn spawn_tray<R: Runtime>(
                     tracing::info!(dir = %designs.display(), "tray: enable git versioning");
                     // git is fast but external: keep it off the UI thread.
                     tauri::async_runtime::spawn_blocking(move || {
-                        match crate::gitinit::run_git_init(&designs) {
+                        match vault_ops::gitinit::run_git_init(&designs) {
                             Ok(out) => {
                                 tracing::info!("git init helper:\n{}", out.trim_end());
                                 crate::dialog::native_info_dialog(
@@ -233,7 +233,7 @@ pub fn spawn_tray<R: Runtime>(
                 {
                     let path = designs.join(key);
                     tracing::info!(path = %path.display(), "tray: reveal file in file manager");
-                    crate::reveal::reveal(&path);
+                    vault_ops::reveal::reveal(&path);
                 }
             }
         })

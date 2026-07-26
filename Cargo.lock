@@ -3137,6 +3137,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vault-index",
+ "vault-ops",
 ]
 
 [[package]]
@@ -5668,6 +5669,26 @@ dependencies = [
  "sync-core",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "vault-ops"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "http",
+ "installer",
+ "penpot-rpc",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sync-core",
+ "sync-daemon",
+ "tempfile",
  "tokio",
  "tracing",
 ]

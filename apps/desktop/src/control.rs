@@ -7,7 +7,7 @@
 //! 2. stop the current stack cleanly ([`RunningApp::shutdown`] — sync daemon,
 //!    index, proxy, supervised postgres/valkey/JVM all go down);
 //! 3. wipe the disposable Penpot DB cluster + the vault index
-//!    ([`crate::vault::reset_disposable_state`]) — zero residue of the old
+//!    ([`vault_ops::vault::reset_disposable_state`]) — zero residue of the old
 //!    vault before the new one reconciles (invariant 2, P0);
 //! 4. point the registry's active vault at the new root;
 //! 5. [`boot`] the target: re-provision the single user, reconcile from the
@@ -52,7 +52,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::vault::{self, SwitchMarker, VaultRef, VaultRegistry};
+use vault_ops::vault::{self, SwitchMarker, VaultRef, VaultRegistry};
 use crate::windows::{OpenWindow, WindowRegistry};
 use crate::{boot, AppConfig, RunningApp};
 

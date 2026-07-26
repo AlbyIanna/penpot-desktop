@@ -45,7 +45,7 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, DragDropEvent, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 use app_state::recent::{self, RecentEntry};
-use crate::docopen;
+use vault_ops::docopen;
 use crate::navwatch::{self, Decision, NavWatch};
 use crate::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
 use model::{build_menu_model, command_for_id, Command, Entry, MenuModel, Predefined, RECENT_PREFIX};
@@ -1280,7 +1280,7 @@ fn reveal_key_file(ctx: &MenuCtx) {
         );
         return;
     };
-    crate::reveal::reveal(&live.vault_root.join(&entry.path));
+    vault_ops::reveal::reveal(&live.vault_root.join(&entry.path));
 }
 
 /// Exhaustive match over every `Command` variant, deliberately WITHOUT a

@@ -79,9 +79,10 @@
 #       mechanism, scripts/d5-plist-check.sh covers the packaged Info.plist)
 #       and drag-drop (no headless drag primitive here). The pure resolver
 #       + import-path-decision logic every one of those UI legs funnels
-#       through is instead REQUIRED by name — `cargo test -p penpot-desktop
-#       -- docopen::` — so a renamed or weakened test cannot leave this gate
-#       green (the D1/D2/D3 precedent).
+#       through is instead REQUIRED by name — `cargo test -p vault-ops
+#       -- docopen::` (docopen:: lives in its own crate as of chapter C's
+#       vault-ops extraction) — so a renamed or weakened test cannot leave
+#       this gate green (the D1/D2/D3 precedent).
 #
 # Dedicated ports: proxy 9056, backend 6518, postgres 5591, valkey 6534,
 # control 9057 (per the brief). A SECOND, would-be port block
@@ -290,8 +291,8 @@ pass "pre-flight: ports free (primary + second block), no existing GUI instance,
 # the native confirm dialog) funnels through. Run FIRST, no live stack
 # needed, so a broken contract fails fast (D3's own ordering rationale).
 # =========================================================================
-echo "-- (e) cargo test -p penpot-desktop -- docopen::"
-(cd "$ROOT" && cargo test -p penpot-desktop -- docopen::) >"$CARGO_TEST_LOG" 2>&1
+echo "-- (e) cargo test -p vault-ops -- docopen::"
+(cd "$ROOT" && cargo test -p vault-ops -- docopen::) >"$CARGO_TEST_LOG" 2>&1
 CARGO_TEST_EXIT=$?
 CARGO_TEST_STRIPPED="$WORK_DIR/cargo-test.stripped.log"
 strip_ansi <"$CARGO_TEST_LOG" >"$CARGO_TEST_STRIPPED"
@@ -327,9 +328,9 @@ for entry in "${REQUIRED_TESTS[@]}"; do
 done
 
 if [ "$CARGO_TEST_EXIT" -eq 0 ]; then
-    pass "(e) cargo test -p penpot-desktop -- docopen:: exits 0 (no unlisted regression hiding behind the named checks alone)"
+    pass "(e) cargo test -p vault-ops -- docopen:: exits 0 (no unlisted regression hiding behind the named checks alone)"
 else
-    fail "(e) cargo test -p penpot-desktop -- docopen:: exited $CARGO_TEST_EXIT — see $CARGO_TEST_LOG"
+    fail "(e) cargo test -p vault-ops -- docopen:: exited $CARGO_TEST_EXIT — see $CARGO_TEST_LOG"
 fi
 
 # =========================================================================
