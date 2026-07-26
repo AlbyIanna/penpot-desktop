@@ -125,3 +125,100 @@ pub async fn first_page_id(client: &PenpotClient, file_id: &str) -> Option<Strin
         .as_str()
         .map(str::to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    //! What this crate can and cannot test without a live stack.
+    //!
+    //! Three of the four public functions here take a `&PenpotClient` and do
+    //! nothing but call it; this workspace has no mocking layer, so a unit test
+    //! of `settle_to_fixpoint` would be a test of a fake. They stay covered by
+    //! the live gates.
+    //!
+    //! [`unzip_normalize_hash`] is the exception, and not a trivial one: it is
+    //! the only pure logic in the crate, and the settle loop rests on the pair
+    //! it returns. `settle_to_fixpoint` compares the HASH across cycles while
+    //! re-importing the ZIP. If those two describe different trees, "two
+    //! consecutive equal hashes ⇒ the export is a fixpoint" is false, and the
+    //! first on-disk export the sync daemon writes is not one — the N6 P0 the
+    //! module doc opens with.
+    //!
+    //! **The two tests below catch disjoint faults, and neither subsumes the
+    //! other.** `semantic_tree_hash` re-normalizes as it hashes, so a raw tree
+    //! and its normalized form hash IDENTICALLY — which means returning the
+    //! un-normalized zip passes the pairing test and fails only the bytes test
+    //! (verified by mutation: moving `zip_dir` above `normalize_tree` fails the
+    //! second and leaves the first green). Conversely a zip built from the wrong
+    //! or a partial tree fails both. Written as one test, half of this would be
+    //! untested and nothing would say so.
+    //!
+    //! This is deliberately NOT whole-crate coverage. `scripts/c1-crates.sh`
+    //! prints each crate's test count precisely so a number this small stays
+    //! visible instead of reading as "installer is tested".
+
+    use super::*;
+    use std::path::Path;
+
+    const BINARY: [u8; 4] = [0x89, 0x50, 0x00, 0xff];
+
+    /// A binfile-shaped tree zipped the way an export actually arrives: one
+    /// deliberately UN-normalized `.json` (keys out of order, 4-space indent,
+    /// no trailing newline, a volatile field) plus one binary that must survive
+    /// byte-identical.
+    fn un_normalized_export(dir: &Path) -> Vec<u8> {
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+        std::fs::write(
+            dir.join("files/a.json"),
+            b"{\n    \"zeta\": 2,\n    \"createdAt\": \"2020-01-01\",\n    \"alpha\": 1\n}",
+        )
+        .unwrap();
+        std::fs::write(dir.join("objects/blob.bin"), BINARY).unwrap();
+        sync_core::zip_dir(dir).unwrap()
+    }
+
+    /// The pairing. Whatever ordering the body uses internally, the hash it
+    /// hands back must be the hash OF the zip it hands back — otherwise the
+    /// settle loop is comparing one tree and re-importing another.
+    #[test]
+    fn the_returned_hash_describes_the_returned_zip() {
+        let src = tempfile::tempdir().unwrap();
+        let zip = un_normalized_export(src.path());
+
+        let (hash, norm_zip) = unzip_normalize_hash(zip).unwrap();
+
+        let landed = tempfile::tempdir().unwrap();
+        sync_core::unzip_to(&norm_zip, landed.path()).unwrap();
+        assert_eq!(
+            sync_core::semantic_tree_hash(landed.path()).unwrap(),
+            hash,
+            "the hash returned must describe the zip returned"
+        );
+    }
+
+    /// The other half, which the pairing alone cannot catch: the semantic view
+    /// re-normalizes before hashing, so a zip of RAW bytes would still hash
+    /// equal above. But these bytes are what gets re-imported (and, downstream,
+    /// what the daemon writes), so they must already be normalized on disk —
+    /// sorted keys, 2-space indent, trailing newline — with binaries untouched.
+    #[test]
+    fn the_returned_zip_carries_normalized_bytes_not_only_a_normalized_hash() {
+        let src = tempfile::tempdir().unwrap();
+        let zip = un_normalized_export(src.path());
+
+        let (_, norm_zip) = unzip_normalize_hash(zip).unwrap();
+
+        let landed = tempfile::tempdir().unwrap();
+        sync_core::unzip_to(&norm_zip, landed.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(landed.path().join("files/a.json")).unwrap(),
+            "{\n  \"alpha\": 1,\n  \"createdAt\": \"2020-01-01\",\n  \"zeta\": 2\n}\n",
+            "normalization must be in the returned BYTES, not only in the hash"
+        );
+        assert_eq!(
+            std::fs::read(landed.path().join("objects/blob.bin")).unwrap(),
+            BINARY,
+            "a non-JSON asset must round-trip byte-identical"
+        );
+    }
+}

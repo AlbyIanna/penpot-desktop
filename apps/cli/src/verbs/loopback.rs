@@ -116,6 +116,34 @@ pub enum Verb {
 }
 
 impl Verb {
+    /// Every verb, once, so the tables in the tests below cannot silently stop
+    /// covering one.
+    ///
+    /// What actually stops a new variant from defaulting to something wrong is
+    /// the absence of `_` arms in [`route`](Verb::route),
+    /// [`surface`](Verb::surface), [`method`](Verb::method) and
+    /// [`tier`](Verb::tier): adding `Verb::Foo` fails to COMPILE until all four
+    /// state its answer. `ALL` is the weaker, second line — it de-duplicates the
+    /// three hand-written verb lists the tests used to carry, so they can no
+    /// longer drift apart from each other. Its own completeness is not
+    /// compiler-checked (nothing forces a new variant into this array), which is
+    /// precisely why the four exhaustive matches must keep their `_`-free form.
+    pub const ALL: [Verb; 13] = [
+        Verb::SyncStatus,
+        Verb::SyncPause,
+        Verb::SyncResume,
+        Verb::PrefsGet,
+        Verb::PrefsSet,
+        Verb::PkgAdd,
+        Verb::PkgInstall,
+        Verb::Boards,
+        Verb::Search,
+        Verb::Reveal,
+        Verb::NewFromTemplate,
+        Verb::VaultSwitch,
+        Verb::Reboot,
+    ];
+
     /// The path this verb requests, on [`Verb::surface`].
     ///
     /// Several verbs deliberately share a path: `sync status` and `prefs get`
@@ -141,29 +169,66 @@ impl Verb {
 
     /// Which listener serves [`Verb::route`]. Only `vault switch` is on the
     /// control surface — see [`Surface`] for why it has to be.
+    ///
+    /// **No `_` arm, on purpose** (and the same goes for [`method`](Verb::method)
+    /// and [`tier`](Verb::tier)). With one, a future `Verb::Foo` compiled
+    /// straight into `Surface::Proxy`/`POST`/tier-2 without anybody choosing
+    /// that — and a wrong surface here is the failure mode this file's own test
+    /// `vault_switch_is_the_only_control_surface_verb` describes: it "would look
+    /// right and fail only under a real switch", because a request sent to the
+    /// proxy dies with the proxy the switch tears down. Listing every variant
+    /// turns that into a compile error at the moment the variant is added.
     pub fn surface(&self) -> Surface {
         match self {
             Verb::VaultSwitch => Surface::Control,
-            _ => Surface::Proxy,
+            Verb::SyncStatus
+            | Verb::SyncPause
+            | Verb::SyncResume
+            | Verb::PrefsGet
+            | Verb::PrefsSet
+            | Verb::PkgAdd
+            | Verb::PkgInstall
+            | Verb::Boards
+            | Verb::Search
+            | Verb::Reveal
+            | Verb::NewFromTemplate
+            | Verb::Reboot => Surface::Proxy,
         }
     }
 
-    /// The HTTP method [`Verb::route`] is registered with.
+    /// The HTTP method [`Verb::route`] is registered with. Exhaustive — see
+    /// [`surface`](Verb::surface).
     pub fn method(&self) -> Method {
         match self {
             Verb::SyncStatus | Verb::PrefsGet | Verb::Boards | Verb::Search | Verb::Reveal => {
                 Method::GET
             }
-            _ => Method::POST,
+            Verb::SyncPause
+            | Verb::SyncResume
+            | Verb::PrefsSet
+            | Verb::PkgAdd
+            | Verb::PkgInstall
+            | Verb::NewFromTemplate
+            | Verb::VaultSwitch
+            | Verb::Reboot => Method::POST,
         }
     }
 
     /// 2 = needs the running app; 3 = needs the supervised backend too.
-    /// Straight from the spike's Q2 table.
+    /// Straight from the spike's Q2 table. Exhaustive — see
+    /// [`surface`](Verb::surface).
     pub fn tier(&self) -> u8 {
         match self {
             Verb::PkgInstall | Verb::NewFromTemplate | Verb::VaultSwitch | Verb::Reboot => 3,
-            _ => 2,
+            Verb::SyncStatus
+            | Verb::SyncPause
+            | Verb::SyncResume
+            | Verb::PrefsGet
+            | Verb::PrefsSet
+            | Verb::PkgAdd
+            | Verb::Boards
+            | Verb::Search
+            | Verb::Reveal => 2,
         }
     }
 }
@@ -251,6 +316,16 @@ pub async fn sync_status(data_dir: &Path) -> Result<Value> {
 /// Pulled out of [`prefs_set`] so the read-modify-write rule is testable
 /// without a running app: the result must carry EVERY field the GET returned,
 /// not just the changed one (see the module doc).
+///
+/// **`field` must already exist**, and that check is the whole reason this
+/// returns a `Result` on the happy path. `Preferences` carries no
+/// `deny_unknown_fields`, so an invented key survives the merge, rides the POST,
+/// gets dropped by serde on the way in, and comes back `{"ok":true}`:
+/// `penpot prefs-set plugnsEnabled false` printed `ok: true`, exited 0, and
+/// changed nothing. A write verb reporting success for work it did not do is
+/// worse than one that fails — a script cannot tell the difference. The live
+/// GET's own keys are the authority on what is settable, so the error can name
+/// them exactly rather than repeating a list that could go stale.
 fn merged_preferences(current: &Value, field: &str, value: Value) -> Result<Value> {
     let mut prefs = current
         .get("preferences")
@@ -259,6 +334,12 @@ fn merged_preferences(current: &Value, field: &str, value: Value) -> Result<Valu
     let obj = prefs
         .as_object_mut()
         .context("GET /__api/prefs returned a non-object `preferences`")?;
+    anyhow::ensure!(
+        obj.contains_key(field),
+        "unknown preference `{field}` — the app would accept the write and \
+         silently drop it. Valid fields: {}",
+        obj.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
     obj.insert(field.to_string(), value);
     Ok(prefs)
 }
@@ -526,6 +607,12 @@ mod tests {
     /// Every verb, in one table, so a new one cannot be added without stating
     /// its surface, method and tier — and so a typo in a path is a test
     /// failure rather than a 404 nobody sees until the app is running.
+    ///
+    /// Driven off [`Verb::ALL`], not off `expected`: iterating the expectations
+    /// meant a verb missing from the table was simply never checked, and the
+    /// test stayed green describing twelve of thirteen verbs. The length
+    /// assertion closes the other direction (an entry for a verb that no longer
+    /// exists).
     #[test]
     fn the_verb_table_is_what_it_claims_to_be() {
         let expected = [
@@ -543,11 +630,20 @@ mod tests {
             (Verb::VaultSwitch, Surface::Control, Method::POST, "/open", 3),
             (Verb::Reboot, Surface::Proxy, Method::POST, "/__api/prefs/reboot", 3),
         ];
-        for (verb, surface, method, route, tier) in expected {
-            assert_eq!(verb.surface(), surface, "{verb:?} surface");
-            assert_eq!(verb.method(), method, "{verb:?} method");
-            assert_eq!(verb.route(), route, "{verb:?} route");
-            assert_eq!(verb.tier(), tier, "{verb:?} tier");
+        assert_eq!(
+            expected.len(),
+            Verb::ALL.len(),
+            "the table describes a verb that no longer exists"
+        );
+        for verb in Verb::ALL {
+            let (_, surface, method, route, tier) = expected
+                .iter()
+                .find(|(v, ..)| *v == verb)
+                .unwrap_or_else(|| panic!("{verb:?} is missing from the verb table"));
+            assert_eq!(verb.surface(), *surface, "{verb:?} surface");
+            assert_eq!(&verb.method(), method, "{verb:?} method");
+            assert_eq!(verb.route(), *route, "{verb:?} route");
+            assert_eq!(verb.tier(), *tier, "{verb:?} tier");
         }
     }
 
@@ -557,24 +653,10 @@ mod tests {
     /// real switch.
     #[test]
     fn vault_switch_is_the_only_control_surface_verb() {
-        let control: Vec<Verb> = [
-            Verb::SyncStatus,
-            Verb::SyncPause,
-            Verb::SyncResume,
-            Verb::PrefsGet,
-            Verb::PrefsSet,
-            Verb::PkgAdd,
-            Verb::PkgInstall,
-            Verb::Boards,
-            Verb::Search,
-            Verb::Reveal,
-            Verb::NewFromTemplate,
-            Verb::VaultSwitch,
-            Verb::Reboot,
-        ]
-        .into_iter()
-        .filter(|v| v.surface() == Surface::Control)
-        .collect();
+        let control: Vec<Verb> = Verb::ALL
+            .into_iter()
+            .filter(|v| v.surface() == Surface::Control)
+            .collect();
         assert_eq!(control, vec![Verb::VaultSwitch]);
     }
 
@@ -594,9 +676,10 @@ mod tests {
     /// the GET returned. `Preferences` gives every field a `serde(default)`, so
     /// a body that omits one silently resets it — the exact bug the spike's
     /// `{"syncEnabled":false}` shortcut had.
-    #[test]
-    fn a_preferences_write_preserves_every_untouched_field() {
-        let current = json!({
+    /// The fixture both preferences tests below run against: a realistic `GET
+    /// /__api/prefs` body, with the four fields the app actually has.
+    fn a_prefs_get_response() -> Value {
+        json!({
             "preferences": {
                 "syncEnabled": true,
                 "exportsEnabled": true,
@@ -604,13 +687,49 @@ mod tests {
                 "cspEnabled": false,
             },
             "syncPaused": false,
-        });
+        })
+    }
+
+    #[test]
+    fn a_preferences_write_preserves_every_untouched_field() {
+        let current = a_prefs_get_response();
         let merged = merged_preferences(&current, "syncEnabled", json!(false)).unwrap();
         assert_eq!(merged["syncEnabled"], json!(false), "the changed field");
         assert_eq!(merged["pluginsEnabled"], json!(false), "must not revert to the default");
         assert_eq!(merged["cspEnabled"], json!(false), "must not revert to the default");
         assert_eq!(merged["exportsEnabled"], json!(true));
         assert_eq!(merged.as_object().unwrap().len(), 4, "no field invented, none dropped");
+    }
+
+    /// A misspelt field must FAIL, not report success. `Preferences` has no
+    /// `deny_unknown_fields`, so before this check the route accepted the body,
+    /// serde dropped the unknown key, and `penpot prefs-set plugnsEnabled false`
+    /// printed `ok: true` and exited 0 having changed nothing — a write verb
+    /// claiming work it did not do.
+    #[test]
+    fn a_preferences_write_refuses_a_field_the_app_does_not_have() {
+        let err = merged_preferences(&a_prefs_get_response(), "plugnsEnabled", json!(false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plugnsEnabled"), "the typo must be quoted back: {err}");
+        // The message has to be actionable: a user who typo'd needs the list,
+        // and the list has to come from the live response, not a stale copy.
+        for field in ["syncEnabled", "exportsEnabled", "pluginsEnabled", "cspEnabled"] {
+            assert!(err.contains(field), "`{field}` must be offered: {err}");
+        }
+    }
+
+    /// The other half: the four real fields must all still be settable, so the
+    /// guard above cannot quietly become "prefs-set never works".
+    #[test]
+    fn every_real_preference_field_is_still_settable() {
+        let current = a_prefs_get_response();
+        for field in ["syncEnabled", "exportsEnabled", "pluginsEnabled", "cspEnabled"] {
+            let merged = merged_preferences(&current, field, json!(true))
+                .unwrap_or_else(|e| panic!("`{field}` must be settable: {e}"));
+            assert_eq!(merged[field], json!(true));
+            assert_eq!(merged.as_object().unwrap().len(), 4, "no field invented");
+        }
     }
 
     #[test]
@@ -628,21 +747,7 @@ mod tests {
     #[test]
     fn no_verb_reaches_the_network_without_a_running_instance() {
         let dir = tempfile::tempdir().unwrap();
-        for verb in [
-            Verb::SyncStatus,
-            Verb::SyncPause,
-            Verb::SyncResume,
-            Verb::PrefsGet,
-            Verb::PrefsSet,
-            Verb::PkgAdd,
-            Verb::PkgInstall,
-            Verb::Boards,
-            Verb::Search,
-            Verb::Reveal,
-            Verb::NewFromTemplate,
-            Verb::VaultSwitch,
-            Verb::Reboot,
-        ] {
+        for verb in Verb::ALL {
             let err = route_for(dir.path(), verb).unwrap_err().to_string();
             assert!(err.contains("penpot daemon"), "{verb:?} got: {err}");
         }

@@ -133,6 +133,11 @@ is GUI model code, not domain code. For the same reason `apps/desktop` keeps `tr
 `menubar/model.rs` — 1,446 pure, well-tested lines. The GUI keeps its own testable layer rather
 than exiling it.
 
+> **Corrected (1).** `status.rs` shipped in `crates/app-core`. "Only the tray and the menubar
+> import it" was true of `use` statements and false of call sites: `boot` calls
+> `status::MockStatusSource::demo_frames()`, so leaving it here would have made a library crate
+> depend on the binary. See [What shipped differed](#what-shipped-differed).
+
 ## Phase 1 — Spike the verbs (throwaway)
 
 Write a deliberately rough `apps/desktop/src/bin/cli.rs`: inside the current crate, Tauri linked,
@@ -178,6 +183,10 @@ Verbs split by nature:
   write the vault tree and need no running backend. Fast, pure, cheap to test.
 - **Online** — `export`, `sync status|pause`, `new --from-template`, `pkg add`. These need Penpot
   running.
+
+> **Corrected (4).** `export` shipped as no verb at all, Online or otherwise: `crates/board-export`
+> registers no routes, so there is nothing for a CLI to call. See
+> [What shipped differed](#what-shipped-differed).
 
 > **Corrected (2).** This binary split is not the shape the system has. There are **three** tiers,
 > because "needs the backend" and "needs the running app" are different axes — `pkg add` is a

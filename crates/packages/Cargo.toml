@@ -18,4 +18,12 @@ sync-daemon = { path = "../sync-daemon" }
 vault-index = { path = "../vault-index" }
 axum = "0.8"
 http = "1"
+
+[dev-dependencies]
+# Test-only in both modules that use it: all 14 `tempfile::` calls sit after the
+# module's `#[cfg(test)]` line (`packages.rs:2172`, `templates.rs:438`). It was
+# in `[dependencies]`, which shipped a test-only crate into every release build
+# and quietly falsified the convention `vault-ops/Cargo.toml` states — that one
+# names `installer` as the SOLE exception, and installer's placement really is
+# correct (its `unzip_normalize_hash` is production code).
 tempfile = "3"

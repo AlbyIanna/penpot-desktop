@@ -163,14 +163,23 @@ pub struct VaultRunner {
     active: Mutex<VaultRef>,
     /// Serializes switches (only one teardown/reboot at a time).
     switch_lock: AsyncMutex<()>,
-    /// Serializes TEARDOWNS specifically — see [`VaultRunner::shutdown`].
+    /// Serializes TEARDOWNS specifically — see [`VaultRunner::shutdown`], which
+    /// carries the full argument for why this lock exists and what keeps it out
+    /// of the proxy-drain cycle.
     ///
     /// Deliberately not `switch_lock`: `stop_then_boot` already runs under
     /// that one and calls `shutdown()`, so reusing it would self-deadlock.
     /// Deliberately not `app` either: holding `app` across a teardown is the
-    /// deadlock this whole arrangement exists to avoid. This third lock is
-    /// touched by exactly one function, and by NO request handler, which is
-    /// what keeps it out of the proxy-drain cycle.
+    /// deadlock this whole arrangement exists to avoid.
+    ///
+    /// **Request handlers DO reach this lock.** `POST /open` → `control_open`
+    /// → [`switch_to`](Self::switch_to) → [`stop_then_boot`](Self::stop_then_boot)
+    /// → [`shutdown`](Self::shutdown) is a handler-to-`teardown_lock` path, and
+    /// so are `POST /__api/prefs/reboot` and `POST /__api/prefs/vault`. What
+    /// keeps that out of the cycle is NOT "no handler touches it" — it is the
+    /// two structural facts spelled out (with what breaks them) in
+    /// [`shutdown`](Self::shutdown)'s "Why a handler blocking on this is still
+    /// safe" section. Read that before editing either.
     teardown_lock: AsyncMutex<()>,
     /// D4 — the same late-bound slot this runner was constructed with (see
     /// [`RunnerSlot`]'s doc). Every reboot/switch re-passes it into `boot()`
@@ -329,13 +338,51 @@ impl VaultRunner {
     ///
     /// So the serialization is restored deliberately, with a lock of its own
     /// rather than by re-holding `app`: `teardown_lock` is held across the
-    /// teardown, `app` is not. No request handler ever touches
-    /// `teardown_lock`, so it cannot join the proxy-drain cycle above, and
-    /// `stop_then_boot` can still call this while holding `switch_lock`
-    /// (taking `switch_lock` here instead would self-deadlock — it already
-    /// holds it).
+    /// teardown, `app` is not. `stop_then_boot` can still call this while
+    /// holding `switch_lock` (taking `switch_lock` here instead would
+    /// self-deadlock — it already holds it).
     ///
-    /// Net effect: exactly the pre-fix ordering, without the pre-fix deadlock.
+    /// # Why a handler blocking on this is still safe
+    ///
+    /// An earlier revision of this doc claimed `teardown_lock` is "touched by
+    /// exactly one function, and by NO request handler". **That is false**, and
+    /// the false version is the dangerous one, because the next editor greps
+    /// `teardown_lock`, finds the single acquisition site below, and believes
+    /// it. `POST /open` → `control_open` → [`switch_to`](Self::switch_to) →
+    /// `stop_then_boot` → here is a request handler reaching this lock, and so
+    /// are `prefs_http`'s `POST /__api/prefs/reboot` and
+    /// `POST /__api/prefs/vault`. (The finding that opened the previous fix
+    /// round on this very function was also a doc comment asserting something
+    /// untrue. Twice is a pattern; hence the naming of breakers below.)
+    ///
+    /// The arrangement is safe anyway, for two reasons the old claim hid. Both
+    /// are load-bearing, and each is ONE edit from putting this lock back inside
+    /// the drain cycle:
+    ///
+    /// 1. **The control server is not drained.** [`serve_control`] is a bare
+    ///    `axum::serve(listener, router).await` — no `.with_graceful_shutdown`
+    ///    — and both binaries run it detached, dropping the `JoinHandle`
+    ///    (`tokio::spawn` in `penpot daemon`, `tauri::async_runtime::spawn` in
+    ///    the GUI), so nothing ever awaits it. `RunningApp::shutdown` drains the
+    ///    PROXY only. A control handler parked on `teardown_lock` therefore
+    ///    cannot stall the teardown that holds it.
+    ///    *Breaks if:* `serve_control` gains `.with_graceful_shutdown`, or a
+    ///    process-exit path starts awaiting that task's handle. Either turns
+    ///    every control route into a drain participant, `/open` included.
+    ///
+    /// 2. **The two proxy routes that reach here answer before they touch the
+    ///    runner.** `prefs_http`'s `post_reboot` and `post_vault` `tokio::spawn`
+    ///    the `reboot_in_place`/`switch_to` call and return `202` immediately
+    ///    (ack-first — see that module's doc), so no in-flight proxy request is
+    ///    ever waiting on this lock while the drain runs.
+    ///    *Breaks if:* either route is made synchronous — awaiting the runner
+    ///    inline to return a real result instead of an ack. Then the proxy drain
+    ///    waits for that handler, the handler waits for `teardown_lock`, and
+    ///    `teardown_lock` is held by the code awaiting the drain. That is the
+    ///    pre-fix deadlock exactly, rebuilt through this lock.
+    ///
+    /// Net effect: exactly the pre-fix ordering, without the pre-fix deadlock —
+    /// as long as those two hold.
     ///
     /// # What this deliberately does NOT do
     ///
