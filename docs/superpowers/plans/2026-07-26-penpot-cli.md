@@ -1439,12 +1439,24 @@ impl Attached {
 
 pub fn attach(data_dir: &Path) -> Result<Attached> {
     let record = app_core::runtime_record::read_record(data_dir)?;
+    if !pid_is_alive(record.pid) {
+        anyhow::bail!(
+            "found a stale {} for pid {} — no such process. The app was killed without \
+             cleaning up. Start one with `penpot daemon`.",
+            app_core::runtime_record::RECORD_FILE_NAME,
+            record.pid,
+        );
+    }
     Ok(Attached {
         base: format!("http://127.0.0.1:{}", record.control_port),
         token: record.token,
     })
 }
 ```
+
+**Why the liveness check exists.** Task 9 removes `runtime.json` on the clean shutdown path of both binaries, but a `SIGKILL` leaves it behind — and the chapter's own N5 gate kills the app mid-switch on purpose, so this is a state the project produces deliberately, not a hypothetical. Without the check, the next CLI invocation reads a plausible-looking record and dials a dead port, and the user sees a connection error instead of "nothing is running". The record already carries `pid` for exactly this.
+
+Implement `pid_is_alive` with `kill(pid, 0)` semantics — signal 0 performs the permission and existence check without delivering anything. Do not add a dependency for it if `std` or an already-present crate can do it; report what you used. Cover it with two tests: the current process's own pid is alive, and a pid that cannot exist is not. Do not attempt to detect pid reuse — a recycled pid is out of scope and the token check is the backstop.
 
 `apps/cli/src/lib.rs`:
 
