@@ -397,6 +397,11 @@ axum = "0.8"
 http = "1"
 rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+# Test-only in all five modules that use it (each first `tempfile::` sits after
+# the module's `#[cfg(test)]` line), so it belongs here — the convention every
+# sibling crate follows except `installer`, whose usage IS production code.
 tempfile = "3"
 ```
 
