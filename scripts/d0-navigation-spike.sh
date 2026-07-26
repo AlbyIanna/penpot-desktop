@@ -3,7 +3,7 @@
 #
 # Answers: can the webview observe + redirect Penpot's SPA HASH navigation
 # WITHOUT touching the SPA (invariant 3)? Assembles Tasks 1-5 (all merged):
-#   - GET /__navprobe?run=<case> (apps/desktop/src/navprobe.{rs,html})
+#   - GET /__navprobe?run=<case> (crates/web-ui/src/navprobe.{rs,html})
 #   - PENPOT_LOCAL_NAVWATCH_LOG / _REDIRECT (apps/desktop/src/navwatch.rs)
 #   - PENPOT_LOCAL_START_URL (apps/desktop/src/main.rs)
 #   - scripts/d0_navprobe.py (reads the navwatch JSONL)

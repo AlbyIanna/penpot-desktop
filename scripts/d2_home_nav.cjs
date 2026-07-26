@@ -164,7 +164,7 @@ async function main() {
     // never a D2 placeholder) -----------------------------------------------
     // D2's `/__home` grid also renders a placeholder `a.board-card.file-card`
     // for every manifest file with zero indexed boards yet (vault-index's
-    // `CardKind::File` — apps/desktop/src/home.html tags it with the extra
+    // `CardKind::File` — crates/web-ui/src/home.html tags it with the extra
     // `file-card` class specifically so callers like this one can tell the
     // two apart). Excluding that class is required: a placeholder's
     // `boardId` is a synthetic `file:<uuid>` with no real board behind it, so

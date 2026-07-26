@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HTTP helper for scripts/d4-preferences.sh (the D4 Preferences gate).
 
-Talks to the D4 Preferences routes (`apps/desktop/src/prefs_http.rs`) THROUGH
+Talks to the D4 Preferences routes (`crates/app-core/src/prefs_http.rs`) THROUGH
 THE PROXY — same-origin, no auth cookie/token needed (these routes are mounted
 unauthenticated, like `/__home` etc.). No RPC client here: the exports
 positive/negative legs of assertion (c) are driven by REUSING
@@ -32,7 +32,7 @@ Subcommands:
       (`{"ok":true,"accepted":true}`) and runs `reboot_in_place` in a
       detached task that outlives the request — it tears down the very
       proxy serving the request, so a synchronous response can never arrive
-      (see apps/desktop/src/prefs_http.rs's module doc). This subcommand
+      (see crates/app-core/src/prefs_http.rs's module doc). This subcommand
       hides that: it records the `lastOp.seq` in effect before the POST,
       sends it, then polls GET /__api/prefs (tolerating connection failures —
       expected while the stack is down) until `lastOp.seq` changes, and
@@ -42,7 +42,7 @@ Subcommands:
       REAL result, not just the 202 ack.
 
       `lastOp` is now `crate::last_op`'s ON-DISK record
-      (`<data_dir>/last-op.json`, apps/desktop/src/last_op.rs), not an
+      (`<data_dir>/last-op.json`, crates/app-state/src/last_op.rs), not an
       in-memory field — it has to be, because a successful switch/reboot
       replaces the whole `PrefsState` it used to live on. That also means the
       GET right after the POST can, for the FIRST TIME, observe a lastOp that
@@ -238,7 +238,7 @@ def _last_op_key(data):
     been recorded — `lastOp.seq`, or `None` before anything has EVER finished
     (empty `<data_dir>/last-op.json`).
 
-    `lastOp` is now a file (`crate::last_op`, apps/desktop/src/last_op.rs),
+    `lastOp` is now a file (`crate::last_op`, crates/app-state/src/last_op.rs),
     not an in-memory field that a successful switch/reboot used to reset back
     to `null` (that reset was the D4 bug this replaces — see that module's
     doc). That means it can ALREADY be non-null before this operation even

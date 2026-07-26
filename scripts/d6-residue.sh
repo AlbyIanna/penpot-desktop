@@ -145,7 +145,7 @@ fi
 #      already fails this gate through that leg.
 #   2. Driving a genuinely new live probe for #/debug/playground (as opposed
 #      to reusing D0's existing /__navprobe page, which is hardcoded to the
-#      #/dashboard case only — apps/desktop/src/navprobe.html) would need a
+#      #/dashboard case only — crates/web-ui/src/navprobe.html) would need a
 #      product-code change to navprobe.{rs,html} to parameterize the target
 #      fragment. That is out of this task's declared scope (this task creates
 #      scripts/d6-residue.sh and modifies the justfile only) and risks

@@ -37,7 +37,6 @@ app-state = { path = "../../crates/app-state" }
 vault-ops = { path = "../../crates/vault-ops" }
 app-core = { path = "../../crates/app-core" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]

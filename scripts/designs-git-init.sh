@@ -20,7 +20,7 @@
 #      (never commits into a pre-existing repo, not even an empty one).
 #
 # The desktop app's tray action "Enable git versioning" runs this exact
-# script (embedded via include_str! in apps/desktop/src/gitinit.rs).
+# script (embedded via include_str! in crates/vault-ops/src/gitinit.rs).
 
 set -euo pipefail
 

@@ -105,7 +105,7 @@ RESTART_TIMEOUT="${D4_RESTART_TIMEOUT:-300}"
 SYNC_TIMEOUT="${D4_SYNC_TIMEOUT:-180}"
 EXPORT_TIMEOUT="${D4_EXPORT_TIMEOUT:-180}"
 # A vault switch = full teardown + DB/index wipe + reboot. `lastOp` is now
-# persisted (`crate::last_op`, apps/desktop/src/last_op.rs) instead of an
+# persisted (`crate::last_op`, crates/app-state/src/last_op.rs) instead of an
 # in-memory field a successful switch used to reset to null before this
 # helper could ever observe it — the poll signal (`lastOp.seq` changing;
 # scripts/d4_prefs_helper.py's `_wait_for_op_outcome`) now actually arrives

@@ -54,7 +54,7 @@ MANIFEST_NAME = ".penpot-sync.json"
 LOCK_NAME = "lock.json"
 PACKAGES_DIR = ".penpot-packages"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-# Mirror apps/desktop/src/installer.rs MAX_SETTLE_CYCLES.
+# Mirror crates/installer/src/lib.rs MAX_SETTLE_CYCLES.
 MAX_SETTLE_CYCLES = 3
 
 

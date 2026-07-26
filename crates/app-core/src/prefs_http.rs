@@ -9,7 +9,7 @@
 //! - `GET /__api/prefs` — `{preferences, vault:{path,name}, syncPaused,
 //!   rendersRunning}`. `preferences` is the persisted store (`prefs::load`);
 //!   the other three fields are LIVE facts read off the running stack (via
-//!   the late-bound [`control::RunnerSlot`]), independent of what the store
+//!   the late-bound [`crate::control::RunnerSlot`]), independent of what the store
 //!   says — e.g. `syncEnabled: false` in the store but the daemon not yet
 //!   re-applied (a narrow race at boot) would still show correctly here.
 //! - `POST /__api/prefs` `{...preferences}` — the FULL preferences object
@@ -20,13 +20,13 @@
 //!   from [`prefs::needs_reboot`]; nothing here re-derives which settings
 //!   are boot-time, exactly per that function's own doc.
 //! - `POST /__api/prefs/reboot` — kicks off
-//!   [`control::VaultRunner::reboot_in_place`], then `{ok}`. The page calls
+//!   [`crate::control::VaultRunner::reboot_in_place`], then `{ok}`. The page calls
 //!   this ONLY from an explicit "Apply & Restart" the user clicks — this
 //!   route itself never decides to reboot on its own; `POST /__api/prefs`
 //!   never calls it either. Silently rebooting the supervised stack under an
 //!   open workspace window is exactly what the D4 plan forbids.
 //! - `POST /__api/prefs/vault` `{path}` — kicks off
-//!   [`control::VaultRunner::switch_to`] VERBATIM, the N5
+//!   [`crate::control::VaultRunner::switch_to`] VERBATIM, the N5
 //!   zero-cross-vault-spill machinery. This route does not, and must not,
 //!   reimplement any part of that switch — see that method's module doc for
 //!   why.

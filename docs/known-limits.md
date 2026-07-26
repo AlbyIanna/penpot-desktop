@@ -17,7 +17,7 @@ distinction mattered.
 
 Two different mechanisms, both configuration-only — no byte of `runtime/frontend/` changed:
 
-**Frontend flags** (`D1_CLOUD_SURFACE_FLAGS`, [`apps/desktop/src/lib.rs`](../apps/desktop/src/lib.rs)),
+**Frontend flags** (`D1_CLOUD_SURFACE_FLAGS`, [`crates/app-core/src/boot.rs`](../crates/app-core/src/boot.rs)),
 appended to the `penpotFlags` string Penpot's own `config.js` bootstrap reads — landed in
 [D1](milestones/d1/README.md):
 

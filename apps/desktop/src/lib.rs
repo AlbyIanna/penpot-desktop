@@ -11,8 +11,8 @@ pub mod navwatch;
 pub mod overlay;
 pub mod tray;
 
-/// Re-exported so `main.rs`, `bin/headless.rs` and the two integration tests
-/// under `tests/` keep spelling these at their pre-chapter-C paths.
+/// Re-exported so `main.rs` and the two integration tests under `tests/`
+/// keep spelling these at their pre-chapter-C paths.
 /// `supervisor_config` is here for `tests/packaged_layout_sim.rs`, which
 /// asserts the packaged-mode command lines through it.
 pub use app_core::{

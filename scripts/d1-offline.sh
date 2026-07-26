@@ -5,7 +5,7 @@
 # Proves the offline promise for every Penpot flag that deletes a cloud
 # surface, PASS/FAIL like the sibling gates:
 #   (a) SERVED — necessary but NOT sufficient: config.js carries the flag
-#       tokens `compose_frontend_flags` (apps/desktop/src/lib.rs) appends —
+#       tokens `compose_frontend_flags` (crates/app-core/src/boot.rs) appends —
 #       disable-registration, disable-dashboard-templates-section,
 #       disable-google-fonts-provider, disable-login-with-password. A renamed
 #       upstream flag would still be "served" while the surface came back, so

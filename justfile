@@ -271,7 +271,7 @@ d3:
     bash scripts/d3-menus.sh
 
 # D4 Preferences gate (PLAN4 milestone D4). A LIVE gate against the native
-# Preferences window's HTTP surface (`/__api/prefs*`, `apps/desktop/src/
+# Preferences window's HTTP surface (`/__api/prefs*`, `crates/app-core/src/
 # prefs_http.rs`): preferences persist across a restart (file AND
 # `GET /__api/prefs`); a live setting (sync pause/resume) actually reaches
 # the daemon, not just the file; the exporter toggle actually stops renders
@@ -319,7 +319,7 @@ d4:
 # equivalent exists for either — see scripts/d5a-finder-spike.sh /
 # scripts/d5-plist-check.sh for the packaged-app legs), kept out of the pass
 # count, while the resolver + import-path logic every one of them funnels
-# through is REQUIRED by name (`cargo test -p penpot-desktop -- docopen::`,
+# through is REQUIRED by name (`cargo test -p vault-ops -- docopen::`,
 # the D1/D2/D3 precedent). Needs a real GUI session (same constraint as
 # D0/D2/D3, not CI-headless). Dedicated ports: proxy 9056, backend 6518,
 # postgres 5591, valkey 6534, control 9057 (+ a would-be SECOND port block
@@ -359,6 +359,13 @@ d6:
 # (with roundtrip.py) first after any Penpot version bump.
 routes-gate:
     bash scripts/routes-gate.sh
+
+# C1 extraction gate (chapter C): the six extracted crates are tauri-free,
+# their tests pass in their new homes, and apps/desktop holds only GUI
+# modules with no orphaned page assets. Fast, pure, no stack, no ports.
+# Chained into `just e2e`.
+c1:
+    bash scripts/c1-crates.sh
 
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
@@ -410,6 +417,7 @@ e2e:
     bash scripts/e3-library.sh
     bash scripts/e4-gallery.sh
     bash scripts/e7-plugins-spike.sh
+    bash scripts/c1-crates.sh
     bash scripts/d1-offline.sh
     bash scripts/d2-home.sh
     bash scripts/d3-menus.sh

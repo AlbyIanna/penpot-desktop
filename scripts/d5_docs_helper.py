@@ -16,7 +16,7 @@ convention scripts/d3_menus_helper.py's own doc comment describes.
 Talks to the stack THROUGH THE PROXY (RPC + /__api/vault/manage/rename) and
 to the GUI binary's localhost control server (GET /health, GET /windows) —
 the ONLY way this gate can observe that a document actually opened inside
-the real Tauri window registry (see apps/desktop/src/control.rs's module
+the real Tauri window registry (see crates/app-core/src/control.rs's module
 doc: "a shell cannot reach into the Tauri process's WindowRegistry any other
 way").
 
