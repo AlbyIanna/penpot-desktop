@@ -275,8 +275,32 @@ impl VaultRunner {
     }
 
     /// Stop the current stack (process-exit path). Idempotent.
+    ///
+    /// The `take()` and the `await` are deliberately two statements, so the
+    /// mutex guard is dropped BEFORE the teardown is awaited. Written as one
+    /// `if let`, the guard's temporary lives to the end of the statement — and
+    /// that deadlocks the app:
+    ///
+    /// - [`RunningApp::shutdown`] ends in `proxy_task.await`, and the proxy is
+    ///   served with `axum::serve(..).with_graceful_shutdown(..)`, which waits
+    ///   for in-flight requests to finish;
+    /// - the in-flight request can be `GET`/`POST /__api/prefs`, whose handlers
+    ///   call [`sync_control`](Self::sync_control) /
+    ///   [`export_status`](Self::export_status) /
+    ///   [`set_renders_enabled`](Self::set_renders_enabled) — all of which take
+    ///   this same `app` lock;
+    /// - so the proxy waits for the handler, the handler waits for the lock,
+    ///   and the lock is held by the code waiting for the proxy. Nothing times
+    ///   out. Only SIGKILL recovers, because SIGTERM's path lands here too.
+    ///
+    /// Dropping the guard first lets that handler observe the `None` this
+    /// field's doc already promises ("only briefly, mid-switch") and answer
+    /// immediately, so the proxy drains and the teardown proceeds. Behaviour is
+    /// otherwise unchanged: `sync_control`, `export_status` and
+    /// `set_renders_enabled` all already handle `None`.
     pub async fn shutdown(&self) {
-        if let Some(app) = self.app.lock().await.take() {
+        let app = self.app.lock().await.take();
+        if let Some(app) = app {
             app.shutdown().await;
         }
     }
