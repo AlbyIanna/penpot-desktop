@@ -10,6 +10,7 @@ members = [
     "crates/board-export",
     "crates/vault-index",
     "crates/installer",
+    "crates/app-state",
 ]
 
 [workspace.package]

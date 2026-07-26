@@ -46,7 +46,7 @@
 //! the failure `vault-switch.json`'s crash marker exists to recover from.
 //! Because the caller can no longer receive a pass/fail verdict in the HTTP
 //! response, the detached task's outcome is logged loudly AND recorded via
-//! `crate::last_op` — a small JSON file (`last-op.json`) in the app DATA dir,
+//! `app_state::last_op` — a small JSON file (`last-op.json`) in the app DATA dir,
 //! NOT an in-memory field on `PrefsState`. It has to be a file: a successful
 //! switch/reboot tears down the very router this state lives on and `boot()`
 //! constructs a fresh `PrefsState` for the new one, so anything kept only in
@@ -76,8 +76,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::control::RunnerSlot;
-use crate::last_op;
-use crate::prefs::{self, Preferences};
+use app_state::last_op;
+use app_state::prefs::{self, Preferences};
 
 const PREFERENCES_PAGE_HTML: &str = include_str!("preferences.html");
 
@@ -90,7 +90,7 @@ struct PrefsState {
     runner: RunnerSlot,
 }
 
-/// Record a detached switch/reboot's outcome to `crate::last_op`'s on-disk
+/// Record a detached switch/reboot's outcome to `app_state::last_op`'s on-disk
 /// store (`<data_dir>/last-op.json`) where `GET /__api/prefs` — served by
 /// whichever `PrefsState` happens to be current, old or new — can find it,
 /// and log it loudly. This is the ONLY place a caller can still learn whether
@@ -187,7 +187,7 @@ async fn get_prefs(State(state): State<Arc<PrefsState>>) -> Response {
         "syncPaused": sync_paused,
         "rendersRunning": renders_running,
         // D4 — outcome of the most recently finished detached switch/reboot
-        // (see module doc + `crate::last_op`). This is how a caller of the
+        // (see module doc + `app_state::last_op`). This is how a caller of the
         // ack-then-detach `/reboot` and `/vault` routes below finds out
         // whether the thing it kicked off actually succeeded, INCLUDING when
         // it succeeded — the on-disk record survives the stack it reports on
@@ -242,7 +242,7 @@ async fn post_reboot(State(state): State<Arc<PrefsState>>) -> Response {
     // ACK first, act second (see module doc) — `reboot_in_place` tears down
     // the proxy answering this very request, so a synchronous response can
     // never arrive. Detach into a task that outlives the request; its
-    // outcome lands in `crate::last_op`'s on-disk record for `GET
+    // outcome lands in `app_state::last_op`'s on-disk record for `GET
     // /__api/prefs` to report, since it can no longer ride this response.
     let state_for_task = state.clone();
     tokio::spawn(async move {
@@ -284,7 +284,7 @@ async fn post_vault(State(state): State<Arc<PrefsState>>, Json(req): Json<VaultS
     // connection must NOT cancel the switch partway through — that is
     // exactly the interrupted-switch case the crash marker inside
     // `switch_to` exists to recover from), and record the outcome via
-    // `crate::last_op` since it can no longer ride this response back.
+    // `app_state::last_op` since it can no longer ride this response back.
     //
     // N5 — still delegates to `VaultRunner::switch_to` VERBATIM inside the
     // task. This route must never reimplement any part of the

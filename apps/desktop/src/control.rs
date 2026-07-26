@@ -363,7 +363,7 @@ impl VaultRunner {
 
     /// D4 — reboot the supervised stack in place: stop it, then boot it
     /// again against the SAME vault, so a freshly re-read `Preferences`
-    /// (`crate::prefs`) takes effect for the settings that are only read at
+    /// (`app_state::prefs`) takes effect for the settings that are only read at
     /// boot (plugins/CSP baked into `config.js` at script load; the
     /// supervisor cannot hot-add the exporter child — see module docs).
     ///

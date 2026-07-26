@@ -44,9 +44,9 @@ use penpot_rpc::{Auth, PenpotClient};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, DragDropEvent, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
+use app_state::recent::{self, RecentEntry};
 use crate::docopen;
 use crate::navwatch::{self, Decision, NavWatch};
-use crate::recent::{self, RecentEntry};
 use crate::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
 use model::{build_menu_model, command_for_id, Command, Entry, MenuModel, Predefined, RECENT_PREFIX};
 

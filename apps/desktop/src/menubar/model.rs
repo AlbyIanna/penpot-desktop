@@ -9,7 +9,7 @@
 //! makes the gate possible (the model can be built and asserted against
 //! headlessly, with no GUI session).
 
-use crate::recent::RecentEntry;
+use app_state::recent::RecentEntry;
 use crate::windows::OpenWindow;
 
 /// Every action a menu item can dispatch. `mod.rs` matches this exhaustively
