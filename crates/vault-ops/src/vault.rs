@@ -353,7 +353,11 @@ pub fn decide_startup(
 /// success), so recovery can call it unconditionally.
 ///
 /// `<data>/assets` is Penpot's `fs` objects-storage backend
-/// (`PENPOT_OBJECTS_STORAGE_FS_DIRECTORY`, wired in [`crate::AppConfig::storage_dir`]),
+/// (`PENPOT_OBJECTS_STORAGE_FS_DIRECTORY`, wired in `app-core`'s
+/// `AppConfig::storage_dir` — deliberately plain text, not an intra-doc link:
+/// resolving one would need a normal `vault-ops` → `app-core` dependency, the
+/// cycle chapter C exists to prevent, and a dev-dependency does not put
+/// `app_core` in the lib target's extern prelude so it cannot resolve either),
 /// holding every uploaded media blob. Wiping it is safe because a reconcile
 /// re-materializes each referenced blob from the `.penpot` on disk: the switch
 /// re-imports every file under its original id via `import-binfile`, and with

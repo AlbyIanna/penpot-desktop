@@ -66,6 +66,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
+name = "app-core"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "app-state",
+ "axum",
+ "board-export",
+ "chrono",
+ "directories",
+ "http",
+ "packages",
+ "penpot-rpc",
+ "proxy",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "supervisor",
+ "sync-core",
+ "sync-daemon",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
+ "vault-index",
+ "vault-ops",
+ "web-ui",
+]
+
+[[package]]
 name = "app-state"
 version = "0.3.0"
 dependencies = [
@@ -3111,18 +3140,11 @@ name = "penpot-desktop"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "app-core",
  "app-state",
- "axum",
- "board-export",
  "chrono",
- "directories",
- "http",
  "installer",
- "packages",
  "penpot-rpc",
- "proxy",
- "rand 0.8.7",
- "serde",
  "serde_json",
  "supervisor",
  "sync-core",
@@ -3133,12 +3155,10 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
- "tower",
  "tracing",
  "tracing-subscriber",
  "vault-index",
  "vault-ops",
- "web-ui",
 ]
 
 [[package]]

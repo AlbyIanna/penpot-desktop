@@ -10,7 +10,7 @@
 //! headlessly, with no GUI session).
 
 use app_state::recent::RecentEntry;
-use crate::windows::OpenWindow;
+use app_core::windows::OpenWindow;
 
 /// Every action a menu item can dispatch. `mod.rs` matches this exhaustively
 /// (no wildcard arm) so a variant added here without being wired there fails

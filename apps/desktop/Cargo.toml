@@ -27,34 +27,23 @@ tauri-plugin-global-shortcut = "2"
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
-supervisor = { path = "../../crates/supervisor" }
-proxy = { path = "../../crates/proxy" }
 penpot-rpc = { path = "../../crates/penpot-rpc" }
 sync-core = { path = "../../crates/sync-core" }
 sync-daemon = { path = "../../crates/sync-daemon" }
-board-export = { path = "../../crates/board-export" }
 vault-index = { path = "../../crates/vault-index" }
 installer = { path = "../../crates/installer" }
 app-state = { path = "../../crates/app-state" }
-packages = { path = "../../crates/packages" }
 vault-ops = { path = "../../crates/vault-ops" }
-web-ui = { path = "../../crates/web-ui" }
-axum = "0.8"
+app-core = { path = "../../crates/app-core" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-http = "1"
-directories = "5"
-rand = "0.8"
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
-# D4: HTTP-level tests for prefs_http.rs (`Router::oneshot`) — no other
-# module in this crate needs axum's request/response cycle driven directly,
-# every earlier one only unit-tests its pure logic (see prefs_http's own
-# module doc for why this route set is different: it must prove the save
-# round-trip and needsReboot flag through the real routes, not just the
-# `prefs::` functions they call).
-tower = { version = "0.5", features = ["util"] }
+# `tests/packaged_layout_sim.rs` asserts the packaged-mode command lines the
+# re-exported `supervisor_config` builds, so it names `supervisor::` types
+# directly. Test-only since chapter C moved the boot body to `app-core`:
+# nothing in this crate's own lib/bins mentions the supervisor any more.
+supervisor = { path = "../../crates/supervisor" }

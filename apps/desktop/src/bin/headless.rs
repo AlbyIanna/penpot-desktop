@@ -22,7 +22,7 @@
 
 use std::io::Write;
 
-use penpot_desktop::{control, AppConfig};
+use app_core::{control, AppConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     // binary (the GUI shell wires its REAL registry through the same call).
     if let Some(port) = control::control_port_from_env() {
         let runner_ctl = runner.clone();
-        let windows = penpot_desktop::windows::WindowRegistry::new();
+        let windows = app_core::windows::WindowRegistry::new();
         tokio::spawn(async move {
             if let Err(e) = control::serve_control(runner_ctl, windows, port).await {
                 tracing::error!("vault control server exited: {e:#}");

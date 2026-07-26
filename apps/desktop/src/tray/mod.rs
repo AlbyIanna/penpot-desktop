@@ -23,7 +23,7 @@ use tauri::{AppHandle, Runtime};
 use tokio::sync::watch;
 
 use crate::overlay::{self, ProxyUrlSlot};
-use crate::status::{ExportStatusSnapshot, SyncControl, SyncStatusSnapshot};
+use app_core::status::{ExportStatusSnapshot, SyncControl, SyncStatusSnapshot};
 use model::{
     build_menu_model, icon_pixels, AggregateState, MenuEntry, MenuModel, CHECKPOINT_ID,
     FILE_ROW_PREFIX, GIT_INIT_ID, ICON_SIZE, OPEN_DESIGNS_ID, OPEN_VAULT_ID, PAUSE_TOGGLE_ID,
@@ -34,7 +34,7 @@ const TRAY_ID: &str = "penpot-sync-status";
 
 /// N5: callback the "Open Vault…" tray entry fires (the GUI's `File > Open
 /// Vault`). It picks a folder and drives the vault switch through the
-/// [`crate::control::VaultRunner`]; `None` in demo mode / before boot.
+/// [`app_core::control::VaultRunner`]; `None` in demo mode / before boot.
 pub type OpenVaultCb = Arc<dyn Fn() + Send + Sync>;
 
 fn icon(state: AggregateState) -> Image<'static> {
@@ -105,8 +105,8 @@ fn build_tauri_menu<R: Runtime>(
 /// Create the tray icon and keep it in sync with the status watch channel.
 ///
 /// `rx`/`control` are the M3 daemon status contract
-/// (see [`crate::status`]) — today they come from
-/// [`crate::status::MockStatusSource`], at integration time from the real
+/// (see [`app_core::status`]) — today they come from
+/// [`app_core::status::MockStatusSource`], at integration time from the real
 /// sync daemon; this function is agnostic.
 ///
 /// Quit goes through `app.exit(0)`, i.e. the existing `RunEvent::Exit`
@@ -118,7 +118,7 @@ fn build_tauri_menu<R: Runtime>(
 /// menu then keeps its pre-M5 shape.
 ///
 /// `exports_rx` (M5): the board-export service's status stream (via
-/// [`crate::status::ExportStatusBridge`]); `Some` only when
+/// [`app_core::status::ExportStatusBridge`]); `Some` only when
 /// `PENPOT_LOCAL_EXPORTS=1` — it adds the "Exports: …" info row.
 pub fn spawn_tray<R: Runtime>(
     app: &AppHandle<R>,

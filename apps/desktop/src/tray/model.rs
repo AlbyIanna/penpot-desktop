@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::status::{ExportStatusSnapshot, FileState, SyncStatusSnapshot};
+use app_core::status::{ExportStatusSnapshot, FileState, SyncStatusSnapshot};
 
 /// Menu item id of the pause/resume toggle.
 pub const PAUSE_TOGGLE_ID: &str = "sync-pause-toggle";
@@ -333,7 +333,7 @@ pub fn icon_pixels(state: AggregateState) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status::SyncStatusSnapshot;
+    use app_core::status::SyncStatusSnapshot;
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-13T12:00:00Z")

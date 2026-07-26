@@ -12,18 +12,21 @@
 #       unit-tested, and this gate requires the SPECIFIC test names that pin
 #       the contract, not merely "the suite passed" (a renamed or weakened
 #       test would otherwise leave this green). Run via
-#       `cargo test -p penpot-desktop -- menubar:: windows::` PLUS
+#       `cargo test -p penpot-desktop -- menubar::` PLUS
+#       `cargo test -p app-core -- windows::` (windows:: lives in its own
+#       crate as of chapter C's app-core extraction — the Tauri-free window
+#       registry moved with the boot sequence) PLUS
 #       `cargo test -p app-state -- recent::` (recent:: lives in its own
 #       crate as of chapter C's app-state extraction — same package the
 #       `pub mod prefs/recent/last_op` trio moved to) PLUS
 #       `cargo test -p vault-ops -- reveal::` (reveal:: lives in its own
-#       crate as of chapter C's vault-ops extraction; all three invocations
+#       crate as of chapter C's vault-ops extraction; all four invocations
 #       append to the same log) — cargo only accepts one positional
 #       TESTNAME, so within each invocation the multi-module filter goes
 #       after `--`, straight to the test harness (libtest ORs multiple
 #       filters). Every name below is verified present in that combined
 #       output (`grep`ped from the real run, not assumed) AND asserted `ok`;
-#       the leg also fails on the summed exit code of all three invocations,
+#       the leg also fails on the summed exit code of all four invocations,
 #       so a failure in a module test NOT individually pinned still fails
 #       the gate rather than being silently absorbed by the named checks
 #       alone.
@@ -301,9 +304,13 @@ pass "pre-flight: ports free, no existing GUI instance, helper present"
 # builder: all pure/Tauri-free unit tests, no live stack needed. Run first
 # so a broken contract fails fast before paying for a stack boot.
 # =========================================================================
-echo "-- (a)/(c) cargo test -p penpot-desktop -- menubar:: windows:: ; cargo test -p app-state -- recent:: ; cargo test -p vault-ops -- reveal::"
-(cd "$ROOT" && cargo test -p penpot-desktop -- menubar:: windows::) >"$CARGO_TEST_LOG" 2>&1
+echo "-- (a)/(c) cargo test -p penpot-desktop -- menubar:: ; cargo test -p app-core -- windows:: ; cargo test -p app-state -- recent:: ; cargo test -p vault-ops -- reveal::"
+(cd "$ROOT" && cargo test -p penpot-desktop -- menubar::) >"$CARGO_TEST_LOG" 2>&1
 CARGO_TEST_EXIT=$?
+# windows:: moved to crates/app-core (chapter C extraction) — same append-to-
+# the-same-log, sum-the-exit-code treatment as the two legs below.
+(cd "$ROOT" && cargo test -p app-core -- windows::) >>"$CARGO_TEST_LOG" 2>&1
+CARGO_TEST_EXIT=$(( CARGO_TEST_EXIT + $? ))
 # recent:: moved to crates/app-state (chapter C extraction) — its own `-p`
 # invocation, appended to the SAME log the REQUIRED_TESTS grep below reads,
 # so the named-test check below still sees every name in one place.
@@ -350,9 +357,9 @@ for entry in "${REQUIRED_TESTS[@]}"; do
 done
 
 if [ "$CARGO_TEST_EXIT" -eq 0 ]; then
-    pass "(a) cargo test -p penpot-desktop -- menubar:: windows:: + cargo test -p app-state -- recent:: + cargo test -p vault-ops -- reveal:: all exit 0 (no unlisted regression hiding behind the named checks alone)"
+    pass "(a) cargo test -p penpot-desktop -- menubar:: + cargo test -p app-core -- windows:: + cargo test -p app-state -- recent:: + cargo test -p vault-ops -- reveal:: all exit 0 (no unlisted regression hiding behind the named checks alone)"
 else
-    fail "(a) cargo test -p penpot-desktop -- menubar:: windows:: / cargo test -p app-state -- recent:: / cargo test -p vault-ops -- reveal:: exited (summed) $CARGO_TEST_EXIT — see $CARGO_TEST_LOG"
+    fail "(a) cargo test -p penpot-desktop -- menubar:: / cargo test -p app-core -- windows:: / cargo test -p app-state -- recent:: / cargo test -p vault-ops -- reveal:: exited (summed) $CARGO_TEST_EXIT — see $CARGO_TEST_LOG"
 fi
 
 # =========================================================================

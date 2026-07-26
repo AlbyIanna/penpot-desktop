@@ -47,7 +47,7 @@ use tauri::{AppHandle, DragDropEvent, Manager, Runtime, WebviewUrl, WebviewWindo
 use app_state::recent::{self, RecentEntry};
 use vault_ops::docopen;
 use crate::navwatch::{self, Decision, NavWatch};
-use crate::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
+use app_core::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
 use model::{build_menu_model, command_for_id, Command, Entry, MenuModel, Predefined, RECENT_PREFIX};
 
 /// Late-bound facts about the active vault/stack: unknown before boot
@@ -851,7 +851,7 @@ fn apply_title_updates<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, updates: V
 /// own.
 ///
 /// Survives an N5 vault switch without resubscribing: `status_rx` is bound
-/// to [`crate::status::DaemonStatusBridge`]'s own channel, which a switch's
+/// to [`app_core::status::DaemonStatusBridge`]'s own channel, which a switch's
 /// `attach` call re-points at the new daemon (see that module's doc) — so
 /// this loop keeps working against whichever vault is active, reading
 /// `ctx.live`/`ctx.registry` (both `Arc`-shared) fresh on every iteration.
