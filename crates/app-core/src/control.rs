@@ -163,6 +163,15 @@ pub struct VaultRunner {
     active: Mutex<VaultRef>,
     /// Serializes switches (only one teardown/reboot at a time).
     switch_lock: AsyncMutex<()>,
+    /// Serializes TEARDOWNS specifically — see [`VaultRunner::shutdown`].
+    ///
+    /// Deliberately not `switch_lock`: `stop_then_boot` already runs under
+    /// that one and calls `shutdown()`, so reusing it would self-deadlock.
+    /// Deliberately not `app` either: holding `app` across a teardown is the
+    /// deadlock this whole arrangement exists to avoid. This third lock is
+    /// touched by exactly one function, and by NO request handler, which is
+    /// what keeps it out of the proxy-drain cycle.
+    teardown_lock: AsyncMutex<()>,
     /// D4 — the same late-bound slot this runner was constructed with (see
     /// [`RunnerSlot`]'s doc). Every reboot/switch re-passes it into `boot()`
     /// unchanged, so the Preferences routes built by a later boot keep
@@ -184,6 +193,7 @@ impl VaultRunner {
             data_dir,
             active: Mutex::new(active),
             switch_lock: AsyncMutex::new(()),
+            teardown_lock: AsyncMutex::new(()),
             runner_slot,
         })
     }
@@ -295,10 +305,51 @@ impl VaultRunner {
     ///
     /// Dropping the guard first lets that handler observe the `None` this
     /// field's doc already promises ("only briefly, mid-switch") and answer
-    /// immediately, so the proxy drains and the teardown proceeds. Behaviour is
-    /// otherwise unchanged: `sync_control`, `export_status` and
-    /// `set_renders_enabled` all already handle `None`.
+    /// immediately, so the proxy drains and the teardown proceeds.
+    ///
+    /// # What dropping the guard changed, and why `teardown_lock` is here
+    ///
+    /// Dropping it is not free, and the earlier claim that behaviour was
+    /// "otherwise unchanged" was wrong. The held guard did two jobs: it
+    /// protected the slot, and — accidentally — it **serialized teardowns**,
+    /// because a second caller blocked on it until the first had finished.
+    /// Releasing it early keeps the first job and drops the second, so a
+    /// concurrent caller would get `None` back *immediately* rather than
+    /// waiting.
+    ///
+    /// That is reachable and it is not benign. The process-exit paths
+    /// (`apps/desktop/src/main.rs`'s `RunEvent::Exit`, `penpot daemon`'s
+    /// signal handler) take the app and await its teardown. A detached
+    /// `reboot_in_place`/`switch_to` task racing them would enter
+    /// [`stop_then_boot`](Self::stop_then_boot), get `None` instantly, and go
+    /// straight on to [`vault::reset_disposable_state`] and a fresh `boot()`
+    /// **while the old postgres and backend were still running** — wiping
+    /// state under a live stack and then binding ports it had not released.
+    /// ⌘Q or SIGTERM during a Preferences-initiated vault switch is enough.
+    ///
+    /// So the serialization is restored deliberately, with a lock of its own
+    /// rather than by re-holding `app`: `teardown_lock` is held across the
+    /// teardown, `app` is not. No request handler ever touches
+    /// `teardown_lock`, so it cannot join the proxy-drain cycle above, and
+    /// `stop_then_boot` can still call this while holding `switch_lock`
+    /// (taking `switch_lock` here instead would self-deadlock — it already
+    /// holds it).
+    ///
+    /// Net effect: exactly the pre-fix ordering, without the pre-fix deadlock.
+    ///
+    /// # What this deliberately does NOT do
+    ///
+    /// It does not make a `None` return mean "someone else is tearing down, so
+    /// give up". `None` has a second, legitimate meaning: `stop_then_boot`
+    /// leaves the slot empty when a `boot()` fails, and the documented
+    /// recovery is for the user to switch again. Refusing to proceed on `None`
+    /// would silently turn that retry into a no-op. Nor does it stop a switch
+    /// from booting a new stack after the process has decided to exit — that
+    /// was equally true before, and closing it needs the slot to carry an
+    /// explicit "terminal" state, which is a larger change than this one.
     pub async fn shutdown(&self) {
+        // Serialize teardowns (see above). Held across the await; `app` is not.
+        let _teardown = self.teardown_lock.lock().await;
         let app = self.app.lock().await.take();
         if let Some(app) = app {
             app.shutdown().await;

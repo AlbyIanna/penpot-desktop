@@ -467,6 +467,31 @@ fi
 # green. Delete the `.layer(...)` in `serve_control` and this block is what
 # must go red. The POSITIVE control comes first, so a 401/403 below can only
 # mean "refused", never "server down".
+#
+# But first, the record barrier. `READY` does NOT imply `runtime.json` exists:
+# the daemon SPAWNS `serve_control` and prints `READY` on the very next
+# statement without waiting for it, and it is `serve_control` that binds the
+# port and writes the record. Reading the token too early yields an empty
+# string, the positive control 401s, and all four assertions below fail
+# shouting THE CONTROL PORT IS UNAUTHENTICATED — the chapter's security gate
+# raising a false alarm about the chapter's security fix, which is a worse
+# failure than the one it is watching for. Every other barrier in this gate is
+# a poll; this was the one place relying on statement ordering.
+wait_record() {
+    local deadline=$(($(date +%s) + $1))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        [ -n "$(control_token)" ] && return 0
+        kill -0 "$DAEMON_PID" 2>/dev/null || { echo "daemon died before publishing runtime.json" >&2; return 1; }
+        sleep 1
+    done
+    echo "runtime.json carried no token within ${1}s" >&2; return 1
+}
+if wait_record 60; then
+    pass "(d) runtime.json carries a token (polled — READY does not imply the record is on disk)"
+else
+    fail "(d) runtime.json never carried a token; the four auth assertions below cannot be trusted"
+fi
+
 AUTH_OK="$(ctl_code -H "x-penpot-control-token: $(control_token)" "$CONTROL/health")"
 [ "$AUTH_OK" = "200" ] &&
     pass "(d) positive control: GET /health WITH the runtime.json token -> 200 (the server is up and answering)" ||
@@ -615,21 +640,31 @@ if run_verb reboot reboot; then
 else
     fail "(c) penpot reboot failed"; head -5 "$WORK_DIR/reboot.err" >&2
 fi
-REBOOT_DEADLINE=$(($(date +%s) + REBOOT_TIMEOUT))
+REBOOT_T0=$(date +%s)
+REBOOT_DEADLINE=$((REBOOT_T0 + REBOOT_TIMEOUT))
 REBOOT_LANDED=0
 POLLS_KILLED=0
+POLLS_ISSUED=0
+POLLS_DURING=0
 POLL_BOUND=30
 while [ "$(date +%s)" -lt "$REBOOT_DEADLINE" ]; do
     run_verb_within "$POLL_BOUND" after-reboot prefs-get --live
     rc=$?
+    POLLS_ISSUED=$((POLLS_ISSUED + 1))
     [ "$LAST_KILLED" -eq 1 ] && POLLS_KILLED=$((POLLS_KILLED + 1))
     if [ "$rc" -eq 0 ] &&
        [ "$(jget lastOp.op <"$WORK_DIR/after-reboot.json" 2>/dev/null || true)" = "reboot" ]; then
         REBOOT_LANDED=1; break
     fi
+    # This poll did NOT see the reboot reported complete, so it sampled the
+    # teardown/boot window itself — either refused (proxy down), or answered
+    # off a stack whose reboot had not finished. That is the overlap the
+    # deadlock pin below needs in order to mean anything.
+    POLLS_DURING=$((POLLS_DURING + 1))
     kill -0 "$DAEMON_PID" 2>/dev/null || break
     sleep 2
 done
+REBOOT_SECS=$(( $(date +%s) - REBOOT_T0 ))
 if [ "$REBOOT_LANDED" -eq 1 ] && [ "$(jget lastOp.ok <"$WORK_DIR/after-reboot.json")" = "true" ]; then
     pass "(c) the detached reboot landed: lastOp={op:reboot, ok:true} — and the CLI reattached over the SAME record"
 else
@@ -651,10 +686,25 @@ fi
 # whether the reboot eventually landed, but whether anything had to be KILLED
 # for it to. A healthy reboot answers every poll in well under a second (the
 # proxy is either up, or down and refusing instantly).
-if [ "$POLLS_KILLED" -eq 0 ]; then
-    pass "(c) no poll had to be killed for the reboot to complete — the teardown released the app lock instead of deadlocking on the proxy drain"
+#
+# It is only a pin if a poll actually OVERLAPPED the teardown, and that is a
+# timing property, not something `POLLS_KILLED == 0` establishes. If a future
+# change made attach slower or the 202 later, every poll could land after the
+# reboot had already finished; `POLLS_KILLED == 0` would then be true for the
+# wrong reason and this pin would go silently, permanently green. So the
+# overlap is asserted directly: at least one poll must have run while the
+# reboot was still in flight (refused, or answering off a stack that had not
+# finished). Counting merely-issued polls would not do — the loop always runs
+# at least once, so that assertion could never fail.
+if [ "$POLLS_DURING" -ge 1 ]; then
+    pass "(c) the teardown window was really sampled: $POLLS_DURING of $POLLS_ISSUED poll(s) saw the reboot still in flight, over ${REBOOT_SECS}s — the pin below has something to be a pin about"
 else
-    fail "(c) $POLLS_KILLED poll(s) hung the full ${POLL_BOUND}s during the reboot and had to be killed — THE TEARDOWN DEADLOCKED: VaultRunner::shutdown is holding the app lock across the proxy's graceful shutdown, and only this gate's watchdog broke the cycle"
+    fail "(c) every poll landed AFTER the reboot had already completed ($POLLS_ISSUED issued in ${REBOOT_SECS}s) — the deadlock pin below never overlapped the teardown and is vacuous"
+fi
+if [ "$POLLS_KILLED" -eq 0 ]; then
+    pass "(c) none of those $POLLS_ISSUED poll(s) had to be killed — the teardown released the app lock instead of deadlocking on the proxy drain"
+else
+    fail "(c) $POLLS_KILLED of $POLLS_ISSUED poll(s) hung the full ${POLL_BOUND}s during the reboot and had to be killed — THE TEARDOWN DEADLOCKED: VaultRunner::shutdown is holding the app lock across the proxy's graceful shutdown, and only this gate's watchdog broke the cycle"
 fi
 
 if wait_index "$INDEX_TIMEOUT" 1 1; then
