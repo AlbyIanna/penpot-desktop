@@ -714,6 +714,16 @@ pub use app_core::{
 
 In `apps/desktop/src/bin/headless.rs`, change the import to `use app_core::{control, AppConfig};`.
 
+Finally, close a broken doc link Task 5 left behind. `crates/vault-ops/src/vault.rs:356` links `` [`crate::AppConfig::storage_dir`] ``, which stopped resolving when `vault-ops` was extracted — Task 5 correctly left it alone, because the correct target did not exist yet. It does now: change it to `` [`app_core::AppConfig::storage_dir`] `` and add `app-core` to `crates/vault-ops/Cargo.toml`'s `[dev-dependencies]` **only if** rustdoc needs it to resolve. If resolving the link would require a normal dependency from `vault-ops` on `app-core`, do **not** add one — that is the cycle this whole chapter is built to avoid. Downgrade the link to plain text instead, exactly as Task 5 did for `vault.rs:4`, and say so in your report.
+
+Verify with:
+
+```bash
+cargo doc -p vault-ops --no-deps 2>&1 | grep -c "unresolved link"
+```
+
+Expected: `0`.
+
 - [ ] **Step 6: Repoint the D3 gate one last time**
 
 `windows::` now lives in `app-core`:
@@ -857,6 +867,14 @@ c1:
 ```
 
 Add `bash scripts/c1-crates.sh` to the `e2e` chain, immediately before `bash scripts/d1-offline.sh`.
+
+Also fix a stale comment the extraction left in the same file. `justfile:322`, inside the `d5` recipe's doc comment, still says `` `cargo test -p penpot-desktop -- docopen::` `` — Task 5 moved that test to `vault-ops` and repointed the script but not the comment describing it. Update it to `-p vault-ops`. Then check whether the `d3` recipe's comment names packages too, and correct any it gets wrong:
+
+```bash
+grep -n "penpot-desktop --\|-p penpot-desktop" justfile
+```
+
+In this repo the recipe comments are the primary documentation of what each gate proves, so a comment that names the wrong package is a real defect, not cosmetic — it is what the next person reads before deciding whether a gate still covers what they need.
 
 - [ ] **Step 5: Run the headless part of the ladder**
 
