@@ -36,6 +36,10 @@ installer = { path = "../../crates/installer" }
 app-state = { path = "../../crates/app-state" }
 vault-ops = { path = "../../crates/vault-ops" }
 app-core = { path = "../../crates/app-core" }
+# Chapter C task 11: `bin/headless` is a shim over `penpot_cli::verbs::daemon`.
+# The arrow points desktop -> cli and must stay that way: `penpot-cli` carries
+# no `tauri` dependency, and nothing in it may ever need one.
+penpot-cli = { path = "../cli" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

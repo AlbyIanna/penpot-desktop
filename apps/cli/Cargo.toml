@@ -16,7 +16,14 @@ path = "src/main.rs"
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
-serde = { workspace = true }
+# Task 11: the lifted daemon body logs a failed control server through
+# `tracing::error!`. Task 10's CLI only ever installed a subscriber, never
+# emitted an event, so this edge is new.
+tracing = { workspace = true }
+# NOTE: no `serde` here. Task 10's Cargo.toml carried it, but nothing in this
+# crate ever names it: every payload is built and read as `serde_json::Value`,
+# and the typed structs it would derive on live in the crates that own the
+# routes. `serde_json` alone is the real edge.
 serde_json = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }

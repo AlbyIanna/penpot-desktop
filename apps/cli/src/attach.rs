@@ -10,22 +10,72 @@ use std::path::Path;
 
 use anyhow::Result;
 
+/// Which of the running app's two loopback listeners a request goes to.
+///
+/// A daemon publishes BOTH ports in `runtime.json`, because the routes a CLI
+/// needs are split across them and neither one can serve the other's:
+/// - [`Surface::Control`] is `control::control_router` — `/health`, `/active`,
+///   `/list`, `/open`, `/windows`. Small, token-authenticated, and alive for
+///   the whole process lifetime.
+/// - [`Surface::Proxy`] is the supervised stack's proxy, which carries every
+///   `/__api/*` route (prefs, packages, templates, vault index, home). It is
+///   torn down and rebuilt by every vault switch and reboot, which is exactly
+///   why `vault switch` is a Control-surface verb: the route that performs the
+///   switch cannot live on the listener the switch destroys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Control,
+    Proxy,
+}
+
 // `Debug` is required for `Result::unwrap_err`'s bound on `T` (the Ok side),
 // which the first test below calls — not in the brief's snippet, but needed
 // for it to compile; no behavior change.
 #[derive(Debug)]
 pub struct Attached {
+    /// The control server's origin (`http://127.0.0.1:<control_port>`).
     pub base: String,
+    /// The proxy's origin (`http://127.0.0.1:<proxy_port>`) — added in Task
+    /// 11, when the first `/__api/*` verbs landed. Task 10 only ever reached
+    /// the control surface, so one `base` was enough then.
+    pub proxy_base: String,
     pub token: String,
 }
 
 impl Attached {
-    /// Build a request to the running daemon, carrying the control token and
-    /// deliberately no `Origin` — the server rejects anything browser-shaped.
-    pub fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+    /// The origin for `surface`.
+    pub fn base_for(&self, surface: Surface) -> &str {
+        match surface {
+            Surface::Control => &self.base,
+            Surface::Proxy => &self.proxy_base,
+        }
+    }
+
+    /// Build a request to the running daemon on `surface`, carrying the
+    /// control token and deliberately no `Origin` — the server rejects
+    /// anything browser-shaped.
+    ///
+    /// The token is sent on BOTH surfaces even though only the control server
+    /// checks it today (the `/__api/*` routes ride the proxy, which the SPA
+    /// itself calls same-origin and which therefore cannot demand a header no
+    /// browser would send). Sending it unconditionally costs one header and
+    /// means a future decision to authenticate a proxy route does not silently
+    /// break every CLI verb that reaches it.
+    pub fn request_on(
+        &self,
+        surface: Surface,
+        method: reqwest::Method,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
         reqwest::Client::new()
-            .request(method, format!("{}{path}", self.base))
+            .request(method, format!("{}{path}", self.base_for(surface)))
             .header(app_core::runtime_record::TOKEN_HEADER, &self.token)
+    }
+
+    /// [`Self::request_on`] against the control surface — the Task 10 shape,
+    /// kept because most control-surface callers never need to say so.
+    pub fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.request_on(Surface::Control, method, path)
     }
 }
 
@@ -67,6 +117,7 @@ pub fn attach(data_dir: &Path) -> Result<Attached> {
     }
     Ok(Attached {
         base: format!("http://127.0.0.1:{}", record.control_port),
+        proxy_base: format!("http://127.0.0.1:{}", record.proxy_port),
         token: record.token,
     })
 }
@@ -101,6 +152,37 @@ mod tests {
         let attached = attach(dir.path()).unwrap();
         assert_eq!(attached.base, "http://127.0.0.1:9063");
         assert_eq!(attached.token, "s3cret");
+    }
+
+    /// The two surfaces must come from the two DIFFERENT ports in the record.
+    /// Deriving both from one field would compile, pass every control-surface
+    /// test above, and send every `/__api/*` verb to a listener that has never
+    /// heard of those routes.
+    #[test]
+    fn the_two_surfaces_resolve_to_their_own_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        app_core::runtime_record::write_record(
+            dir.path(),
+            &app_core::runtime_record::RuntimeRecord {
+                pid: std::process::id(),
+                proxy_port: 9062,
+                control_port: 9063,
+                token: "s3cret".to_string(),
+            },
+        )
+        .unwrap();
+        let attached = attach(dir.path()).unwrap();
+        assert_eq!(attached.base_for(Surface::Control), "http://127.0.0.1:9063");
+        assert_eq!(attached.base_for(Surface::Proxy), "http://127.0.0.1:9062");
+        let built = attached
+            .request_on(Surface::Proxy, reqwest::Method::GET, "/__api/prefs")
+            .build()
+            .unwrap();
+        assert_eq!(built.url().as_str(), "http://127.0.0.1:9062/__api/prefs");
+        assert_eq!(
+            built.headers().get(app_core::runtime_record::TOKEN_HEADER).unwrap(),
+            "s3cret"
+        );
     }
 
     #[test]
