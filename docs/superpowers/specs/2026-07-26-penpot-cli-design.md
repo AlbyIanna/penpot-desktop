@@ -1,8 +1,64 @@
 # penpot-cli: library extraction, then a third front-end
 
 **Date:** 2026-07-26
-**Status:** design approved, not yet planned
+**Status:** shipped, **with four corrections** — see [What shipped differed](#what-shipped-differed) below. The
+design's argument (extract the library, not a process; the CLI is a third front-end) survived
+intact; four of its concrete claims did not, and each is corrected in place rather than quietly
+edited away.
 **Supersedes:** the PLAN2.md:272 non-goal, which deferred this to "its own future chapter". This is that chapter.
+
+## What shipped differed
+
+Four claims below are wrong, and the reasons are worth more than the corrections. Each is also
+flagged inline at the section it affects.
+
+**1. The crate map moved three modules, and reversed the last two extractions.**
+`navprobe` went to `crates/web-ui`, not `apps/desktop`; `status` and `prefs_http` went to
+`crates/app-core`, not `apps/desktop`. *Cause:* the map was derived by scanning modules for
+`use` statements, which cannot see a call site that imports nothing. `boot` calls
+`.merge(navprobe::router())` and `status::MockStatusSource::demo_frames()`; leaving either module
+in `apps/desktop` would have made a library crate depend on the binary crate. `prefs_http` was a
+real two-way cycle — `use crate::control::RunnerSlot` one way, `prefs_http::router(...)` the other
+— which an import-only analysis sees as a single edge. *Consequence:* `app-core` depends on
+`web-ui`, so **`web-ui` is extracted BEFORE `app-core`**, the reverse of the table's numbering.
+Found by the Phase-1 spike, whose whole job was to surface what the static graph could not.
+
+**2. The offline/online split is three tiers, not two.** *Cause:* "needs the backend" and "needs
+the running app" are different axes, and the two-way split conflated them. `pkg add` is a
+`git clone` that never touches Penpot, yet a CLI cannot run it with the app down, because
+`fetch_package` is a private axum handler. Tier 1 is pure offline; Tier 2 needs the running app
+but the work is disk-only; Tier 3 needs the supervised backend as well. A second thing the binary
+split had no way to express: two Tier-1 answers are real but **incomplete** (`pkg list` cannot see
+`live`; `sync status` cannot see `paused`/`lastError`/`state`/`conflict`), so they ship
+`"partial": true` plus a `missing` array naming exactly what is absent.
+
+**3. "No script changes" was too strong, and so was "no change to `just e2e`".** *Cause:* the
+claim conflated *launch commands* with *scripts*. The launch commands really were untouched —
+`bin/headless` kept its path, its `READY <url>` stdout contract and its `STOPPED` line, so not one
+gate's launch line changed. But five existing scripts needed real edits, and a sixth
+(`c2-cli.sh`) is new. `d3-menus.sh` and `d5-documents.sh` pin unit tests BY NAME per crate, so
+their `cargo test -p <package>` flag moved when the modules did — the test names themselves stayed
+byte-identical, which is what kept the edit to one flag. `n5-vaults.sh`, `d5-documents.sh` (via
+`d5_docs_helper.py`) and `e6-library-portability-spike.sh` drive the control port, which is now
+always-on and therefore token-authenticated. And `d1-offline.sh`'s port-ledger reasoning had to be
+restated, because an always-on control server binds an ephemeral port even when a gate never asks
+for one (a LISTEN socket, which its egress parser ignores — the offline claim is unchanged, the
+argument for it is not). A further eight scripts and helpers carried `apps/desktop/src/...` path
+references the extraction made stale; those are comment-only repairs. `just e2e` gained two links,
+`c1-crates.sh` and `c2-cli.sh`.
+
+**4. `export` is not implemented.** It is listed as a candidate verb and as an Online verb; it
+shipped as neither. *Cause:* `crates/board-export` registers no routes at all. It is a poller keyed
+off `.penpot-sync.json` hash movement, enabled at boot from `exports_enabled` and live-toggled
+through `VaultRunner::set_renders_enabled` — there is no "export now" surface for a CLI to call.
+Hand-assembling `PenpotClient` + `ExporterClient` in the CLI's own process is exactly the
+second-writer boundary the spike's RC-7 rules out, and wiring the verb to
+`POST /__api/prefs {"exportsEnabled":true}` would be worse than omitting it: it returns
+immediately, while a caller typing `penpot export` expects rendered files to exist. The verb needs
+a handler-free verb core in `board-export` plus a route the app serves — the RC-6 "promote verb
+cores" work this chapter deliberately avoided by routing Tier-2/3 over loopback. Recorded at the
+point of omission in `apps/cli/src/verbs/loopback.rs`'s module doc, under
+"`export` is deliberately absent".
 
 ## The question
 
@@ -37,6 +93,11 @@ end-user documentation. It may change in any later chapter. This is what makes i
 
 The existing crates (`sync-core`, `sync-daemon`, `penpot-rpc`, `supervisor`, `proxy`,
 `board-export`, `vault-index`) do not change. All the work happens inside `apps/desktop`.
+
+> **Corrected (1).** The table below is the map as designed, kept for the record. As shipped:
+> `navprobe` is in `crates/web-ui`; `status` and `prefs_http` are in `crates/app-core`; and
+> `web-ui` (6) is extracted BEFORE `app-core` (5), because `app-core` depends on it. See
+> [What shipped differed](#what-shipped-differed).
 
 | # | Crate | Modules | Lines | Depends on |
 |---|---|---|---|---|
@@ -82,9 +143,12 @@ The static analysis above already found the seams, including the cross-boundary
 surface the **runtime** couplings that imports never show — shared locks, boot ordering, live
 state held across calls.
 
-Candidate verbs, drawn from the module docs:
+Candidate verbs, drawn from the module docs. The spike ran every one of them and added more
+(`tpl list`, `prefs get|set`, `sync resume`, `boards`, `search`, `reveal`, `pkg install`,
+`reboot`, `daemon`); the shipped set is the `Command` enum in `apps/cli/src/main.rs`. Only
+`export` failed to ship — see [correction 4](#what-shipped-differed):
 
-- `export`
+- `export` — **not implemented**; `crates/board-export` serves no route to call
 - `sync status`, `sync pause`
 - `checkpoint`
 - `vault list`, `vault switch`
@@ -115,6 +179,12 @@ Verbs split by nature:
 - **Online** — `export`, `sync status|pause`, `new --from-template`, `pkg add`. These need Penpot
   running.
 
+> **Corrected (2).** This binary split is not the shape the system has. There are **three** tiers,
+> because "needs the backend" and "needs the running app" are different axes — `pkg add` is a
+> `git clone` with no RPC at all, and still cannot run with the app down. And two offline answers
+> are real but incomplete, which a two-way split cannot say: `pkg list` and `sync status` ship
+> `"partial": true` plus a `missing` array. See [What shipped differed](#what-shipped-differed).
+
 Online verbs use **attach-or-fail**: the verb finds a running instance, or exits with a message
 telling the user to start `penpot daemon`. It never boots a stack implicitly.
 
@@ -125,6 +195,12 @@ a single aggressive reconciliation at boot; two concurrent boots fall outside wh
 The attach point exists: `control.rs::serve_control` already answers `POST /open`, `GET /active`,
 and `GET /list` on a localhost port. The daemon writes a `control.json` in the data dir so the CLI
 can discover it.
+
+> **Shipped as `runtime.json`** (`app_core::runtime_record::RECORD_FILE_NAME`), carrying `pid`,
+> `proxy_port`, `control_port` and `token` — a rename plus two additions the design did not
+> anticipate. The `pid` is what lets a CLI reject a record left behind by a killed app instead of
+> dialing a dead port; the `proxy_port` is needed because the routes a CLI wants are split across
+> two listeners, and the control server serves only its own.
 
 ### Securing the control port
 
@@ -147,6 +223,13 @@ N-gates all launch `--bin headless` and wait for `READY <url>` on stdout; those 
 protecting the whole extraction, and cutting the net in the chapter it protects is backwards.
 Deleting the shim is a one-line change in a later chapter.
 
+> **Corrected (3).** The shim half held exactly: `bin/headless` kept its path, its `READY <url>`
+> contract and its `STOPPED` line, and not one gate's launch command changed. "No script changes"
+> did not: five existing scripts needed real edits — two pin unit tests by crate, three drive the
+> now-token-authenticated control port (`d5-documents.sh` is in both groups), and `d1-offline.sh`
+> had to restate its port ledger — plus eight comment-only path repairs. See
+> [What shipped differed](#what-shipped-differed).
+
 ## Verification
 
 The extraction preserves behaviour, so the existing gates are the oracle: `cargo test --workspace`,
@@ -161,6 +244,14 @@ Two new gates carry the point of the exercise:
 2. **Offline verbs run with no stack.** A smoke script exercises them against a fixture vault
    without booting Penpot. This proves the separation is real rather than nominal.
 
+Both shipped, as `scripts/c1-crates.sh` (`just c1`) and `scripts/c2-cli.sh` (`just c2`). The second
+grew past "offline verbs run with no stack", because that leg alone cannot fail for the reason that
+matters: it stays green against a CLI that has no tier split at all. So it also asserts the ports
+are still free AFTER the offline verbs run (nothing self-booted), that a Tier-2/3 verb with no
+daemon exits non-zero naming `penpot daemon` and writes nothing to stdout, that the control port
+refuses tokenless, wrong-token and browser-shaped requests, and that `runtime.json` is removed on
+clean shutdown.
+
 ## Non-goals
 
 - **No public contract.** The CLI is internal, unstable by design, and undocumented for outside
@@ -173,3 +264,8 @@ Two new gates carry the point of the exercise:
 - **No new functionality.** The CLI exposes verbs that already exist, which keeps the existing
   suites meaningful as an oracle.
 - **No harness rewrite**, and no change to `just e2e`.
+
+> **Corrected (3, second half).** The harness was not rewritten, but `just e2e` did change: it
+> gained `c1-crates.sh` and `c2-cli.sh`, on the same precedent as every other chapter that landed
+> product code. A chapter whose gates are not in the chain is a chapter the ladder cannot keep
+> honest.

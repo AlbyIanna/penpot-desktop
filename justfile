@@ -367,12 +367,24 @@ routes-gate:
 c1:
     bash scripts/c1-crates.sh
 
+# C2 CLI gate (chapter C): Tier-1 verbs run with no stack and declare what
+# they lack; a Tier-2/3 verb with no daemon fails naming `penpot daemon`
+# (never self-boots — the data dir is exclusive); with a daemon it succeeds
+# and runtime.json is well-formed; the control port refuses tokenless,
+# wrong-token AND browser-shaped requests (POST /open wipes the DB); and the
+# record is removed on clean shutdown. Dedicated ports 9062/6522/5597/6540
+# (control 9063). Chained into `just e2e`.
+c2:
+    bash scripts/c2-cli.sh
+
 # THE e2e chain (PLAN2.md N1): every milestone suite, serialized — the
 # suites are concurrency-UNSAFE against sibling stacks (m4's lsof lesson),
 # so never run them in parallel. Chains every landed gate (N1–N6, E1–E4, E7,
-# D1–D5). e1-contract is a fast static gate (no stack); e2/e3/e4/e7/d1/d2/d3/
-# d4/d5 boot their own live stacks (dedicated ports) like the m/n suites,
-# safe to chain at the tail. n2-thumbs + e4-gallery + e7-plugins +
+# C1–C2, D1–D6). e1-contract and c1-crates are fast static gates (no stack);
+# e2/e3/e4/e7/c2/d1/d2/d3/d4/d5 boot their own live stacks (dedicated ports)
+# like the m/n suites, safe to chain at the tail. c2-cli is CI-headless (its
+# daemon is `penpot daemon`, no GUI) and chained because chapter C lands
+# product code — the CLI is the app's third front-end. n2-thumbs + e4-gallery + e7-plugins +
 # d4-preferences need the runtime bundle WITH browsers (`bash scripts/fetch-
 # penpot.sh --with-browsers`) — d4 specifically for its dev-mode exporter
 # (assertion c, the renders-on/off exit criterion); d1-offline and d2-home
@@ -418,6 +430,7 @@ e2e:
     bash scripts/e4-gallery.sh
     bash scripts/e7-plugins-spike.sh
     bash scripts/c1-crates.sh
+    bash scripts/c2-cli.sh
     bash scripts/d1-offline.sh
     bash scripts/d2-home.sh
     bash scripts/d3-menus.sh
