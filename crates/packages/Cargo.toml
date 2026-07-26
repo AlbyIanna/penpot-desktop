@@ -1,0 +1,29 @@
+[package]
+name = "packages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local package home, lockfile, and offline template gallery (PLAN3 E2/E4, N6). A package is a folder or git repo under <vault>/.penpot-packages/ that the sync daemon is blind to; installing one imports through the shared installer crate and pins it in lock.json so a DB wipe re-applies it deterministically. Templates are package type 0."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+installer = { path = "../installer" }
+penpot-rpc = { path = "../penpot-rpc" }
+sync-core = { path = "../sync-core" }
+sync-daemon = { path = "../sync-daemon" }
+vault-index = { path = "../vault-index" }
+axum = "0.8"
+http = "1"
+
+[dev-dependencies]
+# Test-only in both modules that use it: all 14 `tempfile::` calls sit after the
+# module's `#[cfg(test)]` line (`packages.rs:2172`, `templates.rs:438`). It was
+# in `[dependencies]`, which shipped a test-only crate into every release build
+# and quietly falsified the convention `vault-ops/Cargo.toml` states — that one
+# names `installer` as the SOLE exception, and installer's placement really is
+# correct (its `unzip_normalize_hash` is production code).
+tempfile = "3"

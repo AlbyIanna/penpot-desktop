@@ -9,7 +9,7 @@
 //! - `GET /__api/prefs` — `{preferences, vault:{path,name}, syncPaused,
 //!   rendersRunning}`. `preferences` is the persisted store (`prefs::load`);
 //!   the other three fields are LIVE facts read off the running stack (via
-//!   the late-bound [`control::RunnerSlot`]), independent of what the store
+//!   the late-bound [`crate::control::RunnerSlot`]), independent of what the store
 //!   says — e.g. `syncEnabled: false` in the store but the daemon not yet
 //!   re-applied (a narrow race at boot) would still show correctly here.
 //! - `POST /__api/prefs` `{...preferences}` — the FULL preferences object
@@ -20,13 +20,13 @@
 //!   from [`prefs::needs_reboot`]; nothing here re-derives which settings
 //!   are boot-time, exactly per that function's own doc.
 //! - `POST /__api/prefs/reboot` — kicks off
-//!   [`control::VaultRunner::reboot_in_place`], then `{ok}`. The page calls
+//!   [`crate::control::VaultRunner::reboot_in_place`], then `{ok}`. The page calls
 //!   this ONLY from an explicit "Apply & Restart" the user clicks — this
 //!   route itself never decides to reboot on its own; `POST /__api/prefs`
 //!   never calls it either. Silently rebooting the supervised stack under an
 //!   open workspace window is exactly what the D4 plan forbids.
 //! - `POST /__api/prefs/vault` `{path}` — kicks off
-//!   [`control::VaultRunner::switch_to`] VERBATIM, the N5
+//!   [`crate::control::VaultRunner::switch_to`] VERBATIM, the N5
 //!   zero-cross-vault-spill machinery. This route does not, and must not,
 //!   reimplement any part of that switch — see that method's module doc for
 //!   why.
@@ -46,7 +46,7 @@
 //! the failure `vault-switch.json`'s crash marker exists to recover from.
 //! Because the caller can no longer receive a pass/fail verdict in the HTTP
 //! response, the detached task's outcome is logged loudly AND recorded via
-//! `crate::last_op` — a small JSON file (`last-op.json`) in the app DATA dir,
+//! `app_state::last_op` — a small JSON file (`last-op.json`) in the app DATA dir,
 //! NOT an in-memory field on `PrefsState`. It has to be a file: a successful
 //! switch/reboot tears down the very router this state lives on and `boot()`
 //! constructs a fresh `PrefsState` for the new one, so anything kept only in
@@ -76,8 +76,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::control::RunnerSlot;
-use crate::last_op;
-use crate::prefs::{self, Preferences};
+use app_state::last_op;
+use app_state::prefs::{self, Preferences};
 
 const PREFERENCES_PAGE_HTML: &str = include_str!("preferences.html");
 
@@ -90,7 +90,7 @@ struct PrefsState {
     runner: RunnerSlot,
 }
 
-/// Record a detached switch/reboot's outcome to `crate::last_op`'s on-disk
+/// Record a detached switch/reboot's outcome to `app_state::last_op`'s on-disk
 /// store (`<data_dir>/last-op.json`) where `GET /__api/prefs` — served by
 /// whichever `PrefsState` happens to be current, old or new — can find it,
 /// and log it loudly. This is the ONLY place a caller can still learn whether
@@ -187,7 +187,7 @@ async fn get_prefs(State(state): State<Arc<PrefsState>>) -> Response {
         "syncPaused": sync_paused,
         "rendersRunning": renders_running,
         // D4 — outcome of the most recently finished detached switch/reboot
-        // (see module doc + `crate::last_op`). This is how a caller of the
+        // (see module doc + `app_state::last_op`). This is how a caller of the
         // ack-then-detach `/reboot` and `/vault` routes below finds out
         // whether the thing it kicked off actually succeeded, INCLUDING when
         // it succeeded — the on-disk record survives the stack it reports on
@@ -242,7 +242,7 @@ async fn post_reboot(State(state): State<Arc<PrefsState>>) -> Response {
     // ACK first, act second (see module doc) — `reboot_in_place` tears down
     // the proxy answering this very request, so a synchronous response can
     // never arrive. Detach into a task that outlives the request; its
-    // outcome lands in `crate::last_op`'s on-disk record for `GET
+    // outcome lands in `app_state::last_op`'s on-disk record for `GET
     // /__api/prefs` to report, since it can no longer ride this response.
     let state_for_task = state.clone();
     tokio::spawn(async move {
@@ -284,7 +284,7 @@ async fn post_vault(State(state): State<Arc<PrefsState>>, Json(req): Json<VaultS
     // connection must NOT cancel the switch partway through — that is
     // exactly the interrupted-switch case the crash marker inside
     // `switch_to` exists to recover from), and record the outcome via
-    // `crate::last_op` since it can no longer ride this response back.
+    // `app_state::last_op` since it can no longer ride this response back.
     //
     // N5 — still delegates to `VaultRunner::switch_to` VERBATIM inside the
     // task. This route must never reimplement any part of the

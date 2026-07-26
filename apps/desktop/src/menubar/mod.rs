@@ -44,10 +44,10 @@ use penpot_rpc::{Auth, PenpotClient};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, DragDropEvent, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
-use crate::docopen;
+use app_state::recent::{self, RecentEntry};
+use vault_ops::docopen;
 use crate::navwatch::{self, Decision, NavWatch};
-use crate::recent::{self, RecentEntry};
-use crate::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
+use app_core::windows::{self, OpenWindow, Reuse, WindowRegistry, HOME_LABEL};
 use model::{build_menu_model, command_for_id, Command, Entry, MenuModel, Predefined, RECENT_PREFIX};
 
 /// Late-bound facts about the active vault/stack: unknown before boot
@@ -851,7 +851,7 @@ fn apply_title_updates<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx, updates: V
 /// own.
 ///
 /// Survives an N5 vault switch without resubscribing: `status_rx` is bound
-/// to [`crate::status::DaemonStatusBridge`]'s own channel, which a switch's
+/// to [`app_core::status::DaemonStatusBridge`]'s own channel, which a switch's
 /// `attach` call re-points at the new daemon (see that module's doc) — so
 /// this loop keeps working against whichever vault is active, reading
 /// `ctx.live`/`ctx.registry` (both `Arc`-shared) fresh on every iteration.
@@ -1030,7 +1030,7 @@ async fn create_new_file<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) {
         tracing::info!("New File requested before boot completed; ignoring");
         return;
     };
-    let project_id = match crate::installer::default_project_id(&client, &live.team_id).await {
+    let project_id = match installer::default_project_id(&client, &live.team_id).await {
         Ok(id) => id,
         Err(e) => {
             crate::dialog::native_error_dialog("Penpot Local — New File failed", &format!("{e:#}"));
@@ -1040,7 +1040,7 @@ async fn create_new_file<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx) {
     let name = "New File".to_string();
     match client.create_file(&project_id, &name).await {
         Ok(f) => {
-            let page_id = crate::installer::first_page_id(&client, &f.id).await;
+            let page_id = installer::first_page_id(&client, &f.id).await;
             if let Err(e) = open_file_window(app, ctx, &f.id, page_id.as_deref(), &name) {
                 tracing::error!("open_file_window failed: {e}");
             }
@@ -1205,7 +1205,7 @@ async fn import_binfile_from_path<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx,
         tracing::info!(path = %path.display(), "binfile import: vault facts not ready; ignoring");
         return;
     };
-    let project_id = match crate::installer::default_project_id(&client, &live.team_id).await {
+    let project_id = match installer::default_project_id(&client, &live.team_id).await {
         Ok(id) => id,
         Err(e) => {
             crate::dialog::native_error_dialog("Penpot Local — Import failed", &format!("{e:#}"));
@@ -1228,9 +1228,9 @@ async fn import_binfile_from_path<R: Runtime>(app: &AppHandle<R>, ctx: &MenuCtx,
             return;
         }
     };
-    match crate::installer::import_binfile_and_settle(&client, &project_id, &name, bytes, None).await {
+    match installer::import_binfile_and_settle(&client, &project_id, &name, bytes, None).await {
         Ok((file_id, _settle_cycles)) => {
-            let page_id = crate::installer::first_page_id(&client, &file_id).await;
+            let page_id = installer::first_page_id(&client, &file_id).await;
             if let Err(e) = open_file_window(app, ctx, &file_id, page_id.as_deref(), &name) {
                 tracing::error!("open_file_window failed: {e}");
             }
@@ -1280,7 +1280,7 @@ fn reveal_key_file(ctx: &MenuCtx) {
         );
         return;
     };
-    crate::reveal::reveal(&live.vault_root.join(&entry.path));
+    vault_ops::reveal::reveal(&live.vault_root.join(&entry.path));
 }
 
 /// Exhaustive match over every `Command` variant, deliberately WITHOUT a

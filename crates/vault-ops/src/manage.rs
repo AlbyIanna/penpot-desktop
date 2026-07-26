@@ -328,7 +328,7 @@ async fn duplicate_file(State(st): State<Arc<ManageState>>, Json(req): Json<Dupl
     // Our own export_binfile always produces binfile-v3 on 2.16.2 (see
     // penpot-rpc's doc comment), so the version-less import path applies —
     // same as templates.rs's TemplateFormat::V3Zip.
-    match crate::installer::import_binfile_and_settle(&client, &project_id, &name, bytes, None).await {
+    match installer::import_binfile_and_settle(&client, &project_id, &name, bytes, None).await {
         Ok((new_id, _)) => Json(json!({ "fileId": new_id, "name": name })).into_response(),
         Err(e) => upstream_error(format!("import failed: {e}")),
     }

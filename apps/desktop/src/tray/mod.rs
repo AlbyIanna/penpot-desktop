@@ -23,7 +23,7 @@ use tauri::{AppHandle, Runtime};
 use tokio::sync::watch;
 
 use crate::overlay::{self, ProxyUrlSlot};
-use crate::status::{ExportStatusSnapshot, SyncControl, SyncStatusSnapshot};
+use app_core::status::{ExportStatusSnapshot, SyncControl, SyncStatusSnapshot};
 use model::{
     build_menu_model, icon_pixels, AggregateState, MenuEntry, MenuModel, CHECKPOINT_ID,
     FILE_ROW_PREFIX, GIT_INIT_ID, ICON_SIZE, OPEN_DESIGNS_ID, OPEN_VAULT_ID, PAUSE_TOGGLE_ID,
@@ -34,7 +34,7 @@ const TRAY_ID: &str = "penpot-sync-status";
 
 /// N5: callback the "Open Vault…" tray entry fires (the GUI's `File > Open
 /// Vault`). It picks a folder and drives the vault switch through the
-/// [`crate::control::VaultRunner`]; `None` in demo mode / before boot.
+/// [`app_core::control::VaultRunner`]; `None` in demo mode / before boot.
 pub type OpenVaultCb = Arc<dyn Fn() + Send + Sync>;
 
 fn icon(state: AggregateState) -> Image<'static> {
@@ -105,8 +105,8 @@ fn build_tauri_menu<R: Runtime>(
 /// Create the tray icon and keep it in sync with the status watch channel.
 ///
 /// `rx`/`control` are the M3 daemon status contract
-/// (see [`crate::status`]) — today they come from
-/// [`crate::status::MockStatusSource`], at integration time from the real
+/// (see [`app_core::status`]) — today they come from
+/// [`app_core::status::MockStatusSource`], at integration time from the real
 /// sync daemon; this function is agnostic.
 ///
 /// Quit goes through `app.exit(0)`, i.e. the existing `RunEvent::Exit`
@@ -118,7 +118,7 @@ fn build_tauri_menu<R: Runtime>(
 /// menu then keeps its pre-M5 shape.
 ///
 /// `exports_rx` (M5): the board-export service's status stream (via
-/// [`crate::status::ExportStatusBridge`]); `Some` only when
+/// [`app_core::status::ExportStatusBridge`]); `Some` only when
 /// `PENPOT_LOCAL_EXPORTS=1` — it adds the "Exports: …" info row.
 pub fn spawn_tray<R: Runtime>(
     app: &AppHandle<R>,
@@ -166,7 +166,7 @@ pub fn spawn_tray<R: Runtime>(
             OPEN_DESIGNS_ID => {
                 if let Some(designs) = &designs_dir {
                     tracing::info!(dir = %designs.display(), "tray: open designs folder");
-                    crate::reveal::open_folder(designs);
+                    vault_ops::reveal::open_folder(designs);
                 }
             }
             QUICK_OPEN_ID => {
@@ -183,8 +183,8 @@ pub fn spawn_tray<R: Runtime>(
                 if let Some(designs) = designs_for_checkpoint.clone() {
                     tracing::info!(dir = %designs.display(), "tray: checkpoint now");
                     tauri::async_runtime::spawn_blocking(move || {
-                        let label = crate::checkpoint::default_label();
-                        match crate::checkpoint::checkpoint(&designs, &label) {
+                        let label = vault_ops::checkpoint::default_label();
+                        match vault_ops::checkpoint::checkpoint(&designs, &label) {
                             Ok(out) => {
                                 tracing::info!("checkpoint: {}", out.message);
                                 crate::dialog::native_info_dialog(
@@ -208,7 +208,7 @@ pub fn spawn_tray<R: Runtime>(
                     tracing::info!(dir = %designs.display(), "tray: enable git versioning");
                     // git is fast but external: keep it off the UI thread.
                     tauri::async_runtime::spawn_blocking(move || {
-                        match crate::gitinit::run_git_init(&designs) {
+                        match vault_ops::gitinit::run_git_init(&designs) {
                             Ok(out) => {
                                 tracing::info!("git init helper:\n{}", out.trim_end());
                                 crate::dialog::native_info_dialog(
@@ -233,7 +233,7 @@ pub fn spawn_tray<R: Runtime>(
                 {
                     let path = designs.join(key);
                     tracing::info!(path = %path.display(), "tray: reveal file in file manager");
-                    crate::reveal::reveal(&path);
+                    vault_ops::reveal::reveal(&path);
                 }
             }
         })

@@ -518,19 +518,32 @@ fn main() {
                         // `GET /windows` (the D5 gate's only way to observe
                         // that a document actually opened, per
                         // `control.rs`'s module doc) was unreachable in the
-                        // real windowed app. Same env-guarded, localhost-only
-                        // call `headless.rs` makes; `window_registry_boot` is
-                        // the LIVE registry (see its binding above), so
+                        // real windowed app. Same localhost-only call
+                        // `headless.rs` makes; `window_registry_boot` is the
+                        // LIVE registry (see its binding above), so
                         // `/windows` reflects the home window and every real
-                        // file window here, not an empty stand-in. Test-only:
-                        // a normal launch (no `PENPOT_LOCAL_CONTROL_PORT`)
-                        // binds nothing new, byte-identical to before.
-                        if let Some(port) = control::control_port_from_env() {
+                        // file window here, not an empty stand-in.
+                        //
+                        // Chapter C: no longer env-guarded — a normal launch
+                        // now serves the control port too, because that is how
+                        // the `penpot` CLI attaches to the running GUI app.
+                        // `PENPOT_LOCAL_CONTROL_PORT` only pins the port for
+                        // the gates; unset ⇒ 0 ⇒ the OS picks one, and
+                        // `serve_control` publishes the BOUND port plus this
+                        // per-boot token into `runtime.json` under the
+                        // runner's OWN data dir — the same dir `RunEvent::Exit`
+                        // retracts it from. Nothing reachable without that
+                        // token, and anything browser-shaped is refused
+                        // outright — see `app_core::runtime_record`.
+                        {
+                            let port = control::control_port_from_env().unwrap_or(0);
                             let runner_ctl = runner.clone();
                             let windows_ctl = window_registry_boot.clone();
+                            let token = penpot_desktop::runtime_record::new_token();
                             tauri::async_runtime::spawn(async move {
                                 if let Err(e) =
-                                    control::serve_control(runner_ctl, windows_ctl, port).await
+                                    control::serve_control(runner_ctl, windows_ctl, port, token)
+                                        .await
                                 {
                                     tracing::error!("vault control server exited: {e:#}");
                                 }
@@ -602,6 +615,12 @@ fn main() {
             let running = running.clone();
             tauri::async_runtime::block_on(async move {
                 if let Some(runner) = running.lock().await.take() {
+                    // Chapter C: retract the discovery record BEFORE the stack
+                    // goes down, so a CLI never attaches to a control port
+                    // that is already on its way out. Idempotent and never
+                    // fatal (see `remove_record`); if boot never completed
+                    // there is no runner and nothing was published either.
+                    penpot_desktop::runtime_record::remove_record(runner.data_dir());
                     runner.shutdown().await;
                 }
             });

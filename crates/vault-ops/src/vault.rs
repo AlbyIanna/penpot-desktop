@@ -1,7 +1,7 @@
 //! N5 — Vaults, plural. The persistent bookkeeping around a switchable design
 //! vault, plus the pure decision logic the switch state machine and its
 //! crash-recovery path key off. The runtime orchestration (teardown → wipe →
-//! reconcile) lives in [`crate::control`]; everything here is data + pure
+//! reconcile) lives in `app-core`'s `control`; everything here is data + pure
 //! functions so the recovery decision table is unit-testable without a stack.
 //!
 //! Three files carry the state:
@@ -353,16 +353,22 @@ pub fn decide_startup(
 /// success), so recovery can call it unconditionally.
 ///
 /// `<data>/assets` is Penpot's `fs` objects-storage backend
-/// (`PENPOT_OBJECTS_STORAGE_FS_DIRECTORY`, wired in [`crate::AppConfig::storage_dir`]),
-/// holding every uploaded media blob. Wiping it is safe because a reconcile
-/// re-materializes each referenced blob from the `.penpot` on disk: the switch
-/// re-imports every file under its original id via `import-binfile`, and with
-/// the DB cluster gone there is no dedup row to suppress the write, so the fs
-/// backend re-writes the blob and `GET /assets/by-file-media-id/<id>` serves
-/// the exact bytes again (verified empirically for N5, see
-/// `docs/milestones/n5.md`). Not wiping it would leave the previous vault's
-/// blobs orphaned in the shared cache — never surfaced (their DB rows are gone)
-/// but an unbounded-growth / local-first-hygiene leak across vaults.
+/// (`PENPOT_OBJECTS_STORAGE_FS_DIRECTORY`, wired in `app-core`'s
+/// `AppConfig::storage_dir`), holding every uploaded media blob. Wiping it
+/// is safe because a reconcile re-materializes each referenced blob from the
+/// `.penpot` on disk: the switch re-imports every file under its original id
+/// via `import-binfile`, and with the DB cluster gone there is no dedup row
+/// to suppress the write, so the fs backend re-writes the blob and
+/// `GET /assets/by-file-media-id/<id>` serves the exact bytes again (verified
+/// empirically for N5, see `docs/milestones/n5.md`). Not wiping it would
+/// leave the previous vault's blobs orphaned in the shared cache — never
+/// surfaced (their DB rows are gone) but an unbounded-growth /
+/// local-first-hygiene leak across vaults.
+// `AppConfig::storage_dir` above is deliberately plain text, not an
+// intra-doc link: resolving one would need a normal `vault-ops` →
+// `app-core` dependency, the cycle chapter C exists to prevent, and a
+// dev-dependency does not put `app_core` in the lib target's extern
+// prelude so it cannot resolve either.
 pub fn reset_disposable_state(data_dir: &Path) -> Result<()> {
     let pg_cluster = data_dir.join("postgres").join("data");
     if pg_cluster.exists() {

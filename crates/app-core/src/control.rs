@@ -7,7 +7,7 @@
 //! 2. stop the current stack cleanly ([`RunningApp::shutdown`] — sync daemon,
 //!    index, proxy, supervised postgres/valkey/JVM all go down);
 //! 3. wipe the disposable Penpot DB cluster + the vault index
-//!    ([`crate::vault::reset_disposable_state`]) — zero residue of the old
+//!    ([`vault_ops::vault::reset_disposable_state`]) — zero residue of the old
 //!    vault before the new one reconciles (invariant 2, P0);
 //! 4. point the registry's active vault at the new root;
 //! 5. [`boot`] the target: re-provision the single user, reconcile from the
@@ -21,10 +21,17 @@
 //! precedes the reconcile (step 5), forward-completion is safe from any
 //! interruption point: the previous vault's DB state is gone first.
 //!
-//! [`serve_control`] exposes this over a localhost-only HTTP port
-//! (`PENPOT_LOCAL_CONTROL_PORT`) so the N5 gate can drive switches WITHOUT the
-//! GUI dialog. It is a test/automation affordance: the GUI's File > Open Vault
-//! calls [`VaultRunner::switch_to`] directly, no HTTP involved.
+//! [`serve_control`] exposes this over a localhost-only HTTP port so the N5
+//! gate can drive switches WITHOUT the GUI dialog. The GUI's File > Open Vault
+//! still calls [`VaultRunner::switch_to`] directly, no HTTP involved.
+//!
+//! Chapter C promotes that port from a test/automation affordance to the
+//! CLI's attach point, so it is now served on EVERY boot —
+//! `PENPOT_LOCAL_CONTROL_PORT` only pins the port (the gates need a known
+//! one); unset means "let the OS choose". Always-on means every route is
+//! token-authenticated and refuses browser-shaped requests: see
+//! [`crate::runtime_record`] for the threat model and
+//! `<data_dir>/runtime.json` for how a CLI finds the port and the token.
 //!
 //! D4 adds [`VaultRunner::reboot_in_place`] — the same stop→boot dance
 //! ([`VaultRunner::stop_then_boot`], factored out so the two operations never
@@ -52,7 +59,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::vault::{self, SwitchMarker, VaultRef, VaultRegistry};
+use vault_ops::vault::{self, SwitchMarker, VaultRef, VaultRegistry};
 use crate::windows::{OpenWindow, WindowRegistry};
 use crate::{boot, AppConfig, RunningApp};
 
@@ -75,8 +82,10 @@ use crate::{boot, AppConfig, RunningApp};
 /// late-bound slots do — a "still starting" response, never a panic.
 pub type RunnerSlot = Arc<AsyncMutex<Option<Arc<VaultRunner>>>>;
 
-/// Env var: the localhost control port. Unset ⇒ no control server (every
-/// pre-N5 flow is byte-identical; nothing new binds).
+/// Env var: pin the localhost control port. Unset ⇒ the OS picks a free port
+/// (chapter C: the control server itself is unconditional; the port published
+/// in `runtime.json` is the one actually bound). The gates set this because
+/// they need to know the port before the app is up.
 pub const CONTROL_PORT_ENV: &str = "PENPOT_LOCAL_CONTROL_PORT";
 /// Env var (test-only): sleep this many ms mid-switch, right after the DB is
 /// wiped and before the target boots, to widen the SIGKILL window
@@ -154,6 +163,24 @@ pub struct VaultRunner {
     active: Mutex<VaultRef>,
     /// Serializes switches (only one teardown/reboot at a time).
     switch_lock: AsyncMutex<()>,
+    /// Serializes TEARDOWNS specifically — see [`VaultRunner::shutdown`], which
+    /// carries the full argument for why this lock exists and what keeps it out
+    /// of the proxy-drain cycle.
+    ///
+    /// Deliberately not `switch_lock`: `stop_then_boot` already runs under
+    /// that one and calls `shutdown()`, so reusing it would self-deadlock.
+    /// Deliberately not `app` either: holding `app` across a teardown is the
+    /// deadlock this whole arrangement exists to avoid.
+    ///
+    /// **Request handlers DO reach this lock.** `POST /open` → `control_open`
+    /// → [`switch_to`](Self::switch_to) → [`stop_then_boot`](Self::stop_then_boot)
+    /// → [`shutdown`](Self::shutdown) is a handler-to-`teardown_lock` path, and
+    /// so are `POST /__api/prefs/reboot` and `POST /__api/prefs/vault`. What
+    /// keeps that out of the cycle is NOT "no handler touches it" — it is the
+    /// two structural facts spelled out (with what breaks them) in
+    /// [`shutdown`](Self::shutdown)'s "Why a handler blocking on this is still
+    /// safe" section. Read that before editing either.
+    teardown_lock: AsyncMutex<()>,
     /// D4 — the same late-bound slot this runner was constructed with (see
     /// [`RunnerSlot`]'s doc). Every reboot/switch re-passes it into `boot()`
     /// unchanged, so the Preferences routes built by a later boot keep
@@ -175,6 +202,7 @@ impl VaultRunner {
             data_dir,
             active: Mutex::new(active),
             switch_lock: AsyncMutex::new(()),
+            teardown_lock: AsyncMutex::new(()),
             runner_slot,
         })
     }
@@ -182,6 +210,20 @@ impl VaultRunner {
     /// The proxy origin (stable across switches — same proxy port).
     pub fn proxy_url(&self) -> String {
         self.base_config.public_uri()
+    }
+
+    /// The proxy port (chapter C: published in `runtime.json` so a CLI can
+    /// reach the proxy, not just the control port).
+    pub fn proxy_port(&self) -> u16 {
+        self.base_config.proxy_port
+    }
+
+    /// The app data dir this runner owns — where `runtime.json`, the registry
+    /// and the markers live. Exposed because both binaries hand `config` to
+    /// [`boot_active_vault`] and then still need the dir for the runtime
+    /// record (publish at [`serve_control`], remove at shutdown).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// The currently-open vault.
@@ -252,8 +294,111 @@ impl VaultRunner {
     }
 
     /// Stop the current stack (process-exit path). Idempotent.
+    ///
+    /// The `take()` and the `await` are deliberately two statements, so the
+    /// mutex guard is dropped BEFORE the teardown is awaited. Written as one
+    /// `if let`, the guard's temporary lives to the end of the statement — and
+    /// that deadlocks the app:
+    ///
+    /// - [`RunningApp::shutdown`] ends in `proxy_task.await`, and the proxy is
+    ///   served with `axum::serve(..).with_graceful_shutdown(..)`, which waits
+    ///   for in-flight requests to finish;
+    /// - the in-flight request can be `GET`/`POST /__api/prefs`, whose handlers
+    ///   call [`sync_control`](Self::sync_control) /
+    ///   [`export_status`](Self::export_status) /
+    ///   [`set_renders_enabled`](Self::set_renders_enabled) — all of which take
+    ///   this same `app` lock;
+    /// - so the proxy waits for the handler, the handler waits for the lock,
+    ///   and the lock is held by the code waiting for the proxy. Nothing times
+    ///   out. Only SIGKILL recovers, because SIGTERM's path lands here too.
+    ///
+    /// Dropping the guard first lets that handler observe the `None` this
+    /// field's doc already promises ("only briefly, mid-switch") and answer
+    /// immediately, so the proxy drains and the teardown proceeds.
+    ///
+    /// # What dropping the guard changed, and why `teardown_lock` is here
+    ///
+    /// Dropping it is not free, and the earlier claim that behaviour was
+    /// "otherwise unchanged" was wrong. The held guard did two jobs: it
+    /// protected the slot, and — accidentally — it **serialized teardowns**,
+    /// because a second caller blocked on it until the first had finished.
+    /// Releasing it early keeps the first job and drops the second, so a
+    /// concurrent caller would get `None` back *immediately* rather than
+    /// waiting.
+    ///
+    /// That is reachable and it is not benign. The process-exit paths
+    /// (`apps/desktop/src/main.rs`'s `RunEvent::Exit`, `penpot daemon`'s
+    /// signal handler) take the app and await its teardown. A detached
+    /// `reboot_in_place`/`switch_to` task racing them would enter
+    /// [`stop_then_boot`](Self::stop_then_boot), get `None` instantly, and go
+    /// straight on to [`vault::reset_disposable_state`] and a fresh `boot()`
+    /// **while the old postgres and backend were still running** — wiping
+    /// state under a live stack and then binding ports it had not released.
+    /// ⌘Q or SIGTERM during a Preferences-initiated vault switch is enough.
+    ///
+    /// So the serialization is restored deliberately, with a lock of its own
+    /// rather than by re-holding `app`: `teardown_lock` is held across the
+    /// teardown, `app` is not. `stop_then_boot` can still call this while
+    /// holding `switch_lock` (taking `switch_lock` here instead would
+    /// self-deadlock — it already holds it).
+    ///
+    /// # Why a handler blocking on this is still safe
+    ///
+    /// An earlier revision of this doc claimed `teardown_lock` is "touched by
+    /// exactly one function, and by NO request handler". **That is false**, and
+    /// the false version is the dangerous one, because the next editor greps
+    /// `teardown_lock`, finds the single acquisition site below, and believes
+    /// it. `POST /open` → `control_open` → [`switch_to`](Self::switch_to) →
+    /// `stop_then_boot` → here is a request handler reaching this lock, and so
+    /// are `prefs_http`'s `POST /__api/prefs/reboot` and
+    /// `POST /__api/prefs/vault`. (The finding that opened the previous fix
+    /// round on this very function was also a doc comment asserting something
+    /// untrue. Twice is a pattern; hence the naming of breakers below.)
+    ///
+    /// The arrangement is safe anyway, for two reasons the old claim hid. Both
+    /// are load-bearing, and each is ONE edit from putting this lock back inside
+    /// the drain cycle:
+    ///
+    /// 1. **The control server is not drained.** [`serve_control`] is a bare
+    ///    `axum::serve(listener, router).await` — no `.with_graceful_shutdown`
+    ///    — and both binaries run it detached, dropping the `JoinHandle`
+    ///    (`tokio::spawn` in `penpot daemon`, `tauri::async_runtime::spawn` in
+    ///    the GUI), so nothing ever awaits it. `RunningApp::shutdown` drains the
+    ///    PROXY only. A control handler parked on `teardown_lock` therefore
+    ///    cannot stall the teardown that holds it.
+    ///    *Breaks if:* `serve_control` gains `.with_graceful_shutdown`, or a
+    ///    process-exit path starts awaiting that task's handle. Either turns
+    ///    every control route into a drain participant, `/open` included.
+    ///
+    /// 2. **The two proxy routes that reach here answer before they touch the
+    ///    runner.** `prefs_http`'s `post_reboot` and `post_vault` `tokio::spawn`
+    ///    the `reboot_in_place`/`switch_to` call and return `202` immediately
+    ///    (ack-first — see that module's doc), so no in-flight proxy request is
+    ///    ever waiting on this lock while the drain runs.
+    ///    *Breaks if:* either route is made synchronous — awaiting the runner
+    ///    inline to return a real result instead of an ack. Then the proxy drain
+    ///    waits for that handler, the handler waits for `teardown_lock`, and
+    ///    `teardown_lock` is held by the code awaiting the drain. That is the
+    ///    pre-fix deadlock exactly, rebuilt through this lock.
+    ///
+    /// Net effect: exactly the pre-fix ordering, without the pre-fix deadlock —
+    /// as long as those two hold.
+    ///
+    /// # What this deliberately does NOT do
+    ///
+    /// It does not make a `None` return mean "someone else is tearing down, so
+    /// give up". `None` has a second, legitimate meaning: `stop_then_boot`
+    /// leaves the slot empty when a `boot()` fails, and the documented
+    /// recovery is for the user to switch again. Refusing to proceed on `None`
+    /// would silently turn that retry into a no-op. Nor does it stop a switch
+    /// from booting a new stack after the process has decided to exit — that
+    /// was equally true before, and closing it needs the slot to carry an
+    /// explicit "terminal" state, which is a larger change than this one.
     pub async fn shutdown(&self) {
-        if let Some(app) = self.app.lock().await.take() {
+        // Serialize teardowns (see above). Held across the await; `app` is not.
+        let _teardown = self.teardown_lock.lock().await;
+        let app = self.app.lock().await.take();
+        if let Some(app) = app {
             app.shutdown().await;
         }
     }
@@ -363,7 +508,7 @@ impl VaultRunner {
 
     /// D4 — reboot the supervised stack in place: stop it, then boot it
     /// again against the SAME vault, so a freshly re-read `Preferences`
-    /// (`crate::prefs`) takes effect for the settings that are only read at
+    /// (`app_state::prefs`) takes effect for the settings that are only read at
     /// boot (plugins/CSP baked into `config.js` at script load; the
     /// supervisor cannot hot-add the exporter child — see module docs).
     ///
@@ -569,8 +714,28 @@ pub fn control_router(runner: Arc<VaultRunner>, windows: WindowRegistry) -> Rout
 }
 
 /// Serve the control routes on `127.0.0.1:<port>` until the process exits.
-/// Localhost-only by construction. Spawn this only when
-/// [`CONTROL_PORT_ENV`] is set (the N5 gate sets it).
+/// Localhost-only by construction, and — since chapter C — **always** served:
+/// the CLI is a first-class front-end, so `/open`, `/active`, `/list` and
+/// `/windows` must exist in a normal install, not only under
+/// [`CONTROL_PORT_ENV`]. Pass `0` to let the OS choose a free port.
+///
+/// Always-on is what makes the auth mandatory rather than decorative: every
+/// route is behind [`crate::runtime_record::require_token`], which demands the
+/// per-boot `token` and refuses anything browser-shaped outright (a web page
+/// CAN send a cross-origin `POST /open`, which wipes the disposable DB — see
+/// that module's doc for the full threat model).
+///
+/// The bound port — not the requested one, so port `0` works — is published
+/// with the pid, the proxy port and the token into `runtime.json` (mode 0600)
+/// for the CLI to discover. The record is removed on the shutdown path of
+/// whichever binary owns this task.
+///
+/// The data dir and the proxy port are read off `runner`, never passed in:
+/// shutdown retracts the record through [`VaultRunner::data_dir`], so if
+/// publish could take a different path the two could silently disagree — the
+/// record landing where the CLI does not look, and shutdown deleting a path
+/// that was never written, leaving a stale record pointing at a dead port.
+/// One source for the path makes that divergence impossible by construction.
 ///
 /// `windows` is the live [`WindowRegistry`] backing `GET /windows` (D5 Task
 /// 2). The headless runner (no Tauri, no windows ever open) passes an empty
@@ -578,20 +743,39 @@ pub fn control_router(runner: Arc<VaultRunner>, windows: WindowRegistry) -> Rout
 /// `{"windows":[]}`, which is honest: nothing IS open. The GUI shell passes
 /// the SAME registry the menu bar / window-per-file machinery populates, so
 /// `/windows` reflects reality there.
-pub async fn serve_control(runner: Arc<VaultRunner>, windows: WindowRegistry, port: u16) -> Result<()> {
+pub async fn serve_control(
+    runner: Arc<VaultRunner>,
+    windows: WindowRegistry,
+    port: u16,
+    token: String,
+) -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("control server cannot bind {addr}"))?;
-    tracing::info!(%addr, "vault control server listening (test/automation)");
-    axum::serve(listener, control_router(runner, windows))
-        .await
-        .context("control server error")?;
+    let bound = listener.local_addr()?.port();
+    crate::runtime_record::write_record(
+        runner.data_dir(),
+        &crate::runtime_record::RuntimeRecord {
+            pid: std::process::id(),
+            proxy_port: runner.proxy_port(),
+            control_port: bound,
+            token: token.clone(),
+        },
+    )?;
+    tracing::info!(port = bound, "vault control server listening (token-authenticated)");
+    let router = control_router(runner, windows).layer(axum::middleware::from_fn_with_state(
+        token,
+        crate::runtime_record::require_token,
+    ));
+    axum::serve(listener, router).await.context("control server error")?;
     Ok(())
 }
 
-/// Read + parse [`CONTROL_PORT_ENV`]; `None` (or an invalid value) disables the
-/// control server.
+/// Read + parse [`CONTROL_PORT_ENV`]; `None` (or an invalid value) means "no
+/// pinned port" — the caller passes `0` and the OS picks one. Since chapter C
+/// this is an override for the gates that pin a port, no longer the on/off
+/// switch for the control server itself.
 pub fn control_port_from_env() -> Option<u16> {
     std::env::var(CONTROL_PORT_ENV).ok().and_then(|v| v.trim().parse().ok())
 }

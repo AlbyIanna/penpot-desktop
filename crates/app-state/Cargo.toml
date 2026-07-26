@@ -1,0 +1,20 @@
+[package]
+name = "app-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local per-machine app state: the preferences store (D4), the Open Recent list (D3), and the last-finished-operation record (D4). All three are small JSON files in the app data dir, never in the vault — they describe this machine's session, not the user's designs."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+# last_op.rs stamps its record with an RFC3339-ish UTC timestamp; not in the
+# task brief's Cargo.toml snippet — added because `cargo build` fails
+# without it (last_op.rs's `chrono::Utc::now()` call moved verbatim from
+# apps/desktop, which already depends on chrono with this exact spec).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+tempfile = "3"

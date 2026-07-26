@@ -1,0 +1,27 @@
+[package]
+name = "vault-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local verbs over a vault: the switchable-vault registry and its crash-recovery decision logic (N5), the git-native checkpoint verb (N4b), the git-versioning helper (M5), the front-door create/rename/duplicate/move/delete mutations (D2), document-open path resolution (D5), and reveal-in-file-manager command construction (M5). Pure data plus decisions; the runtime orchestration that consumes them lives in app-core."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+installer = { path = "../installer" }
+penpot-rpc = { path = "../penpot-rpc" }
+sync-core = { path = "../sync-core" }
+sync-daemon = { path = "../sync-daemon" }
+axum = "0.8"
+http = "1"
+rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+# Test-only in all five modules that use it (each first `tempfile::` sits after
+# the module's `#[cfg(test)]` line), so it belongs here — the convention every
+# sibling crate follows except `installer`, whose usage IS production code.
+tempfile = "3"

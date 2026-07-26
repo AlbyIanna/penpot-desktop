@@ -1,0 +1,33 @@
+[package]
+name = "app-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local boot sequence and live-stack ownership (M1, N5, D4): resolve config -> pin PENPOT_SECRET_KEY -> supervise postgres/valkey/backend -> provision the single user -> serve the proxy, plus the VaultRunner that owns the running stack across vault switches and reboots-in-place, the Preferences control surface, the sync/export status bridges, the packaged runtime layout resolver, the non-BMP boot pre-flight, and the Tauri-free window registry."
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+app-state = { path = "../app-state" }
+packages = { path = "../packages" }
+vault-ops = { path = "../vault-ops" }
+web-ui = { path = "../web-ui" }
+supervisor = { path = "../supervisor" }
+proxy = { path = "../proxy" }
+penpot-rpc = { path = "../penpot-rpc" }
+sync-core = { path = "../sync-core" }
+sync-daemon = { path = "../sync-daemon" }
+board-export = { path = "../board-export" }
+vault-index = { path = "../vault-index" }
+axum = "0.8"
+http = "1"
+directories = "5"
+rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

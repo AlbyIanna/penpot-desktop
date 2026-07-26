@@ -107,7 +107,18 @@ Headless (no window, same stack — used by tests and useful for debugging):
 
 ```sh
 cargo run -p penpot-desktop --bin headless   # prints "READY <url>" — open it in a browser
+cargo run -p penpot-cli --bin penpot daemon  # the same runner, reached through the CLI
 ```
+
+`bin/headless` is a shim over `penpot daemon`: identical boot sequence, identical
+`READY <url>` contract (every milestone gate launches the shim and waits for that line).
+`penpot` is the app's third front-end, beside the native chrome and the served HTML pages —
+**internal, with no stability contract**. Its verbs fall in three tiers: Tier 1 runs against the
+folder tree and the data dir with nothing else running (`vault-list`, `checkpoint`, `open`,
+`tpl-list`, `pkg-list`, `prefs-get`, `sync-status`); Tier 2 needs the running app; Tier 3 needs
+the supervised backend as well. Tiers 2 and 3 **attach or fail** — they never boot a stack
+implicitly, because the data dir is exclusive — and reach the running app over loopback, so the
+app stays the single writer. `scripts/c2-cli.sh` (`just c2`) is the gate over all of it.
 
 ## Development
 
@@ -131,12 +142,20 @@ Repo layout:
 
 | Path | What |
 |---|---|
-| `apps/desktop` | Tauri v2 shell, boot sequence, tray UI, headless bin, boot pre-flight |
+| `apps/desktop` | Tauri v2 shell only: window, menu bar, tray, native dialogs, navigation policy, the `headless` shim |
+| `apps/cli` | the `penpot` binary — the third front-end: Tier-1 offline verbs, Tier-2/3 over loopback, `penpot daemon` |
+| `crates/app-core` | the boot sequence itself, the localhost control server + `runtime.json`, runtime layout, pre-flight, window registry, the shared status model, `/__api/prefs*` |
+| `crates/web-ui` | the served framework-free HTML pages: `/__home` (lighttable) and the navigation probe |
+| `crates/vault-ops` | vault registry + switch, checkpoint, git-init, project/file management, document resolution, reveal |
+| `crates/packages` | package install/update/lockfile reconciliation, the builtin-template catalog and New-from-template |
+| `crates/app-state` | preferences, Open Recent, the detached-operation outcome record |
+| `crates/installer` | the shared import-as-new + settle-until-fixpoint mechanism (used by `packages`, `vault-ops` and the menu bar) |
 | `crates/supervisor` | child-process supervision: embedded Postgres, Valkey, backend JVM, optional exporter |
 | `crates/proxy` | local replacement for Penpot's nginx (SPA, `/api`, websockets, X-Accel assets, `/api/export`) |
 | `crates/penpot-rpc` | typed client for the Penpot RPC surface |
 | `crates/sync-core` | manifest, normalization/hash, atomic dir swaps |
 | `crates/sync-daemon` | two-way folder⇄DB sync, conflicts, OS rename/move re-keying |
+| `crates/vault-index` | offline full-content search over the vault (FTS5), the boards listing and the quick-open palette |
 | `crates/board-export` | per-board SVG/PNG auto-export next to sources (M5) |
 | `scripts/` | `fetch-penpot.sh` (extract pinned artifacts), milestone test suites |
 | `runtime/` | extracted Penpot backend/frontend/exporter (gitignored; regenerate with the fetch script) |

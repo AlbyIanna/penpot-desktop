@@ -90,9 +90,9 @@ pub fn trash_file(vault_root: &Path, file_id: &str, stamp: &str) -> Result<Trash
 /// True iff `rel` is a safe within-vault relative path: not empty, not
 /// absolute, and with no `.`/`..`/prefix components, so `vault_root.join`
 /// can never be tricked into leaving the vault. Mirrors
-/// `apps/desktop/src/home.rs::is_safe_vault_rel` (kept as a private copy
+/// `crates/web-ui/src/home.rs::is_safe_vault_rel` (kept as a private copy
 /// here rather than a shared dependency — `sync-core` must not depend on
-/// `apps/desktop`).
+/// `web-ui`).
 fn is_safe_vault_rel(rel: &str) -> bool {
     if rel.is_empty() {
         return false;

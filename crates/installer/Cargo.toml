@@ -1,0 +1,13 @@
+[package]
+name = "installer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Penpot Local shared import-as-new + settle-until-fixpoint mechanism (PLAN3 E2). Templates and design-data packages both import through here: import-as-new mints a fresh file id, then export -> normalize -> in-place re-import cycles run until two consecutive exports share a semantic hash, so the first on-disk export the sync daemon writes is already a round-trip fixpoint."
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+penpot-rpc = { path = "../penpot-rpc" }
+sync-core = { path = "../sync-core" }
+tempfile = "3"

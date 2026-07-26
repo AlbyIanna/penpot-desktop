@@ -11,7 +11,7 @@
 # Rationale: tauri-build copies `bundle.resources` next to the compiled binary
 # so `tauri dev` can resolve them — with the resources in the base config every
 # debug build would drop a penpot-runtime/ into target/debug/, and the
-# executable-adjacent bundle discovery in apps/desktop/src/layout.rs would
+# executable-adjacent bundle discovery in crates/app-core/src/layout.rs would
 # silently flip dev runs (cargo run, m1-smoke, m2/m3 scripts) into packaged
 # mode. Dev mode must stay byte-identical to pre-M4; only this script opts in.
 #
@@ -63,7 +63,7 @@ echo "== cargo tauri build (release + app + dmg)"
 # compile time; $HOME covers all three roots (std is already shipped as
 # /rustc/<hash> by upstream). The CARGO_MANIFEST_DIR dev-fallback (the one
 # string remap cannot touch) is compiled out of release builds in
-# apps/desktop/src/layout.rs. Verify with:
+# crates/app-core/src/layout.rs. Verify with:
 #   strings target/release/penpot-desktop | grep -c "$HOME"   # must be 0
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${HOME}=/build"
 # tauri-build copies bundle.resources next to the release binary

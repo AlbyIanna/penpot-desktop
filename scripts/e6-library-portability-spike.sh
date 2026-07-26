@@ -177,9 +177,15 @@ read_token() {
     [ -n "$PENPOT_TOKEN" ]
 }
 
+# Chapter C: the control port demands the per-boot token the running app
+# publishes in <data>/runtime.json (mode 0600), and refuses browser-shaped
+# requests outright — read fresh per call, since each boot mints a new one.
+control_token() { json_field token <"$DATA_DIR/runtime.json" 2>/dev/null || true; }
+
 switch_vault() { # switch_vault <abs-path>
     local out
     out="$(curl -fsS --max-time "$SWITCH_TIMEOUT" -X POST "$CONTROL/open" \
+        -H "x-penpot-control-token: $(control_token)" \
         -H 'Content-Type: application/json' -d "{\"path\": \"$1\"}" 2>/dev/null)" || return 1
     echo "$out" | grep -q '"ok":true' || echo "$out" | grep -q '"ok": true'
 }
