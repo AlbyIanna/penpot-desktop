@@ -15,6 +15,15 @@
 //! dead pid; [`route_for`] calls it BEFORE building anything, so that failure
 //! always arrives before the first byte goes on the wire.
 //!
+//! # Success and failure
+//!
+//! **Pretty JSON on stdout on success; any non-2xx is an `Err`, which `main`
+//! reports on stderr and exits 1 for.** Same as every Tier-1 verb and the
+//! no-app attach path, so a caller never has to know a verb's tier to know how
+//! it reports failure, and `penpot boards | jq` never gets a failure object
+//! piped into it as though it were a board listing. See [`outcome`], which is
+//! the whole decision, pure and unit-tested.
+//!
 //! # What this surface does not guarantee
 //!
 //! **`sync pause` is not a barrier.** `POST /__api/prefs` persists
@@ -169,10 +178,32 @@ pub fn route_for(data_dir: &Path, verb: Verb) -> Result<reqwest::RequestBuilder>
     Ok(attached.request_on(verb.surface(), verb.method(), verb.route()))
 }
 
-/// Send a built request and parse the JSON body, keeping a non-2xx status
-/// visible: these routes answer 4xx/5xx with a JSON `{"ok":false,"error":…}`
-/// body worth showing, so the status is reported alongside it rather than
-/// thrown away or turned into a bare transport error.
+/// Turn a response into a verb result. Pure, so the decision that governs the
+/// process's exit status is testable without a socket.
+///
+/// **Contract: JSON on stdout only on success; any non-2xx is an `Err`.** A
+/// failure therefore exits 1, with the server's own explanation on stderr.
+///
+/// The alternative — always print JSON and set the exit code separately — was
+/// considered and rejected. Returning `Err` is what the rest of this CLI
+/// already does (every Tier-1 verb propagates one, and so does the no-app
+/// attach path), so a caller does not have to know which tier a verb is in to
+/// know how it reports failure. It also keeps stdout clean: `penpot boards |
+/// jq` never has a failure object piped into it as if it were a board listing.
+///
+/// The status AND the parsed body both go into the message, because these
+/// routes answer with a JSON `{"ok":false,"error":…}` worth reading — losing it
+/// would trade a silent success for an uninformative failure.
+fn outcome(verb: Verb, status: reqwest::StatusCode, body: &str) -> Result<Value> {
+    let parsed: Value =
+        serde_json::from_str(body).unwrap_or_else(|_| json!({ "raw": body.to_string() }));
+    if status.is_success() {
+        return Ok(parsed);
+    }
+    anyhow::bail!("{verb:?} failed: HTTP {status}\n{parsed:#}")
+}
+
+/// Send a built request and hand the response to [`outcome`].
 async fn send(verb: Verb, req: reqwest::RequestBuilder) -> Result<Value> {
     let resp = req
         .send()
@@ -180,13 +211,7 @@ async fn send(verb: Verb, req: reqwest::RequestBuilder) -> Result<Value> {
         .with_context(|| format!("cannot reach the running app for `{:?}`", verb))?;
     let status = resp.status();
     let body = resp.text().await.context("cannot read the response body")?;
-    let parsed: Value = serde_json::from_str(&body)
-        .unwrap_or_else(|_| json!({ "raw": body }));
-    if status.is_success() {
-        Ok(parsed)
-    } else {
-        Ok(json!({ "ok": false, "status": status.as_u16(), "response": parsed }))
-    }
+    outcome(verb, status, &body)
 }
 
 async fn get(data_dir: &Path, verb: Verb, query: &[(&str, String)]) -> Result<Value> {
@@ -359,6 +384,143 @@ mod tests {
         assert_eq!(Verb::SyncStatus.route(), "/__api/prefs");
         assert_eq!(Verb::VaultSwitch.route(), "/open");
         assert_ne!(Verb::SyncStatus.route(), Verb::VaultSwitch.route());
+    }
+
+    /// A one-shot loopback server standing in for one route, so the REAL
+    /// `send` path — attach, build, dial, read status and body — is exercised
+    /// without booting a stack. Answers exactly one request with the given
+    /// status line and body, then closes.
+    async fn one_shot_server(status_line: &'static str, body: &'static str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head; we do not care what it says, only that
+            // the client is talking to us.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        port
+    }
+
+    /// Point a `runtime.json` at `port` so `attach` succeeds and the verbs
+    /// dial the stub instead of a real app.
+    fn record_pointing_at(dir: &Path, port: u16) {
+        app_core::runtime_record::write_record(
+            dir,
+            &app_core::runtime_record::RuntimeRecord {
+                pid: std::process::id(),
+                proxy_port: port,
+                control_port: port,
+                token: "s3cret".to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// **The regression this file exists to prevent.** A 4xx from the app must
+    /// be an `Err`, because `main` prints whatever `dispatch` returns and then
+    /// exits 0. Before this was fixed, every 4xx and 5xx across all thirteen
+    /// verbs exited **0** — so a gate leg written as `penpot boards || fail`
+    /// could never fail, and would pass vacuously against a completely broken
+    /// route. The Tier-1 verbs and the no-app attach path both exit 1; only
+    /// this path swallowed it.
+    ///
+    /// The body below is verbatim what `home.rs`'s `reveal_action` returns for
+    /// an absolute path, which is the cheapest real 4xx this surface has.
+    #[tokio::test]
+    async fn a_non_2xx_is_an_error_so_the_process_cannot_exit_0() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = one_shot_server(
+            "400 Bad Request",
+            r#"{"ok":false,"error":"path must be a within-vault relative path"}"#,
+        )
+        .await;
+        record_pointing_at(dir.path(), port);
+
+        let err = reveal(dir.path(), "/absolute/path")
+            .await
+            .expect_err("a 400 must not be reported as success")
+            .to_string();
+        assert!(err.contains("400"), "the status must survive: {err}");
+        assert!(
+            err.contains("within-vault"),
+            "the server's own explanation must survive into the message: {err}"
+        );
+    }
+
+    /// The other half: a 2xx still returns the parsed body, unchanged. Without
+    /// this, "make failures fail" could quietly turn into "make everything
+    /// fail".
+    #[tokio::test]
+    async fn a_2xx_still_returns_the_parsed_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = one_shot_server("200 OK", r#"{"count":2,"cards":[]}"#).await;
+        record_pointing_at(dir.path(), port);
+
+        let out = boards(dir.path(), None, None).await.unwrap();
+        assert_eq!(out["count"], json!(2));
+    }
+
+    /// The same rule stated over the whole status space, cheaply. `202` is the
+    /// one that would bite: `reboot` and `POST /__api/prefs/vault` ack and
+    /// detach, so treating "not 200" as failure would make a working reboot
+    /// report an error.
+    #[test]
+    fn only_a_non_2xx_is_a_failure() {
+        use reqwest::StatusCode;
+        for ok in [StatusCode::OK, StatusCode::ACCEPTED, StatusCode::NO_CONTENT] {
+            assert!(
+                outcome(Verb::Reboot, ok, r#"{"ok":true}"#).is_ok(),
+                "{ok} must be a success"
+            );
+        }
+        for bad in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            // `boards`/`search` answer this while the index is still building.
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                outcome(Verb::Boards, bad, r#"{"ok":false}"#).is_err(),
+                "{bad} must be a failure"
+            );
+        }
+    }
+
+    /// A failing route that answers with something other than JSON (an nginx
+    /// error page, a proxy hiccup) must still fail, and must still show what it
+    /// said — an empty or unparseable body is exactly when a caller most needs
+    /// the text.
+    #[test]
+    fn a_non_json_failure_body_still_fails_and_still_reports_itself() {
+        use reqwest::StatusCode;
+        let err = outcome(Verb::Boards, StatusCode::BAD_GATEWAY, "<html>502</html>")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("502"), "got: {err}");
+        assert!(err.contains("<html>502</html>"), "the raw body must survive: {err}");
+    }
+
+    /// The message has to name the verb, because a shell gate running several
+    /// verbs sees only stderr.
+    #[test]
+    fn a_failure_message_names_the_verb() {
+        use reqwest::StatusCode;
+        let err = outcome(Verb::PkgInstall, StatusCode::NOT_FOUND, r#"{"error":"nope"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PkgInstall"), "got: {err}");
     }
 
     /// Every verb, in one table, so a new one cannot be added without stating
