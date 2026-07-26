@@ -20,7 +20,11 @@ EXTRACTED=(installer app-state packages vault-ops web-ui app-core)
 
 echo "-- (a) no extracted crate depends on tauri"
 for c in "${EXTRACTED[@]}"; do
-    if (cd "$ROOT" && cargo tree -p "$c" -e normal 2>/dev/null | grep -q 'tauri v'); then
+    TREE_OUT="$(cd "$ROOT" && cargo tree -p "$c" -e normal 2>&1)"
+    TREE_RC=$?
+    if [ "$TREE_RC" -ne 0 ]; then
+        fail "(a) $c — cargo tree exited $TREE_RC, dependency graph not inspected: $TREE_OUT"
+    elif echo "$TREE_OUT" | grep -q 'tauri v'; then
         fail "(a) $c depends on tauri — the extraction has regressed"
     else
         pass "(a) $c is tauri-free"
