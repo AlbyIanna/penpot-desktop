@@ -36,6 +36,7 @@ sync-core = { path = "../../crates/sync-core" }
 sync-daemon = { path = "../../crates/sync-daemon" }
 board-export = { path = "../../crates/board-export" }
 vault-index = { path = "../../crates/vault-index" }
+installer = { path = "../../crates/installer" }
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 http = "1"

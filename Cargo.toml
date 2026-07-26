@@ -9,6 +9,7 @@ members = [
     "crates/sync-daemon",
     "crates/board-export",
     "crates/vault-index",
+    "crates/installer",
 ]
 
 [workspace.package]

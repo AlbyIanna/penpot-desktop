@@ -401,12 +401,12 @@ async fn import_new_from_template(
     display: &str,
     bytes: Vec<u8>,
 ) -> anyhow::Result<NewFromTemplateResp> {
-    let project_id = crate::installer::default_project_id(client, team_id).await?;
+    let project_id = installer::default_project_id(client, team_id).await?;
 
     // 1+2. import-as-new (mints a fresh id) + settle until the DB's export is a
     //       round-trip fixpoint (the shared installer mechanism). The `version`
     //       field depends on the origin format (legacy needs 1).
-    let (file_id, settle_cycles) = crate::installer::import_binfile_and_settle(
+    let (file_id, settle_cycles) = installer::import_binfile_and_settle(
         client,
         &project_id,
         display,
@@ -420,7 +420,7 @@ async fn import_new_from_template(
     );
 
     // 3. First page id for the deep link.
-    let page_id = crate::installer::first_page_id(client, &file_id).await;
+    let page_id = installer::first_page_id(client, &file_id).await;
     let deep_link = vault_index::workspace_deep_link(team_id, &file_id, page_id.as_deref());
 
     Ok(NewFromTemplateResp {

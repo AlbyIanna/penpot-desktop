@@ -1393,7 +1393,7 @@ async fn do_install(
             let live = client.get_file(&existing.file_id).await.is_ok();
             let resurrecting = !live && manifest_pins(&state.vault_root, &existing.file_id);
             if live || resurrecting {
-                let page_id = crate::installer::first_page_id(client, &existing.file_id).await;
+                let page_id = installer::first_page_id(client, &existing.file_id).await;
                 tracing::info!(
                     package = %id, file = %existing.file_id, live, resurrecting,
                     "install no-op (already pinned; live or resurrecting from disk)"
@@ -1421,9 +1421,9 @@ async fn do_install(
 
     // import-as-new + settle to a round-trip fixpoint (shared installer).
     let zip = sync_core::zip_dir(&tree_dir)?;
-    let project_id = crate::installer::default_project_id(client, &state.team_id).await?;
+    let project_id = installer::default_project_id(client, &state.team_id).await?;
     let (file_id, settle_cycles) =
-        crate::installer::import_binfile_and_settle(client, &project_id, &display, zip, None)
+        installer::import_binfile_and_settle(client, &project_id, &display, zip, None)
             .await?;
     tracing::info!(
         package = %id, file = %file_id, cycles = settle_cycles,
@@ -1459,7 +1459,7 @@ async fn do_install(
     );
     lock.save(&state.vault_root)?;
 
-    let page_id = crate::installer::first_page_id(client, &file_id).await;
+    let page_id = installer::first_page_id(client, &file_id).await;
     let deep_link =
         vault_index::workspace_deep_link(&state.team_id, &file_id, page_id.as_deref());
 
@@ -1550,7 +1550,7 @@ async fn do_publish(
     }
     lock.save(&state.vault_root)?;
 
-    let page_id = crate::installer::first_page_id(client, &file_id).await;
+    let page_id = installer::first_page_id(client, &file_id).await;
     Ok(PublishResp {
         ok: true,
         id: id.to_string(),

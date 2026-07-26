@@ -12,7 +12,6 @@ pub mod dialog;
 pub mod docopen;
 pub mod gitinit;
 pub mod home;
-pub mod installer;
 pub mod last_op;
 pub mod layout;
 pub mod manage;
