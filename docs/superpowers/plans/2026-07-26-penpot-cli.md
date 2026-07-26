@@ -797,7 +797,16 @@ EXTRACTED=(installer app-state packages vault-ops web-ui app-core)
 
 echo "-- (a) no extracted crate depends on tauri"
 for c in "${EXTRACTED[@]}"; do
-    if (cd "$ROOT" && cargo tree -p "$c" -e normal 2>/dev/null | grep -q 'tauri v'); then
+    # Three distinguishable outcomes, not two. Piping cargo tree straight into
+    # grep would branch only on grep's status, so a `cargo tree` failure (a stale
+    # crate name in EXTRACTED, a bad lockfile) yields no output, grep finds
+    # nothing, and the gate prints PASS having inspected no dependency graph at
+    # all — the exact silent-success failure this gate exists to prevent.
+    TREE_OUT="$(cd "$ROOT" && cargo tree -p "$c" -e normal 2>&1)"
+    TREE_RC=$?
+    if [ "$TREE_RC" -ne 0 ]; then
+        fail "(a) $c — cargo tree exited $TREE_RC, dependency graph not inspected: $TREE_OUT"
+    elif echo "$TREE_OUT" | grep -q 'tauri v'; then
         fail "(a) $c depends on tauri — the extraction has regressed"
     else
         pass "(a) $c is tauri-free"
