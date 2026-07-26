@@ -868,15 +868,35 @@ c1:
 
 Add `bash scripts/c1-crates.sh` to the `e2e` chain, immediately before `bash scripts/d1-offline.sh`.
 
-Also fix a stale comment the extraction left in the same file. `justfile:322`, inside the `d5` recipe's doc comment, still says `` `cargo test -p penpot-desktop -- docopen::` `` — Task 5 moved that test to `vault-ops` and repointed the script but not the comment describing it. Update it to `-p vault-ops`. Then check whether the `d3` recipe's comment names packages too, and correct any it gets wrong:
+- [ ] **Step 5: Repair the references the extraction invalidated**
+
+Six tasks of moves left prose across the repo pointing at files that no longer exist. A controller sweep found every one and confirmed **none is an executed path** — the only real path assignment, `scripts/d6-residue.sh:63`'s `NAVWATCH_RS`, targets `navwatch.rs`, which stays in `apps/desktop`. So no gate is broken; what is broken is the documentation someone greps when deciding whether a gate still covers what they need. In this repo that documentation is load-bearing, so fix all of it:
+
+| File:line | Says | Should say |
+|---|---|---|
+| `justfile:322` | `cargo test -p penpot-desktop -- docopen::` | `-p vault-ops` |
+| `crates/sync-core/src/trash.rs:93` | `apps/desktop/src/home.rs::is_safe_vault_rel` | `crates/web-ui/src/home.rs::is_safe_vault_rel` |
+| `crates/sync-daemon/src/paths.rs:32` | `apps/desktop/src/manage.rs` | `crates/vault-ops/src/manage.rs` |
+| `scripts/e2_packages_helper.py:57` | `apps/desktop/src/installer.rs` | `crates/installer/src/lib.rs` |
+| `scripts/d4-preferences.sh:108` | `apps/desktop/src/last_op.rs` | `crates/app-state/src/last_op.rs` |
+| `scripts/d4_prefs_helper.py:4,35` | `apps/desktop/src/prefs_http.rs` | `crates/app-core/src/prefs_http.rs` |
+| `scripts/d4_prefs_helper.py:45,241` | `apps/desktop/src/last_op.rs` | `crates/app-state/src/last_op.rs` |
+| `scripts/designs-git-init.sh:23` | `apps/desktop/src/gitinit.rs` | `crates/vault-ops/src/gitinit.rs` |
+| `scripts/d5_docs_helper.py:19` | `apps/desktop/src/control.rs` | `crates/app-core/src/control.rs` |
+| `scripts/d0-navigation-spike.sh:6` | `apps/desktop/src/navprobe.{rs,html}` | `crates/web-ui/src/navprobe.{rs,html}` |
+| `scripts/d6-residue.sh:148` | `apps/desktop/src/navprobe.html` | `crates/web-ui/src/navprobe.html` |
+
+Leave every reference to `navwatch.rs`, `main.rs`, `menubar/`, `tray/`, `overlay.rs` and `dialog.rs` alone — those modules never moved.
+
+Then verify nothing was missed, and note the trap: a compound `grep` with `--include` filters returned a false empty during the controller's first sweep. Use a positive control — confirm the command finds a reference you know exists before trusting it to report none.
 
 ```bash
-grep -n "penpot-desktop --\|-p penpot-desktop" justfile
+grep -rn "apps/desktop/src" crates/ scripts/ justfile README.md | grep -vE "navwatch|main\.rs|menubar|tray|overlay|dialog"
 ```
 
-In this repo the recipe comments are the primary documentation of what each gate proves, so a comment that names the wrong package is a real defect, not cosmetic — it is what the next person reads before deciding whether a gate still covers what they need.
+Expected: no output. Sanity-check the command first by dropping the second `grep` and confirming it prints the surviving `navwatch` lines.
 
-- [ ] **Step 5: Run the headless part of the ladder**
+- [ ] **Step 6: Run the headless part of the ladder**
 
 ```bash
 bash scripts/c1-crates.sh && bash scripts/m1-smoke.sh && bash scripts/m2-invariant.sh && bash scripts/m3-sync.sh && bash scripts/n1-index.sh && bash scripts/n3-home.sh && bash scripts/n4-palette.sh && bash scripts/n5-vaults.sh && bash scripts/n6-templates.sh && bash scripts/e1-contract.sh && bash scripts/e2-packages.sh && bash scripts/e3-library.sh && bash scripts/e4-gallery.sh && bash scripts/d4-preferences.sh && bash scripts/d6-residue.sh
@@ -884,7 +904,7 @@ bash scripts/c1-crates.sh && bash scripts/m1-smoke.sh && bash scripts/m2-invaria
 
 Expected: all green. Report the result; the controller runs the GUI-session gates (`d2-home.sh`, `d3-menus.sh`, `d5-documents.sh`) separately — do not attempt them.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add -A
