@@ -28,17 +28,42 @@ keeps working unchanged. Nothing in the workflow assumes private-vs-public.
 
 ## How to cut a release
 
-The version is **derived from the git tag** — never hardcoded in the workflow.
-Tag `vX.Y.Z` → released version `X.Y.Z` → assets named `..._X.Y.Z_...`.
+The version is **derived from git tags** — never hardcoded in the workflow or
+in `Cargo.toml`. There are two paths:
 
-1. Decide the version. Bumping the committed workspace version in `Cargo.toml`
-   (e.g. `0.1.0` → `0.2.0` to reflect chapter 2) is a **product-owner
-   decision** and is **not required** by this pipeline: at build time the
-   workflow patches the workspace `Cargo.toml` version *in the runner only*
-   (ephemeral, never committed) from the tag, so `tauri` names the bundle with
-   the released version. The committed source is untouched.
+### Automatic (the normal path)
 
-2. Push a tag:
+Every merge to `main` runs `scripts/release-plan.sh` (gated by
+`scripts/release-plan-test.sh`, chained into `just e2e`), which reads the
+conventional commits since the last bare `vX.Y.Z` tag:
+
+| Commits since the last release tag | Bump |
+|---|---|
+| a `!` type suffix (`feat(api)!:`) or a `BREAKING CHANGE:` footer | major |
+| at least one `feat` | minor |
+| only `fix` / `perf` | patch |
+| only `docs`/`test`/`refactor`/`chore`/`ci`/non-conforming | none — the rolling `latest` still updates |
+
+When a release is warranted, the `publish` job publishes the **same
+artifacts** it just attached to `latest` as a real Release `vX.Y.Z` (with the
+*Latest* badge), creating the tag with the default `GITHUB_TOKEN` — which
+GitHub never retriggers workflows for, so there is no loop and no second
+build. The release body carries a generated "What's changed" changelog grouped
+from the same commits. Two deliberate exclusions: **merge commits are
+ignored** (PR titles here are narrative; the semantics live in the commits
+inside the PR), and **`rc`/suffixed tags** (e.g. `v0.2.0-rc1`) never anchor
+the commit range — a validation run must not eat a real release's changelog.
+
+Consequence to know: versions move fast (two feat-PRs merged the same day
+yield e.g. 0.5.0 then 0.6.0), and a refactor-only chapter cuts no release
+unless a commit is marked `!` or carries a `feat`/`fix`.
+
+### Manual (the escape hatch)
+
+Push a tag yourself — unchanged, and it takes precedence naturally (the auto
+path sees HEAD already tagged and stands down):
+
+1. Push a tag:
 
    ```sh
    git tag v0.2.0
@@ -49,8 +74,13 @@ Tag `vX.Y.Z` → released version `X.Y.Z` → assets named `..._X.Y.Z_...`.
    `publish` job creates a Release for tag `v0.2.0` (not a prerelease) and
    attaches the dmg + AppImage.
 
-3. The Release appears at
+2. The Release appears at
    `https://github.com/AlbyIanna/penpot-desktop/releases/tag/v0.2.0`.
+
+The committed workspace version in `Cargo.toml` is a **placeholder** (it stays
+at its historical value): the released version comes from the git tag, patched
+into the runner's `Cargo.toml` at build time (ephemeral, never committed).
+Local `cargo` builds report the placeholder — that is expected.
 
 ### Rolling "latest" builds from `main` (automatic)
 
@@ -59,12 +89,17 @@ Every push to `main` (i.e. every merge) automatically republishes a single
 a permanent version:
 
 - Trigger: `push: branches: ["main"]`.
-- Version: the committed workspace version + short commit sha, e.g.
-  `0.3.0-dev.84148b6` (derived in the `prepare` job from `Cargo.toml`).
+- Version: **next-patch-dev**, e.g. `0.4.2-dev.84148b6` — derived by
+  `scripts/release-plan.sh` from the last release tag (+ short commit sha) so
+  it sorts *before* the eventual real `0.4.2`, no longer read from the
+  committed `Cargo.toml`.
 - Tag: `latest` — the `publish` job **deletes and recreates** it each run so the
   tag tracks the newest `main` commit (a plain `gh release edit` cannot move a tag).
 - Marked as a **prerelease**, with a "Rolling build" note in the body.
 - Stable URL: `https://github.com/AlbyIanna/penpot-desktop/releases/tag/latest`.
+- After a merge lands, verify not only that `latest` actually advanced but —
+  when the commits warranted a release — that the new `vX.Y.Z` Release exists
+  with both assets (the dmg CI step is known-flaky).
 
 Scope: the rolling build only **builds + publishes** the artifacts — the code was
 already gated before it reached `main` (local `just e2e`); it does **not** re-run

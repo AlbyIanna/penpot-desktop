@@ -19,6 +19,8 @@ members = [
 ]
 
 [workspace.package]
+# Placeholder — released versions are derived from git tags by the release
+# workflow (scripts/release-plan.sh; see docs/RELEASES.md). Do not bump.
 version = "0.3.0"
 edition = "2021"
 license = "MPL-2.0"
