@@ -17,15 +17,18 @@
 
   Both `POST /__api/prefs/reboot` and `POST /__api/prefs/vault` ACK with a
   `202` before doing any work — they tear down the very proxy serving this
-  page, so THIS PAGE'S OWN ORIGIN goes away and comes back. A fetch made
+  page, so THIS PAGE'S OWN ORIGIN goes away and comes back. A request made
   mid-teardown, or while the new stack is still booting, fails outright
   (connection refused) — that is expected, not an error to surface as a
-  failure. So after either call, this page stops making one-shot requests
-  and instead polls `GET /__api/prefs` on a short interval, showing a
-  "reconnecting" state, until a request finally succeeds again — then it
-  reloads live state AND checks `lastOp` (the server's own record of how
-  that detached switch/reboot actually turned out, since the `202` response
-  itself never carries a pass/fail verdict) to report success or failure.
+  failure. Every request is also time-bounded, so a stack that ACCEPTS a
+  connection and then never answers fails the same way instead of hanging
+  forever; see `fetchBounded` below. So after either call, this page stops
+  making one-shot requests and instead polls `GET /__api/prefs` on a short
+  interval, showing a "reconnecting" state, until a request finally succeeds
+  again — then it reloads live state AND checks `lastOp` (the server's own
+  record of how that detached switch/reboot actually turned out, since the
+  `202` response itself never carries a pass/fail verdict) to report success
+  or failure.
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -242,6 +245,49 @@
 
   function setSwitchNote(text) { els.switchNote.textContent = text || ""; }
 
+  // Every request this page makes is time-bounded. Nothing below calls the
+  // platform `fetch` directly.
+  //
+  // A rejected request is ALREADY this page's expected path: `.catch(retry)`
+  // is what makes "connection refused while this page's own origin is torn
+  // down and rebooted" a normal condition rather than a failure. But a
+  // connection that is ACCEPTED and then never answered settles NEITHER
+  // `.then` NOR `.catch`. The retry ladder would simply stop advancing —
+  // `attempt >= RECONNECT_MAX_ATTEMPTS` would never fire, the page would
+  // never notice the stack coming BACK either, and the window would sit on
+  // its "working…" note forever with nothing to show the user. An abort
+  // rejects, so a timeout feeds the very same `.catch` the refused case
+  // already feeds; it never bypasses the ladder, it is just another rung.
+  //
+  // AbortController + setTimeout rather than `AbortSignal.timeout`, which
+  // only landed in WebKit 16 / WebKitGTK 2.38 — this page runs in whatever
+  // webview the host OS happens to ship.
+  //
+  // Two bounds, because an abort does not mean the same thing everywhere:
+  //   - GET polls are idempotent and already sit on a retry ladder, so an
+  //     over-eager abort costs one extra poll and nothing else. 5s is the
+  //     bound `scripts/d4_prefs_helper.py` has always passed to `urlopen` —
+  //     which is exactly why the automated gate self-healed through a hung
+  //     server while the real window wedged.
+  //   - The POSTs report a rejection to the user as a verdict ("Restart
+  //     failed."), and the two 202-ACK routes answer BEFORE doing any work,
+  //     so a healthy server replies to them practically instantly. They get
+  //     a much looser bound, so that an abort there is real news rather than
+  //     a false alarm raised over a restart that is in fact underway.
+  var POLL_TIMEOUT_MS = 5000;
+  var WRITE_TIMEOUT_MS = 15000;
+
+  function fetchBounded(url, init, timeoutMs) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, timeoutMs || POLL_TIMEOUT_MS);
+    var opts = init || {};
+    opts.signal = controller.signal;
+    return fetch(url, opts).then(
+      function (r) { clearTimeout(timer); return r; },
+      function (e) { clearTimeout(timer); throw e; }
+    );
+  }
+
   // The server's own record of how the most recently FINISHED detached
   // switch/reboot turned out (see prefs_http.rs's module doc) — kept in sync
   // by every successful GET /__api/prefs (`load`, `pollLive`, and the
@@ -282,11 +328,18 @@
   // that holds in every case, because only the detached task itself writes
   // it, and only once it is completely done — success or failure.
   var RECONNECT_INTERVAL_MS = 1000;
-  var RECONNECT_MAX_ATTEMPTS = 150; // ~2.5 minutes
+  // ~2.5 minutes when every poll fails fast, which is the normal case: a
+  // torn-down origin refuses connections instantly. A server that ACCEPTS
+  // and then never answers instead stretches each attempt by up to
+  // POLL_TIMEOUT_MS, so the pathological ceiling is ~150 * (5s + 1s) ≈ 15
+  // minutes. Longer, but bounded — and every attempt in between is a real
+  // chance to notice the stack coming back, which an unbounded request
+  // would have thrown away entirely.
+  var RECONNECT_MAX_ATTEMPTS = 150;
   function waitForOpOutcome(baselineKey, noteText, onDone, attempt) {
     attempt = attempt || 0;
     setSaveNote(noteText);
-    fetch("/__api/prefs")
+    fetchBounded("/__api/prefs")
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (data) {
         applyPrefs(data.preferences);
@@ -317,7 +370,7 @@
   }
 
   function load() {
-    fetch("/__api/prefs")
+    fetchBounded("/__api/prefs")
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (data) {
         applyPrefs(data.preferences);
@@ -332,7 +385,7 @@
   // Live status only (vault/sync/renders) — polled on an interval so the
   // page reflects reality even when nothing was just saved here.
   function pollLive() {
-    fetch("/__api/prefs")
+    fetchBounded("/__api/prefs")
       .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
       .then(function (data) { applyStatus(data); })
       .catch(function () { /* keep last known state */ });
@@ -353,11 +406,11 @@
   function save() {
     var body = currentFromForm();
     setSaveNote("Saving…");
-    fetch("/__api/prefs", {
+    fetchBounded("/__api/prefs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    })
+    }, WRITE_TIMEOUT_MS)
       .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
       .then(function (res) {
         if (!res.body.ok) {
@@ -387,7 +440,7 @@
     var prevLabel = els.rebootBtn.textContent;
     els.rebootBtn.textContent = "Restarting…";
     var baselineKey = opKey(currentLastOp);
-    fetch("/__api/prefs/reboot", { method: "POST" })
+    fetchBounded("/__api/prefs/reboot", { method: "POST" }, WRITE_TIMEOUT_MS)
       .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
       .then(function (res) {
         if (!res.body.ok) {
@@ -437,11 +490,11 @@
     els.switchBtn.disabled = true;
     setSwitchNote("Switching vaults…");
     var baselineKey = opKey(currentLastOp);
-    fetch("/__api/prefs/vault", {
+    fetchBounded("/__api/prefs/vault", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: path }),
-    })
+    }, WRITE_TIMEOUT_MS)
       .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
       .then(function (res) {
         if (!res.body.ok) {
