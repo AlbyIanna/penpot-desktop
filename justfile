@@ -437,6 +437,7 @@ e2e:
     bash scripts/d4-preferences.sh
     bash scripts/d5-documents.sh
     bash scripts/d6-residue.sh
+    bash scripts/release-plan-test.sh
 
 # M5: enable git versioning for a designs folder (idempotent; the tray's
 # "Enable git versioning" action runs this same script).

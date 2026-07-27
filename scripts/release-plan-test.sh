@@ -84,6 +84,56 @@ echo "$CH" | grep -q '^### Bug fixes$'       && pass "changelog: Bug fixes group
 echo "$CH" | grep -q '\*\*cli:\*\* new verb' && pass "changelog: scoped subject"   || fail "changelog: scoped subject missing"
 echo "$CH" | grep -q 'feat(cli):'            && fail "changelog: prefix not stripped" || pass "changelog: prefix stripped"
 
+# --- 7. breaking via "!" -> major --------------------------------------------
+R="$(mk_repo t7)"; G "$R" tag v1.2.3; cm "$R" "feat(api)!: drop legacy verbs"
+OUT="$(run_plan "$R")"
+expect "bang" "$OUT" bump major
+expect "bang" "$OUT" version 2.0.0
+
+# --- 8. breaking via body footer -> major ------------------------------------
+R="$(mk_repo t8)"; G "$R" tag v1.2.3
+cmb "$R" "fix: change default port" "BREAKING CHANGE: the control port moved"
+OUT="$(run_plan "$R")"
+expect "body-breaking" "$OUT" bump major
+expect "body-breaking" "$OUT" version 2.0.0
+
+# --- 9. rc tags never anchor the range ---------------------------------------
+R="$(mk_repo t9)"; G "$R" tag v1.2.3
+cm "$R" "feat: one"; G "$R" tag v1.3.0-rc1; cm "$R" "feat: two"
+OUT="$(run_plan "$R")"
+expect "rc-ignored" "$OUT" last_tag v1.2.3
+expect "rc-ignored" "$OUT" version 1.3.0
+# BOTH feats (before and after the rc tag) are in the changelog:
+grep -q 'one' "$TMP/t9/ch.md" && pass "rc-ignored: pre-rc commit in changelog" \
+                              || fail "rc-ignored: pre-rc commit missing"
+
+# --- 10. bare tag on HEAD -> bump=none, rolling derives from it --------------
+R="$(mk_repo t10)"; G "$R" tag v1.2.3; cm "$R" "feat: shipped"; G "$R" tag v1.3.0
+OUT="$(run_plan "$R")"
+SHORT="$(G "$R" rev-parse --short=7 HEAD)"
+expect "head-tagged" "$OUT" bump none
+expect "head-tagged" "$OUT" head_tag v1.3.0
+expect "head-tagged" "$OUT" version "1.3.1-dev.$SHORT"
+expect "head-tagged" "$OUT" release_tag ""
+
+# --- 11. merge commits are excluded ------------------------------------------
+R="$(mk_repo t11)"; G "$R" tag v1.2.3
+G "$R" checkout -q -b feature
+cm "$R" "fix: real work"
+G "$R" checkout -q main
+cm "$R" "docs: mainline noise"
+G "$R" merge -q --no-ff feature -m "feat: LYING merge subject"
+OUT="$(run_plan "$R")"
+expect "merge-excluded" "$OUT" bump patch   # the fix counts; the merge's fake feat does not
+grep -q 'LYING' "$TMP/t11/ch.md" && fail "merge-excluded: merge subject leaked" \
+                                 || pass "merge-excluded: merge subject absent"
+
+# --- 12. non-conforming subjects -> none, never crash ------------------------
+R="$(mk_repo t12)"; G "$R" tag v1.2.3
+cm "$R" "just a plain sentence with (parens) and: colons"
+OUT="$(run_plan "$R")"
+expect "non-conforming" "$OUT" bump none
+
 echo
 echo "release-plan-test: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
