@@ -12,16 +12,24 @@
 # naming, (3) a publish job that cuts the Release.
 #
 # Triggers:
-#   * push tag v*         -> a real release for that tag (prerelease=false)
+#   * push to main        -> roll the "latest" prerelease with fresh
+#                            downloadables; ADDITIONALLY, when the conventional
+#                            commits since the last bare vX.Y.Z tag warrant it
+#                            (feat/fix/breaking), publish the SAME artifacts as
+#                            a real vX.Y.Z release (the auto path — one build,
+#                            two publications).
+#   * push tag v*         -> a real release for that tag (the manual escape
+#                            hatch; prerelease=false)
 #   * workflow_dispatch   -> a validation run: builds, then cuts a DELETABLE
 #                            prerelease under a throwaway tag. Used by the
 #                            ReleaseCI phase so validation needs no permanent tag.
 #
-# Version derivation: taken from the tag (v0.2.0 -> 0.2.0), never hardcoded.
+# Version derivation: scripts/release-plan.sh over git history (tags + the
+# conventional commits since the last release tag) — never hardcoded, never
+# read from the committed Cargo.toml (its version field is a placeholder).
 # The workspace Cargo.toml version is patched IN THE RUNNER (ephemeral, never
-# committed) so tauri names the bundle with the released version. Bumping the
-# committed workspace version (e.g. 0.1.0 -> 0.2.0) is a separate product-owner
-# decision; this workflow does not depend on it. See docs/RELEASES.md.
+# committed) so tauri names the bundle with the released version.
+# See docs/RELEASES.md.
 
 name: release
 
@@ -60,8 +68,11 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       prerelease: ${{ steps.v.outputs.prerelease }}
       rolling: ${{ steps.v.outputs.rolling }}
+      release_tag: ${{ steps.v.outputs.release_tag }}
     steps:
-      - uses: actions/checkout@v4   # needed to read the committed workspace version
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # release-plan.sh needs every tag and the full commit range
       - id: v
         env:
           # Pass untrusted context through env (never interpolate github.* into
@@ -72,25 +83,36 @@ jobs:
           REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           set -euo pipefail
+          # The version decision lives in scripts/release-plan.sh (testable
+          # locally; see scripts/release-plan-test.sh). This step only routes
+          # its outputs per event. Run it on EVERY event so the changelog
+          # artifact always exists for publish.
+          PLAN="$(bash scripts/release-plan.sh changelog.md)"
+          echo "$PLAN"
+          plan() { printf '%s\n' "$PLAN" | sed -n "s/^$1=//p"; }
+
           ROLLING="false"
+          RELEASE_TAG=""
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             # Manual validation run: a deletable prerelease under the given version.
             VERSION="${INPUT_VERSION#v}"
             TAG="v${VERSION}"
             PRERELEASE="$INPUT_PRERELEASE"
           elif [ "${REF#refs/tags/}" != "$REF" ]; then
-            # A v* tag -> the official, pinned versioned release.
+            # A v* tag -> the official, pinned versioned release (manual path).
             TAG="$REF_NAME"
             VERSION="${TAG#v}"
             PRERELEASE="false"
           else
-            # A push to main -> roll the single "latest" prerelease with fresh
-            # downloadables. Version = committed workspace version + short sha.
-            BASE="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-            SHORT="${SHA:0:7}"
-            VERSION="${BASE}-dev.${SHORT}"
+            # A push to main -> always roll "latest"; ADDITIONALLY, when the
+            # commits since the last release tag warrant it, publish the same
+            # artifacts as a real vX.Y.Z (the auto path). The tag is created
+            # by publish with GITHUB_TOKEN, which cannot retrigger workflows.
+            VERSION="$(plan version)"
+            RELEASE_TAG="$(plan release_tag)"
             TAG="latest"
             PRERELEASE="true"
             ROLLING="true"
@@ -100,11 +122,19 @@ jobs:
           case "$VERSION" in
             *[!A-Za-z0-9.+-]*|"") echo "invalid version: '$VERSION'" >&2; exit 1 ;;
           esac
-          echo "version=$VERSION"       >>"$GITHUB_OUTPUT"
-          echo "tag=$TAG"               >>"$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >>"$GITHUB_OUTPUT"
-          echo "rolling=$ROLLING"       >>"$GITHUB_OUTPUT"
-          echo "Resolved version=$VERSION tag=$TAG prerelease=$PRERELEASE rolling=$ROLLING"
+          echo "version=$VERSION"         >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG"                 >>"$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE"   >>"$GITHUB_OUTPUT"
+          echo "rolling=$ROLLING"         >>"$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >>"$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION tag=$TAG prerelease=$PRERELEASE rolling=$ROLLING release_tag=$RELEASE_TAG"
+
+      - name: Upload changelog artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-changelog
+          path: changelog.md
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   # macOS arm64 dmg: crane path (no docker on macOS runners) + build-dmg.sh.
