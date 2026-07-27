@@ -368,6 +368,7 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
           ROLLING: ${{ needs.prepare.outputs.rolling }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
 
@@ -376,16 +377,24 @@ jobs:
           test -f "$DMG"
           test -f "$APPIMAGE"
 
-          ROLLING_NOTE=""
-          if [ "$ROLLING" = "true" ]; then
-            ROLLING_NOTE=$'> **Rolling build** — automatically republished from the latest commit on `main`. It moves with `main`; for a pinned, stable release use a versioned `v*` release.\n'
+          # What's-changed section from the prepare job's release-plan run.
+          CHANGELOG="artifacts/release-changelog/changelog.md"
+          WHATS_CHANGED=""
+          if [ -s "$CHANGELOG" ]; then
+            WHATS_CHANGED="$(printf "## What's changed\n\n"; cat "$CHANGELOG")"
           fi
 
-          BODY_FILE="$(mktemp)"
-          cat >"$BODY_FILE" <<EOF
+          # write_body <file> <rolling: true|false> — one body builder for both
+          # legs so the rolling and the versioned release can never drift apart.
+          write_body() {
+            local file="$1" rolling="$2" note=""
+            if [ "$rolling" = "true" ]; then
+              note=$'> **Rolling build** — automatically republished from the latest commit on `main`. It moves with `main`; for a pinned, stable release use a versioned `v*` release.\n'
+            fi
+            cat >"$file" <<EOF
           Penpot Local ${VERSION} — offline, local-first Penpot desktop.
 
-          ${ROLLING_NOTE}
+          ${note}
 
           ## Downloads
 
@@ -393,6 +402,8 @@ jobs:
           |---|---|
           | macOS (Apple Silicon) | \`$(basename "$DMG")\` |
           | Linux (x86_64) | \`$(basename "$APPIMAGE")\` |
+
+          ${WHATS_CHANGED}
 
           ## macOS (Apple Silicon / arm64)
 
@@ -407,9 +418,13 @@ jobs:
 
           Everything runs offline — the embedded Postgres, Valkey, backend JVM, proxy, and packaged exporter ship inside the artifact. No account, no network.
           EOF
+          }
 
           FLAGS=()
           if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+
+          BODY_FILE="$(mktemp)"
+          write_body "$BODY_FILE" "$ROLLING"
 
           # Rolling "latest": delete the previous release + tag so the recreated
           # tag tracks the current main commit (gh release edit cannot move a tag).
@@ -431,6 +446,30 @@ jobs:
           fi
 
           gh release upload "$TAG" "$DMG" "$APPIMAGE" --clobber
+
+          # Auto versioned release (push-to-main with release-worthy commits):
+          # the SAME artifacts, published a second time under vX.Y.Z. gh creates
+          # the tag via the API with GITHUB_TOKEN — which GitHub never
+          # retriggers workflows for, so this cannot loop and cannot
+          # double-build. No --prerelease (it is a real release); --latest is
+          # explicit so the Latest badge moves to it.
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            REL_BODY="$(mktemp)"
+            write_body "$REL_BODY" "false"
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              echo "Release $RELEASE_TAG exists (re-run) — updating."
+              gh release edit "$RELEASE_TAG" --notes-file "$REL_BODY" --latest
+            else
+              echo "Creating versioned release $RELEASE_TAG (target $GITHUB_SHA)."
+              gh release create "$RELEASE_TAG" \
+                --title "Penpot Local ${VERSION}" \
+                --notes-file "$REL_BODY" \
+                --target "$GITHUB_SHA" \
+                --latest
+            fi
+            gh release upload "$RELEASE_TAG" "$DMG" "$APPIMAGE" --clobber
+          fi
+
           echo "Attached:"
           echo "  $(basename "$DMG")"
           echo "  $(basename "$APPIMAGE")"
