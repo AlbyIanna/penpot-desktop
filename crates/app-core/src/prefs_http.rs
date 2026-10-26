@@ -312,6 +312,76 @@ async fn post_vault(State(state): State<Arc<PrefsState>>, Json(req): Json<VaultS
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------
+    // Every request the preferences page makes must be time-bounded.
+    //
+    // The page's retry ladder is built entirely on rejection: `.catch(retry)`
+    // is what makes "connection refused while this page's own origin is being
+    // torn down and rebooted" an expected condition rather than a failure. A
+    // connection that is ACCEPTED and then never answered settles neither
+    // `.then` nor `.catch`, so the ladder never advances — `attempt >=
+    // RECONNECT_MAX_ATTEMPTS` never fires, the page never notices the server
+    // coming back, and the window shows its "working…" note forever with no
+    // user-visible failure.
+    //
+    // So no call site may use a bare `fetch()`: all of them go through
+    // `fetchBounded`, which aborts on a timer and therefore always settles —
+    // into the SAME `.catch` the refused case already feeds. This is a
+    // source-shape assertion (there is no JS harness in-repo; same idiom as
+    // `web-ui`'s navprobe.rs page assertions) and it guards the regression that
+    // matters: a NEW request added later without a bound.
+    //
+    // `scripts/d4_prefs_helper.py` has passed `urlopen(timeout=5)` since D4,
+    // which is why the automated gate self-healed through a hung server while
+    // the real GUI wedged. This test closes that asymmetry.
+    // ---------------------------------------------------------------------
+    /// The page's `<script>` body with `//` comments stripped, so the
+    /// assertions below read executable code only — mentioning `fetch()` in
+    /// prose must never fail this test. (Naive on purpose: no `//` appears
+    /// inside a string literal on this page — every URL is origin-relative.)
+    fn page_script(page: &str) -> String {
+        let body = page
+            .split_once("<script>")
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .map(|(body, _)| body)
+            .expect("preferences page has a <script> block");
+        body.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_page_request_is_time_bounded() {
+        let script = page_script(PREFERENCES_PAGE_HTML);
+        // `fetch(` cannot match inside `fetchBounded(` — the character after
+        // `fetch` is `B`, not `(` — so this counts bare calls directly.
+        let bare = script.matches("fetch(").count();
+        let bounded = script.matches("fetchBounded(").count();
+        assert_eq!(
+            bare, 1,
+            "exactly one bare `fetch(` may exist — the one inside `fetchBounded` \
+             itself — but found {bare}; every other request must go through \
+             `fetchBounded`, or a server that accepts and never answers is an \
+             infinite spinner"
+        );
+        // Helper definition + one per request site (waitForOpOutcome, load,
+        // pollLive, save, /prefs/reboot, /prefs/vault).
+        assert!(
+            bounded >= 7,
+            "expected `fetchBounded` to define + cover all 6 request sites, saw {bounded}"
+        );
+        assert!(
+            script.contains("new AbortController()"),
+            "the bound must abort the request, not just race a timer against a \
+             promise that stays pending forever"
+        );
+        assert!(
+            script.contains("clearTimeout("),
+            "the abort timer must be cleared once the request settles"
+        );
+    }
+
     #[test]
     fn vault_name_takes_the_trailing_path_component() {
         assert_eq!(vault_name("/Users/alby/Designs"), "Designs");
